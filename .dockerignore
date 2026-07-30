@@ -1,0 +1,8 @@
+node_modules
+.next
+.vinext
+dist
+.runtime
+.git
+.wrangler
+*.log
