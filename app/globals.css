@@ -203,11 +203,13 @@ button {
   border-radius: 24px;
 }
 
-.language-row {
+.language-row,
+.transcript-row {
   padding: 4px 4px 14px;
 }
 
-.language-row > span {
+.language-row > span,
+.transcript-row > span {
   display: block;
   margin-bottom: 9px;
   color: var(--muted);
@@ -215,13 +217,15 @@ button {
   font-weight: 700;
 }
 
-.language-row > div {
+.language-row > div,
+.transcript-row > div {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 6px;
 }
 
-.language-row button {
+.language-row button,
+.transcript-row button {
   min-height: 40px;
   padding: 6px;
   color: var(--muted);
@@ -233,10 +237,24 @@ button {
   cursor: pointer;
 }
 
-.language-row button.active {
+.language-row button.active,
+.transcript-row button.active {
   color: var(--bg);
   background: var(--text);
   border-color: var(--text);
+}
+
+.transcript-row {
+  padding-top: 2px;
+}
+
+.transcript-row > small {
+  display: block;
+  min-height: 25px;
+  margin-top: 8px;
+  color: var(--dim);
+  font-size: 9px;
+  line-height: 1.4;
 }
 
 .upload-reel {
@@ -424,11 +442,16 @@ button {
 }
 
 .live-caption span {
-  transition: color 80ms linear;
+  display: inline-block;
+  transform-origin: 50% 72%;
+  transition:
+    color 70ms linear,
+    transform 110ms cubic-bezier(0.2, 1.6, 0.4, 1);
 }
 
 .live-caption span.active {
   color: var(--highlight-color);
+  transform: scale(1.13);
 }
 
 .processing-cover,
@@ -1270,18 +1293,20 @@ button {
 
   .launch-card {
     display: grid;
-    grid-template-columns: 210px 1fr;
+    grid-template-columns: 190px 210px 1fr;
     gap: 10px;
   }
 
-  .language-row {
+  .language-row,
+  .transcript-row {
     display: flex;
     flex-direction: column;
     justify-content: center;
     padding: 14px;
   }
 
-  .language-row > div {
+  .language-row > div,
+  .transcript-row > div {
     grid-template-columns: 1fr;
   }
 

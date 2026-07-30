@@ -65,13 +65,16 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
   assert.match(page, /Advanced SubStation Alpha/);
-  assert.match(page, /ASS \\kf sweep/);
+  assert.match(page, /Whole-word ASS hits/);
+  assert.match(page, /Exact speech/);
   assert.doesNotMatch(page, /initialCaptions|demoDuration|importSrt|Download SRT/);
   assert.match(layout, /og-mobile\.png/);
   assert.match(layout, /x-forwarded-host/);
   assert.match(renderServer, /model: "saaras:v3"/);
-  assert.match(renderServer, /mode: "codemix"/);
+  assert.match(renderServer, /mode: job\.mode \?\? "codemix"/);
+  assert.match(renderServer, /"codemix", "verbatim", "transcribe"/);
   assert.match(renderServer, /with_timestamps: true/);
+  assert.doesNotMatch(renderServer, /\\kf\$\{duration\}/);
   assert.match(renderServer, /processJob/);
   assert.match(renderServer, /\/v1\/jobs\/:id\/result/);
   assert.match(renderServer, /app\.delete\("\/v1\/jobs\/:id"/);

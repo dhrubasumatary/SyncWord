@@ -57,6 +57,38 @@ test("uses low-energy valleys to place monotonic word boundaries", () => {
   assert.ok(words.every((word, index) => !index || word.start >= words[index - 1].end));
   assert.ok(Math.abs(words[0].end - 0.9) < 0.3);
   assert.ok(Math.abs(words[1].end - 1.8) < 0.3);
-  assert.equal(result.summary.method, "phrase-anchored-waveform-dp");
+  assert.equal(result.summary.method, "phrase-anchored-acoustic-dp");
   assert.equal(result.summary.totalWords, 4);
+});
+
+test("uses acoustic changes when a word boundary has no silence", () => {
+  const sampleRate = 16_000;
+  const seconds = 2;
+  const buffer = Buffer.alloc(seconds * sampleRate * 2);
+  for (let sample = 0; sample < seconds * sampleRate; sample += 1) {
+    const time = sample / sampleRate;
+    const frequency = time < 1 ? 155 : 455;
+    const value = Math.round(
+      Math.sin(2 * Math.PI * frequency * time) * 7_000,
+    );
+    buffer.writeInt16LE(value, sample * 2);
+  }
+
+  const result = alignTranscriptWords(
+    [
+      {
+        id: "continuous-phrase",
+        start: 0,
+        end: 2,
+        text: "মোৰ পৰিচয়",
+        language: "as",
+      },
+    ],
+    buffer,
+  );
+
+  const words = result.captions[0].words;
+  assert.equal(words.length, 2);
+  assert.ok(Math.abs(words[0].end - 1) < 0.35);
+  assert.equal(words[0].source, "acoustic-dp");
 });

@@ -49,7 +49,14 @@ function smooth(values) {
   });
 }
 
-export function pcmEnergyEnvelope(
+function normalizeFeature(values) {
+  const floor = percentile(values, 0.1);
+  const ceiling = percentile(values, 0.9);
+  const range = Math.max(0.0001, ceiling - floor);
+  return values.map((value) => clamp((value - floor) / range, 0, 1));
+}
+
+export function pcmAcousticFeatures(
   pcmBuffer,
   {
     sampleRate = DEFAULT_SAMPLE_RATE,
@@ -58,7 +65,9 @@ export function pcmEnergyEnvelope(
 ) {
   const samplesPerFrame = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
   const frameCount = Math.ceil(pcmBuffer.length / 2 / samplesPerFrame);
-  const raw = new Array(frameCount).fill(0);
+  const rawEnergy = new Array(frameCount).fill(0);
+  const rawDifference = new Array(frameCount).fill(0);
+  const rawCrossings = new Array(frameCount).fill(0);
 
   for (let frame = 0; frame < frameCount; frame += 1) {
     const firstSample = frame * samplesPerFrame;
@@ -67,26 +76,77 @@ export function pcmEnergyEnvelope(
       firstSample + samplesPerFrame,
     );
     let squareSum = 0;
+    let differenceSquareSum = 0;
+    let zeroCrossings = 0;
     let sampleCount = 0;
+    let previousValue = 0;
 
     for (let sample = firstSample; sample < lastSample; sample += 1) {
       const value = pcmBuffer.readInt16LE(sample * 2) / 32768;
       squareSum += value * value;
+      if (sampleCount) {
+        const difference = value - previousValue;
+        differenceSquareSum += difference * difference;
+        if ((value >= 0) !== (previousValue >= 0)) zeroCrossings += 1;
+      }
+      previousValue = value;
       sampleCount += 1;
     }
-    raw[frame] = sampleCount ? Math.sqrt(squareSum / sampleCount) : 0;
+    rawEnergy[frame] = sampleCount ? Math.sqrt(squareSum / sampleCount) : 0;
+    rawDifference[frame] =
+      sampleCount > 1
+        ? Math.sqrt(differenceSquareSum / (sampleCount - 1))
+        : 0;
+    rawCrossings[frame] =
+      sampleCount > 1 ? zeroCrossings / (sampleCount - 1) : 0;
   }
 
-  const compressed = raw.map((value) => Math.log1p(value * 24));
-  const smoothed = smooth(compressed);
-  const floor = percentile(smoothed, 0.15);
-  const ceiling = percentile(smoothed, 0.95);
-  const range = Math.max(0.0001, ceiling - floor);
+  const energy = normalizeFeature(
+    smooth(rawEnergy.map((value) => Math.log1p(value * 24))),
+  );
+  const articulation = normalizeFeature(
+    smooth(
+      rawDifference.map(
+        (value, index) => value / Math.max(0.001, rawEnergy[index]),
+      ),
+    ),
+  );
+  const crossings = normalizeFeature(smooth(rawCrossings));
+  const boundary = energy.map((value, index) => {
+    const previousEnergy = energy[index - 2] ?? value;
+    const nextEnergy = energy[index + 2] ?? value;
+    const previousArticulation = articulation[index - 1] ?? articulation[index];
+    const nextArticulation = articulation[index + 1] ?? articulation[index];
+    const previousCrossings = crossings[index - 1] ?? crossings[index];
+    const nextCrossings = crossings[index + 1] ?? crossings[index];
+    const valley =
+      value <= (energy[index - 1] ?? value) &&
+      value <= (energy[index + 1] ?? value)
+        ? 1
+        : 0;
+    return clamp(
+      (1 - value) * 0.52 +
+        Math.abs(nextEnergy - previousEnergy) * 0.18 +
+        Math.abs(nextArticulation - previousArticulation) * 0.17 +
+        Math.abs(nextCrossings - previousCrossings) * 0.09 +
+        valley * 0.08,
+      0,
+      1,
+    );
+  });
 
-  return smoothed.map((value) => clamp((value - floor) / range, 0, 1));
+  return { energy, boundary };
 }
 
-function weightedFallback(words, start, end) {
+export function pcmEnergyEnvelope(pcmBuffer, options = {}) {
+  return pcmAcousticFeatures(pcmBuffer, options).energy;
+}
+
+function captionWordId(caption, index) {
+  return `${String(caption?.id ?? "caption")}-word-${index + 1}`;
+}
+
+function weightedFallback(caption, words, start, end) {
   const weights = words.map(wordWeight);
   const totalWeight = weights.reduce((sum, value) => sum + value, 0);
   let cursor = start;
@@ -97,7 +157,7 @@ function weightedFallback(words, start, end) {
         : ((end - start) * weights[index]) / totalWeight;
     const wordEnd = index === words.length - 1 ? end : cursor + duration;
     const timing = {
-      id: `word-${index + 1}`,
+      id: captionWordId(caption, index),
       text: word,
       start: Number(cursor.toFixed(3)),
       end: Number(wordEnd.toFixed(3)),
@@ -114,7 +174,8 @@ export function alignCaptionWords(
   energy,
   {
     frameMs = DEFAULT_FRAME_MS,
-    minimumWordMs = 80,
+    minimumWordMs = 110,
+    boundaryLikelihood,
   } = {},
 ) {
   const words = tokenizeWords(caption.text);
@@ -124,7 +185,7 @@ export function alignCaptionWords(
     return [];
   }
   if (words.length === 1 || !energy?.length) {
-    return weightedFallback(words, start, end);
+    return weightedFallback(caption, words, start, end);
   }
 
   const startFrame = clamp(
@@ -141,7 +202,7 @@ export function alignCaptionWords(
   const minimumFrames = Math.max(1, Math.ceil(minimumWordMs / frameMs));
 
   if (availableFrames < words.length * minimumFrames) {
-    return weightedFallback(words, start, end);
+    return weightedFallback(caption, words, start, end);
   }
 
   const weights = words.map(wordWeight);
@@ -168,14 +229,17 @@ export function alignCaptionWords(
       const next = energy[frame + 1] ?? frameEnergy;
       const isValley = frameEnergy <= previous && frameEnergy <= next;
       const distance = Math.abs(frame - target) / Math.max(1, searchRadius);
+      const acousticBoundary =
+        boundaryLikelihood?.[frame] ??
+        clamp(1 - frameEnergy + (isValley ? 0.08 : 0), 0, 1);
       const localCost =
-        frameEnergy * 0.68 + distance * 0.28 - (isValley ? 0.08 : 0);
+        (1 - acousticBoundary) * 0.7 + distance * 0.3;
       const proximity = 1 - Math.min(1, distance);
       candidates.push({
         frame,
         localCost,
         confidence: clamp(
-          0.5 + (1 - frameEnergy) * 0.34 + proximity * 0.16,
+          0.44 + acousticBoundary * 0.4 + proximity * 0.16,
           0.42,
           0.97,
         ),
@@ -234,7 +298,7 @@ export function alignCaptionWords(
     0,
   );
   if (!Number.isFinite(costs[lastLayerIndex][selectedIndex])) {
-    return weightedFallback(words, start, end);
+    return weightedFallback(caption, words, start, end);
   }
 
   const selectedBoundaries = new Array(candidateLayers.length);
@@ -260,12 +324,12 @@ export function alignCaptionWords(
         ? (leftConfidence + rightConfidence) / 2
         : leftConfidence ?? rightConfidence ?? 0.72;
     return {
-      id: `word-${index + 1}`,
+      id: captionWordId(caption, index),
       text: word,
       start: Number(((boundaryFrames[index] * frameMs) / 1000).toFixed(3)),
       end: Number(((boundaryFrames[index + 1] * frameMs) / 1000).toFixed(3)),
       confidence: Number(confidence.toFixed(2)),
-      source: "waveform-dp",
+      source: "acoustic-dp",
     };
   });
 }
@@ -278,17 +342,20 @@ export function alignTranscriptWords(
     frameMs = DEFAULT_FRAME_MS,
   } = {},
 ) {
-  const energy = pcmEnergyEnvelope(pcmBuffer, { sampleRate, frameMs });
+  const features = pcmAcousticFeatures(pcmBuffer, { sampleRate, frameMs });
   let waveformAlignedWords = 0;
   let totalWords = 0;
   let confidenceSum = 0;
 
   const alignedCaptions = captions.map((caption) => {
-    const words = alignCaptionWords(caption, energy, { frameMs });
+    const words = alignCaptionWords(caption, features.energy, {
+      frameMs,
+      boundaryLikelihood: features.boundary,
+    });
     for (const word of words) {
       totalWords += 1;
       confidenceSum += word.confidence;
-      if (word.source === "waveform-dp") waveformAlignedWords += 1;
+      if (word.source === "acoustic-dp") waveformAlignedWords += 1;
     }
     return { ...caption, words };
   });
@@ -296,7 +363,7 @@ export function alignTranscriptWords(
   return {
     captions: alignedCaptions,
     summary: {
-      method: "phrase-anchored-waveform-dp",
+      method: "phrase-anchored-acoustic-dp",
       totalWords,
       waveformAlignedWords,
       averageConfidence: totalWords

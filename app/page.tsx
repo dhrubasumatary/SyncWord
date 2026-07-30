@@ -14,7 +14,7 @@ type WordTiming = {
   start: number;
   end: number;
   confidence: number;
-  source: "waveform-dp" | "grapheme-prior" | "manual";
+  source: "acoustic-dp" | "grapheme-prior" | "manual";
 };
 
 type Caption = {
@@ -75,6 +75,7 @@ type JobResponse = {
 
 type StudioTab = "captions" | "style" | "export";
 type EngineState = "offline" | "waking" | "online";
+type TranscriptMode = "codemix" | "verbatim" | "transcribe";
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
 
@@ -234,30 +235,63 @@ async function pingRenderEngine(apiBase: string) {
 }
 
 function groupWordsForReels(words: WordTiming[], maxWords: number) {
-  const groups: WordTiming[][] = [];
-  let current: WordTiming[] = [];
-  for (const word of words) {
-    const nextDuration = current.length
-      ? word.end - current[0].start
-      : word.end - word.start;
-    const nextGlyphs = [...current, word].reduce(
-      (sum, item) => sum + Array.from(item.text).length,
+  if (!words.length) return [];
+  if (words.length <= 2) return [words];
+
+  const preferredMaximum = Math.max(2, Math.min(7, Math.round(maxWords)));
+  const hardMaximum = Math.min(words.length, preferredMaximum + 1);
+  const best = new Array(words.length + 1).fill(Number.POSITIVE_INFINITY);
+  const parent = new Array(words.length + 1).fill(-1);
+  best[0] = 0;
+  const endsStrongPhrase = (text: string) =>
+    /[.!?।॥…]["'”’)]*$/u.test(text.trim());
+
+  const penalty = (start: number, end: number) => {
+    const count = end - start;
+    const slice = words.slice(start, end);
+    const duration = slice.at(-1)!.end - slice[0].start;
+    const glyphs = slice.reduce(
+      (sum, word) => sum + Array.from(word.text).length,
       0,
     );
-    if (
-      current.length &&
-      (current.length >= maxWords || nextDuration > 2.6 || nextGlyphs > 30)
-    ) {
-      groups.push(current);
-      current = [];
+    let score = Math.abs(count - Math.min(preferredMaximum, 4)) * 2.2;
+    if (count === 1 && words.length > 1) score += 1_000;
+    if (count > preferredMaximum) {
+      score += (count - preferredMaximum) ** 2 * 70;
     }
-    current.push(word);
-    if (current.length >= 2 && /[.!?।॥…]$/u.test(word.text)) {
-      groups.push(current);
-      current = [];
+    if (duration > 2.8) score += (duration - 2.8) ** 2 * 18;
+    if (glyphs > 30) score += (glyphs - 30) ** 2 * 0.35;
+    if (words.length - end === 1) score += 800;
+    if (endsStrongPhrase(slice.at(-1)!.text)) score -= 7;
+    if (/[,:;—–-]$/u.test(slice.at(-1)!.text)) score -= 3;
+    if (slice.slice(0, -1).some((word) => endsStrongPhrase(word.text))) {
+      score += 24;
+    }
+    return score;
+  };
+
+  for (let end = 1; end <= words.length; end += 1) {
+    for (
+      let start = Math.max(0, end - hardMaximum);
+      start < end;
+      start += 1
+    ) {
+      if (!Number.isFinite(best[start])) continue;
+      const candidate = best[start] + penalty(start, end);
+      if (candidate < best[end]) {
+        best[end] = candidate;
+        parent[end] = start;
+      }
     }
   }
-  if (current.length) groups.push(current);
+
+  const groups: WordTiming[][] = [];
+  for (let end = words.length; end > 0; ) {
+    const start = parent[end];
+    if (start < 0) return [words];
+    groups.unshift(words.slice(start, end));
+    end = start;
+  }
   return groups;
 }
 
@@ -270,6 +304,8 @@ export default function Home() {
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [language, setLanguage] = useState("unknown");
+  const [transcriptMode, setTranscriptMode] =
+    useState<TranscriptMode>("codemix");
   const [captionStyle, setCaptionStyle] = useState(defaultStyle);
   const [captions, setCaptions] = useState<Caption[]>([]);
   const [selectedCaptionId, setSelectedCaptionId] = useState("");
@@ -454,7 +490,7 @@ export default function Home() {
       const payload = new FormData();
       payload.append("video", nextFile);
       payload.append("language", language);
-      payload.append("mode", "codemix");
+      payload.append("mode", transcriptMode);
       payload.append("style", JSON.stringify(captionStyle));
       const response = await fetch(`${apiBase}/v1/jobs`, {
         method: "POST",
@@ -732,6 +768,34 @@ export default function Home() {
               </div>
             </div>
 
+            <div className="transcript-row">
+              <span>Transcript</span>
+              <div>
+                {[
+                  ["codemix", "Natural mix"],
+                  ["verbatim", "Exact speech"],
+                  ["transcribe", "Clean"],
+                ].map(([value, label]) => (
+                  <button
+                    key={value}
+                    className={transcriptMode === value ? "active" : ""}
+                    onClick={() =>
+                      setTranscriptMode(value as TranscriptMode)
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <small>
+                {transcriptMode === "verbatim"
+                  ? "Keeps fillers and repetitions. Timing is aligned separately."
+                  : transcriptMode === "transcribe"
+                    ? "Normalizes speech into a cleaner native-script transcript."
+                    : "English stays English; Indic speech stays in its native script."}
+              </small>
+            </div>
+
             <button
               className="upload-reel"
               onClick={() => videoInputRef.current?.click()}
@@ -755,7 +819,7 @@ export default function Home() {
             </li>
             <li>
               <b>02</b>
-              <span>Waveform alignment snaps every word</span>
+              <span>Phrase-aware acoustic alignment times each hit</span>
             </li>
             <li>
               <b>03</b>
@@ -1195,7 +1259,7 @@ export default function Home() {
                     </div>
                     <div>
                       <span>Word effect</span>
-                      <strong>ASS \kf sweep</strong>
+                      <strong>Whole-word ASS hits</strong>
                     </div>
                     <div>
                       <span>Compatibility</span>

@@ -15,6 +15,10 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import {
+  groupWordsForReels,
+  stitchShortCaptionPhrases,
+} from "./caption-groups.mjs";
 import { alignTranscriptWords } from "./word-aligner.mjs";
 
 const app = express();
@@ -227,6 +231,9 @@ async function restoreJobs() {
         continue;
       }
       job.directory = directory;
+      job.mode = ["codemix", "verbatim", "transcribe"].includes(job.mode)
+        ? job.mode
+        : "codemix";
       ensureJobRuntime(job);
       for (const pathKey of [
         "inputPath",
@@ -661,7 +668,7 @@ async function transcribe(job) {
         body: JSON.stringify({
           job_parameters: {
             model: "saaras:v3",
-            mode: "codemix",
+            mode: job.mode ?? "codemix",
             language_code: job.language,
             with_timestamps: true,
             with_diarization: false,
@@ -725,6 +732,7 @@ async function transcribe(job) {
       { sampleRate: 16_000, frameMs: 20 },
     );
     job.captions = aligned.captions;
+    job.captions = stitchShortCaptionPhrases(job.captions);
     job.alignment = aligned.summary;
     updateJob(
       job,
@@ -806,37 +814,6 @@ function animationTag(animation, position, playResX, playResY) {
   return "{\\fscx84\\fscy84\\t(0,190,\\fscx100\\fscy100)\\fad(60,100)}";
 }
 
-function groupWordsForReels(words, maxWords) {
-  const groups = [];
-  let current = [];
-  for (const word of words) {
-    const nextDuration = current.length
-      ? Number(word.end) - Number(current[0].start)
-      : Number(word.end) - Number(word.start);
-    const nextGlyphs = [...current, word].reduce(
-      (sum, item) => sum + Array.from(String(item.text ?? "")).length,
-      0,
-    );
-    if (
-      current.length &&
-      (current.length >= maxWords || nextDuration > 2.6 || nextGlyphs > 30)
-    ) {
-      groups.push(current);
-      current = [];
-    }
-    current.push(word);
-    if (
-      current.length >= 2 &&
-      /[.!?।॥…]$/u.test(String(word.text ?? ""))
-    ) {
-      groups.push(current);
-      current = [];
-    }
-  }
-  if (current.length) groups.push(current);
-  return groups;
-}
-
 function createAss(captions, rawStyle, languageCode, video = {}) {
   const supportedFonts = new Set([
     "Noto Sans Bengali",
@@ -901,35 +878,49 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
                 },
               ],
             ];
-      return groups.map((words) => {
-        const text =
-          Array.isArray(caption.words) && caption.words.length
-            ? words
-              .map((word, index) => {
-                const duration = Math.max(
-                  1,
-                  Math.round(
-                    (Number(word.end) - Number(word.start)) * 100,
-                  ),
-                );
-                const wordText = escapeAssText(
-                  word.text,
-                  style.uppercaseEnglish,
-                );
-                return `{\\kf${duration}}${wordText}${
-                  index === words.length - 1 ? "" : " "
-                }`;
-              })
-              .join("")
-            : escapeAssText(words[0].text, style.uppercaseEnglish);
-        return `Dialogue: 0,${assTime(words[0].start)},${assTime(
-          words.at(-1).end,
-        )},Default,,0,0,0,,${animationTag(
-          style.animation,
-          style.position,
-          playResX,
-          playResY,
-        )}${text}`;
+      return groups.flatMap((words) => {
+        if (!Array.isArray(caption.words) || !caption.words.length) {
+          return `Dialogue: 0,${assTime(words[0].start)},${assTime(
+            words.at(-1).end,
+          )},Default,,0,0,0,,${animationTag(
+            style.animation,
+            style.position,
+            playResX,
+            playResY,
+          )}${escapeAssText(words[0].text, style.uppercaseEnglish)}`;
+        }
+
+        return words.map((activeWord, activeIndex) => {
+          const eventEnd =
+            words[activeIndex + 1]?.start ?? activeWord.end;
+          const text = words
+            .map((word, index) => {
+              const wordText = escapeAssText(
+                word.text,
+                style.uppercaseEnglish,
+              );
+              const color = index === activeIndex ? secondary : primary;
+              const scale = index === activeIndex
+                ? "\\fscx116\\fscy116\\t(0,120,\\fscx106\\fscy106)"
+                : "\\fscx100\\fscy100";
+              return `{\\1c${color}&${scale}}${wordText}${
+                index === words.length - 1 ? "" : " "
+              }`;
+            })
+            .join("");
+          const entrance =
+            activeIndex === 0
+              ? animationTag(
+                  style.animation,
+                  style.position,
+                  playResX,
+                  playResY,
+                )
+              : "";
+          return `Dialogue: 0,${assTime(activeWord.start)},${assTime(
+            eventEnd,
+          )},Default,,0,0,0,,${entrance}${text}`;
+        });
       });
     })
     .join("\n");
@@ -1112,12 +1103,18 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
   )
     ? request.body.language
     : "unknown";
+  const mode = ["codemix", "verbatim", "transcribe"].includes(
+    request.body.mode,
+  )
+    ? request.body.mode
+    : "codemix";
   const job = {
     id,
     directory,
     inputPath,
     originalName: request.file.originalname,
     language,
+    mode,
     style: objectFromField(request.body.style),
     status: "queued",
     progress: 3,
