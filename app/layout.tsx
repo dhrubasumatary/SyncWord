@@ -26,32 +26,32 @@ export async function generateMetadata(): Promise<Metadata> {
 
   return {
     metadataBase: new URL(origin),
-    title: "SyncWord — Caption Indian voices, beautifully",
+    title: "SyncWord — Word timing without word timestamps",
     description:
-      "An India-first video caption studio with Saaras v3 transcription, live style previews, and ASS-powered ffmpeg rendering.",
+      "Phrase-anchored waveform alignment for Assamese and Bodo karaoke captions, with confidence review and ASS-powered rendering.",
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",
     },
     openGraph: {
       title: "SyncWord",
-      description: "Caption Indian voices, beautifully.",
+      description: "Word timing without word timestamps.",
       type: "website",
       url: origin,
       images: [
         {
-          url: `${origin}/og.png`,
+          url: `${origin}/og-wordsync.png`,
           width: 1536,
           height: 1024,
-          alt: "SyncWord caption editor preview",
+          alt: "SyncWord phrase-to-word timing editor",
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
       title: "SyncWord",
-      description: "Caption Indian voices, beautifully.",
-      images: [`${origin}/og.png`],
+      description: "Word timing without word timestamps.",
+      images: [`${origin}/og-wordsync.png`],
     },
   };
 }

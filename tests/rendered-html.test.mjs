@@ -38,11 +38,12 @@ test("server-renders the SyncWord editor", async () => {
   const html = await response.text();
   assert.match(
     html,
-    /<title>SyncWord — Caption Indian voices, beautifully<\/title>/i,
+    /<title>SyncWord — Word timing without word timestamps<\/title>/i,
   );
-  assert.match(html, /Caption Indian voices, beautifully\./);
-  assert.match(html, /Saaras v3/);
-  assert.match(html, /Live style preview/);
+  assert.match(html, /Word\s?Sync/i);
+  assert.match(html, /Sarvam phrase/);
+  assert.match(html, /Audio valleys/);
+  assert.match(html, /ASS karaoke/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
@@ -55,7 +56,7 @@ test("removes the disposable starter and wires product metadata", async () => {
 
   assert.match(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
-  assert.match(layout, /og\.png/);
+  assert.match(layout, /og-wordsync\.png/);
   assert.match(layout, /x-forwarded-host/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await assert.rejects(

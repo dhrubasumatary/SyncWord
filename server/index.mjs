@@ -12,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { alignTranscriptWords } from "./word-aligner.mjs";
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
@@ -61,6 +62,7 @@ function publicJob(job) {
     progress: job.progress,
     message: job.message,
     captions: job.captions,
+    alignment: job.alignment,
     languageCode: job.languageCode,
     downloadUrl:
       job.status === "complete" ? `/v1/jobs/${job.id}/download` : undefined,
@@ -382,11 +384,40 @@ async function transcribe(job) {
       JSON.stringify(transcript, null, 2),
       "utf8",
     );
+    updateJob(job, "transcribing", 76, "Aligning words to waveform valleys");
+    await run(
+      process.env.FFMPEG_PATH ?? "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "audio.wav",
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "audio.pcm",
+      ],
+      { cwd: job.directory },
+    );
+    const aligned = alignTranscriptWords(
+      job.captions,
+      await readFile(path.join(job.directory, "audio.pcm")),
+      { sampleRate: 16_000, frameMs: 20 },
+    );
+    job.captions = aligned.captions;
+    job.alignment = aligned.summary;
     updateJob(
       job,
       "ready",
-      78,
-      `${job.captions.length} phrase blocks ready for review`,
+      82,
+      `${aligned.summary.totalWords} words aligned · ${aligned.summary.needsReview} need review`,
     );
   } catch (error) {
     updateJob(
@@ -463,6 +494,7 @@ function createAss(captions, rawStyle, languageCode) {
     textColor: rawStyle?.textColor ?? "#fff9ee",
     backgroundColor: rawStyle?.backgroundColor ?? "#171a27",
     backgroundOpacity: clamp(rawStyle?.backgroundOpacity, 0, 100, 78),
+    highlightColor: rawStyle?.highlightColor ?? "#ffde59",
     outlineColor: rawStyle?.outlineColor ?? "#171a27",
     outlineWidth: clamp(rawStyle?.outlineWidth, 0, 8, 2),
     position: clamp(rawStyle?.position, 52, 92, 83),
@@ -479,6 +511,7 @@ function createAss(captions, rawStyle, languageCode) {
   const borderStyle = style.backgroundOpacity > 0 ? 3 : 1;
   const bold = style.weight >= 700 ? -1 : 0;
   const primary = hexToAss(style.textColor);
+  const secondary = hexToAss(style.highlightColor);
   const outline = hexToAss(style.outlineColor);
   const background = hexToAss(
     style.backgroundColor,
@@ -492,10 +525,26 @@ function createAss(captions, rawStyle, languageCode) {
         String(caption.text ?? "").trim(),
     )
     .map((caption) => {
-      const text = escapeAssText(
-        caption.text,
-        style.uppercaseEnglish,
-      );
+      const text =
+        Array.isArray(caption.words) && caption.words.length
+          ? caption.words
+              .map((word, index) => {
+                const duration = Math.max(
+                  1,
+                  Math.round(
+                    (Number(word.end) - Number(word.start)) * 100,
+                  ),
+                );
+                const wordText = escapeAssText(
+                  word.text,
+                  style.uppercaseEnglish,
+                );
+                return `{\\kf${duration}}${wordText}${
+                  index === caption.words.length - 1 ? "" : " "
+                }`;
+              })
+              .join("")
+          : escapeAssText(caption.text, style.uppercaseEnglish);
       return `Dialogue: 0,${assTime(caption.start)},${assTime(
         caption.end,
       )},Default,,0,0,0,,${animationTag(style.animation)}${text}`;
@@ -513,7 +562,7 @@ YCbCr Matrix: TV.709
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,${style.fontFamily},${style.fontSize},${primary},${primary},${outline},${background},${bold},0,0,0,100,100,0,0,${borderStyle},${style.outlineWidth},0,2,90,90,${marginV},1
+Style: Default,${style.fontFamily},${style.fontSize},${primary},${secondary},${outline},${background},${bold},0,0,0,100,100,0,0,${borderStyle},${style.outlineWidth},0,2,90,90,${marginV},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
