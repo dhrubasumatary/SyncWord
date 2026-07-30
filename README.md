@@ -41,14 +41,13 @@ The web editor runs at `http://localhost:3000`; the render API runs at
 ## Container render service
 
 `server/Dockerfile` installs ffmpeg plus Noto script fonts and starts the render
-API. Set `SARVAM_API_KEY`, `ALLOWED_ORIGINS`, and a persistent volume mounted at
-`/data/syncword` in production.
+API. Set `SARVAM_API_KEY` and `ALLOWED_ORIGINS` in production.
 
-`render.yaml` defines the v1 production topology: one Docker web service in
-Singapore, one serialized in-process render queue, and one encrypted persistent
-disk. Job metadata and artifacts survive restarts and expire after 24 hours.
-There is deliberately no product database, account system, or distributed queue
-in v1.
+`render.yaml` defines the hobby MVP topology: one free Docker web service in
+Singapore, one serialized in-process render queue, ephemeral `/tmp` storage,
+and two-hour artifact expiry. Reels are limited to 150 MB and three minutes.
+Users download results in the same session. Render restarts or free-tier sleep
+can discard active jobs; persistent storage and a durable queue are a v2 concern.
 
 ## API
 

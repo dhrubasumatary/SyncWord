@@ -73,6 +73,7 @@ type JobResponse = {
 };
 
 type StudioTab = "captions" | "style" | "export";
+type EngineState = "offline" | "waking" | "online";
 
 const defaultStyle: CaptionStyle = {
   fontFamily: "Noto Sans Bengali",
@@ -207,6 +208,28 @@ function statusStep(status?: JobStatus) {
   return 0;
 }
 
+function clientDelay(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function pingRenderEngine(apiBase: string) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(`${apiBase}/health`, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    const payload = (await response.json()) as { ok?: boolean };
+    return payload.ok === true;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 function groupWordsForReels(words: WordTiming[], maxWords: number) {
   const groups: WordTiming[][] = [];
   let current: WordTiming[] = [];
@@ -250,6 +273,8 @@ export default function Home() {
   const [selectedWordIndex, setSelectedWordIndex] = useState(0);
   const [job, setJob] = useState<JobResponse | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [engineState, setEngineState] =
+    useState<EngineState>("offline");
   const [hasChanges, setHasChanges] = useState(false);
   const [toast, setToast] = useState("");
   const hydrated = useSyncExternalStore(
@@ -332,6 +357,29 @@ export default function Home() {
   }, [toast]);
 
   useEffect(() => {
+    let active = true;
+    if (!apiBase) {
+      return () => {
+        active = false;
+      };
+    }
+    void (async () => {
+      if (active) setEngineState("waking");
+      for (let attempt = 0; attempt < 18 && active; attempt += 1) {
+        if (await pingRenderEngine(apiBase)) {
+          if (active) setEngineState("online");
+          return;
+        }
+        await clientDelay(4_000);
+      }
+      if (active) setEngineState("offline");
+    })();
+    return () => {
+      active = false;
+    };
+  }, [apiBase]);
+
+  useEffect(() => {
     if (!job || !apiBase || ["complete", "failed"].includes(job.status)) {
       return;
     }
@@ -339,7 +387,20 @@ export default function Home() {
     const interval = window.setInterval(async () => {
       try {
         const response = await fetch(`${apiBase}/v1/jobs/${jobId}`);
+        if (response.status === 404) {
+          const failedJob: JobResponse = {
+            ...job,
+            status: "failed",
+            progress: job.progress,
+            message:
+              "The free render engine restarted. Tap Try again to rebuild this reel.",
+          };
+          setJob(failedJob);
+          setToast(failedJob.message ?? "Render restarted.");
+          return;
+        }
         if (!response.ok) return;
+        setEngineState("online");
         const next = (await response.json()) as JobResponse;
         setJob(next);
         if (next.captions?.length) {
@@ -353,7 +414,7 @@ export default function Home() {
           setToast(next.message ?? "Processing failed.");
         }
       } catch {
-        setToast("The render engine is unreachable.");
+        setEngineState("waking");
       }
     }, 2000);
     return () => window.clearInterval(interval);
@@ -366,6 +427,22 @@ export default function Home() {
     }
     setUploading(true);
     try {
+      setEngineState("waking");
+      setToast("Waking the hobby render engine. First use can take a minute.");
+      let engineReady = false;
+      for (let attempt = 0; attempt < 18; attempt += 1) {
+        if (await pingRenderEngine(apiBase)) {
+          engineReady = true;
+          setEngineState("online");
+          break;
+        }
+        await clientDelay(4_000);
+      }
+      if (!engineReady) {
+        throw new Error(
+          "The free render engine is still waking. Tap Try again in a moment.",
+        );
+      }
       const payload = new FormData();
       payload.append("video", nextFile);
       payload.append("language", language);
@@ -392,6 +469,10 @@ export default function Home() {
       /\.(mp4|mov|webm|mkv|m4v)$/i.test(nextFile.name);
     if (!looksLikeVideo) {
       setToast("Choose an MP4, MOV, WebM, MKV, or M4V video.");
+      return;
+    }
+    if (nextFile.size > 150 * 1024 * 1024) {
+      setToast("Keep the reel under 150 MB for the hobby beta.");
       return;
     }
     if (videoUrl) URL.revokeObjectURL(videoUrl);
@@ -542,9 +623,13 @@ export default function Home() {
           </i>
           <strong>syncword</strong>
         </a>
-        <div className={`engine-state ${apiBase ? "online" : ""}`}>
+        <div className={`engine-state ${engineState}`}>
           <span />
-          {apiBase ? "render online" : "engine offline"}
+          {engineState === "online"
+            ? "render online"
+            : engineState === "waking"
+              ? "waking render"
+              : "engine offline"}
         </div>
       </header>
 
@@ -603,7 +688,7 @@ export default function Home() {
             >
               <i>＋</i>
               <strong>Upload your reel</strong>
-              <small>Processing starts automatically · up to 500 MB</small>
+              <small>Hobby beta · up to 3 min / 150 MB</small>
             </button>
           </div>
 
@@ -1061,6 +1146,10 @@ export default function Home() {
                       </button>
                     </div>
                   )}
+                  <p className="hobby-note">
+                    Hobby MVP files are temporary. Download the final MP4 in
+                    this session.
+                  </p>
                 </div>
               )}
             </div>

@@ -138,6 +138,23 @@ button {
   box-shadow: 0 0 9px rgba(215, 255, 56, 0.7);
 }
 
+.engine-state.waking {
+  color: #d9b779;
+}
+
+.engine-state.waking > span {
+  background: #ffbb47;
+  animation: engine-pulse 1.25s ease-in-out infinite;
+  box-shadow: 0 0 9px rgba(255, 187, 71, 0.55);
+}
+
+@keyframes engine-pulse {
+  50% {
+    opacity: 0.35;
+    transform: scale(0.72);
+  }
+}
+
 .launch {
   width: min(100%, 780px);
   margin: 0 auto;
@@ -1120,6 +1137,16 @@ button {
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--line);
+}
+
+.hobby-note {
+  margin: 14px 4px 0;
+  color: var(--dim);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  line-height: 1.45;
+  text-align: center;
+  text-transform: uppercase;
 }
 
 .action-dock {

@@ -43,7 +43,8 @@ test("server-renders the SyncWord editor", async () => {
   assert.match(html, /Your words\./);
   assert.match(html, /On beat\./);
   assert.match(html, /Upload your reel/);
-  assert.match(html, /Processing starts automatically/);
+  assert.match(html, /Hobby beta/);
+  assert.match(html, /3 min \/ 150 MB/);
   assert.match(html, /No mock transcript/);
   assert.match(html, /ASS/);
   assert.doesNotMatch(

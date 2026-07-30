@@ -290,21 +290,36 @@ async function probeVideo(job) {
       "-select_streams",
       "v:0",
       "-show_entries",
-      "stream=width,height,r_frame_rate",
+      "stream=width,height,r_frame_rate:format=duration",
       "-of",
       "json",
       path.basename(job.inputPath),
     ],
     { cwd: job.directory },
   );
-  const stream = JSON.parse(output).streams?.[0];
+  const probe = JSON.parse(output);
+  const stream = probe.streams?.[0];
   if (!stream?.width || !stream?.height) {
     throw new Error("The upload does not contain a readable video stream.");
+  }
+  const duration = Number(probe.format?.duration);
+  const maxDuration = Number(
+    process.env.MAX_VIDEO_DURATION_SECONDS ?? 600,
+  );
+  if (
+    Number.isFinite(duration) &&
+    Number.isFinite(maxDuration) &&
+    duration > maxDuration
+  ) {
+    throw new Error(
+      `Keep this reel under ${Math.floor(maxDuration / 60)} minutes for the hobby beta.`,
+    );
   }
   job.video = {
     width: Number(stream.width),
     height: Number(stream.height),
     frameRate: String(stream.r_frame_rate ?? ""),
+    duration: Number.isFinite(duration) ? duration : undefined,
   };
   void persistJob(job);
 }
@@ -892,6 +907,10 @@ async function renderVideo(job, captions, style) {
     );
 
     updateJob(job, "complete", 100, "Captioned video ready");
+    await Promise.allSettled([
+      unlink(path.join(job.directory, "audio.wav")),
+      unlink(path.join(job.directory, "audio.pcm")),
+    ]);
   } catch (error) {
     updateJob(
       job,
@@ -929,6 +948,7 @@ app.get("/health", (_request, response) => {
     queueDepth: taskQueue.length,
     active: queueRunning,
     retentionHours: jobLifetimeMs / 3_600_000,
+    deploymentMode: process.env.DEPLOYMENT_MODE ?? "standard",
   });
 });
 

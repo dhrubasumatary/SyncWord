@@ -2,7 +2,7 @@ services:
   - type: web
     name: syncword-render-dhrub404
     runtime: docker
-    plan: starter
+    plan: free
     region: singapore
     dockerfilePath: ./server/Dockerfile
     dockerContext: .
@@ -16,20 +16,20 @@ services:
       - key: ALLOWED_ORIGINS
         value: https://syncword-caption-studio.dhrub404.chatgpt.site
       - key: RUNTIME_DIR
-        value: /data/syncword
+        value: /tmp/syncword
       - key: CAPTION_FONTS_DIR
         value: /usr/share/fonts/truetype/noto
       - key: FFMPEG_PRESET
-        value: fast
+        value: veryfast
       - key: FFMPEG_CRF
-        value: "18"
+        value: "20"
       - key: MAX_UPLOAD_BYTES
-        value: "524288000"
+        value: "157286400"
       - key: MAX_QUEUED_JOBS
-        value: "4"
+        value: "2"
       - key: JOB_RETENTION_HOURS
-        value: "24"
-    disk:
-      name: syncword-jobs
-      mountPath: /data/syncword
-      sizeGB: 10
+        value: "2"
+      - key: MAX_VIDEO_DURATION_SECONDS
+        value: "180"
+      - key: DEPLOYMENT_MODE
+        value: hobby
