@@ -28,7 +28,7 @@ export async function generateMetadata(): Promise<Metadata> {
     metadataBase: new URL(origin),
     title: "SyncWord — Make every word hit on time",
     description:
-      "Phrase-anchored waveform alignment for Assamese and Bodo karaoke captions, with confidence review and ASS-powered rendering.",
+      "GPU CTC forced alignment for Assamese and Bodo karaoke captions, with confidence review and ASS-powered rendering.",
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",

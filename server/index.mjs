@@ -4,6 +4,7 @@ import express from "express";
 import multer from "multer";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createWriteStream } from "node:fs";
 import {
   copyFile,
   mkdir,
@@ -15,6 +16,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   captionsHaveWordTimings,
   groupWordsForReels,
@@ -31,9 +34,12 @@ const uploadRoot = path.join(runtimeRoot, "incoming");
 const jobsRoot = path.join(runtimeRoot, "jobs");
 const sarvamBaseUrl =
   process.env.SARVAM_BASE_URL ?? "https://api.sarvam.ai";
+const defaultModalAlignerUrl =
+  "https://dhrubasumatary--syncword-aligner-alignment-api.modal.run";
 const jobs = new Map();
 const taskQueue = [];
 const persistenceQueue = new Map();
+const remoteSyncQueue = new Map();
 const configuredRetentionHours = Number(
   process.env.JOB_RETENTION_HOURS ?? 24,
 );
@@ -144,6 +150,64 @@ function updateJob(job, status, progress, message) {
     updatedAt: new Date().toISOString(),
   });
   void persistJob(job);
+  void syncRemoteJob(job);
+}
+
+function remoteAuthorization(job) {
+  return {
+    authorization: `Bearer ${job.remote.capabilityToken}`,
+    ...(job.remote.sitesAuthorization
+      ? {
+          "oai-sites-authorization": `Bearer ${job.remote.sitesAuthorization}`,
+        }
+      : {}),
+  };
+}
+
+function syncRemoteJob(job) {
+  if (!job.remote) return Promise.resolve();
+  const snapshot = publicJob(job);
+  const previous = remoteSyncQueue.get(job.id) ?? Promise.resolve();
+  const pending = previous
+    .catch(() => {})
+    .then(async () => {
+      const response = await fetch(`${job.remote.callbackBase}/state`, {
+        method: "PUT",
+        headers: {
+          ...remoteAuthorization(job),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(snapshot),
+      });
+      if (!response.ok) {
+        throw new Error(`Remote state callback returned ${response.status}.`);
+      }
+    })
+    .catch((error) => {
+      console.error(`Could not sync remote job ${job.id}:`, error);
+    });
+  remoteSyncQueue.set(job.id, pending);
+  return pending;
+}
+
+async function uploadRemoteArtifact(job, artifact, filePath, contentType) {
+  if (!job.remote) return;
+  const response = await fetch(`${job.remote.callbackBase}/${artifact}`, {
+    method: "PUT",
+    headers: {
+      ...remoteAuthorization(job),
+      "content-type": contentType,
+    },
+    body: await readFile(filePath),
+    signal: ensureJobRuntime(job).abortController.signal,
+  });
+  throwIfCancelled(job);
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(
+      `Could not save ${artifact} to durable storage (${response.status}). ${detail}`.trim(),
+    );
+  }
 }
 
 function isCancelled(job) {
@@ -634,6 +698,70 @@ async function downloadTranscript(job, sarvamJobId, status) {
   return transcriptResponse.json();
 }
 
+function modalAlignerEndpoint() {
+  const configured = String(
+    process.env.MODAL_ALIGNER_URL ?? defaultModalAlignerUrl,
+  )
+    .trim()
+    .replace(/\/+$/, "");
+  if (!configured) return "";
+  return configured.endsWith("/v1/align")
+    ? configured
+    : `${configured}/v1/align`;
+}
+
+async function alignTranscriptWithModal(job) {
+  const endpoint = modalAlignerEndpoint();
+  if (!endpoint) return null;
+
+  const audio = await readFile(path.join(job.directory, "audio.wav"));
+  const captions = job.captions.map(({ words: _words, ...caption }) => {
+    void _words;
+    return caption;
+  });
+  const payload = new FormData();
+  payload.append(
+    "audio",
+    new Blob([audio], { type: "audio/wav" }),
+    `${job.id}.wav`,
+  );
+  payload.append("captions", JSON.stringify(captions));
+
+  updateJob(
+    job,
+    "transcribing",
+    76,
+    "Locking every word to GPU acoustic frames",
+  );
+  const response = await fetch(endpoint, {
+    method: "POST",
+    body: payload,
+    signal: ensureJobRuntime(job).abortController.signal,
+  });
+  throwIfCancelled(job);
+
+  const text = await response.text();
+  let result;
+  try {
+    result = text ? JSON.parse(text) : {};
+  } catch {
+    result = { detail: text };
+  }
+  if (!response.ok) {
+    const reason =
+      result?.detail ??
+      result?.error ??
+      `GPU aligner returned ${response.status}`;
+    throw new Error(
+      typeof reason === "string" ? reason : JSON.stringify(reason),
+    );
+  }
+  if (!captionsHaveWordTimings(result?.captions)) {
+    throw new Error("GPU aligner returned incomplete word timings.");
+  }
+  return result;
+}
+
 async function transcribe(job) {
   try {
     ensureJobRuntime(job);
@@ -707,34 +835,58 @@ async function transcribe(job) {
       JSON.stringify(transcript, null, 2),
       "utf8",
     );
-    updateJob(job, "transcribing", 76, "Aligning words to waveform valleys");
-    await run(
-      process.env.FFMPEG_PATH ?? "ffmpeg",
-      [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        "audio.wav",
-        "-f",
-        "s16le",
-        "-acodec",
-        "pcm_s16le",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "audio.pcm",
-      ],
-      { cwd: job.directory, job },
-    );
-    throwIfCancelled(job);
-    const aligned = alignTranscriptWords(
-      job.captions,
-      await readFile(path.join(job.directory, "audio.pcm")),
-      { sampleRate: 16_000, frameMs: 20 },
-    );
+    let aligned;
+    try {
+      aligned = await alignTranscriptWithModal(job);
+    } catch (error) {
+      const requiresGpu =
+        String(process.env.MODAL_ALIGNMENT_REQUIRED ?? "true").toLowerCase() !==
+        "false";
+      if (requiresGpu) {
+        throw new Error(
+          `Precision word alignment is temporarily unavailable. ${
+            error instanceof Error ? error.message : ""
+          }`.trim(),
+        );
+      }
+      console.error("Modal word alignment failed; using local fallback.", error);
+    }
+
+    if (!aligned) {
+      updateJob(
+        job,
+        "transcribing",
+        76,
+        "Using local acoustic alignment",
+      );
+      await run(
+        process.env.FFMPEG_PATH ?? "ffmpeg",
+        [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-y",
+          "-i",
+          "audio.wav",
+          "-f",
+          "s16le",
+          "-acodec",
+          "pcm_s16le",
+          "-ac",
+          "1",
+          "-ar",
+          "16000",
+          "audio.pcm",
+        ],
+        { cwd: job.directory, job },
+      );
+      throwIfCancelled(job);
+      aligned = alignTranscriptWords(
+        job.captions,
+        await readFile(path.join(job.directory, "audio.pcm")),
+        { sampleRate: 16_000, frameMs: 20 },
+      );
+    }
     job.captions = aligned.captions;
     job.captions = stitchShortCaptionPhrases(job.captions);
     job.alignment = aligned.summary;
@@ -895,8 +1047,10 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
         }
 
         return words.map((activeWord, activeIndex) => {
-          const eventEnd =
-            words[activeIndex + 1]?.start ?? activeWord.end;
+          const eventEnd = Math.min(
+            words[activeIndex + 1]?.start ?? activeWord.end,
+            activeWord.end,
+          );
           const text = words
             .map((word, index) => {
               const wordText = escapeAssText(
@@ -1003,6 +1157,22 @@ async function renderVideo(job, captions, style) {
     );
     throwIfCancelled(job);
 
+    if (job.remote) {
+      updateJob(job, "rendering", 97, "Saving your export");
+      await uploadRemoteArtifact(
+        job,
+        "captions.ass",
+        job.assPath,
+        "text/x-ssa; charset=utf-8",
+      );
+      await uploadRemoteArtifact(
+        job,
+        "result",
+        job.outputPath,
+        "video/mp4",
+      );
+    }
+
     updateJob(job, "complete", 100, "Captioned video ready");
     await Promise.allSettled([
       unlink(path.join(job.directory, "audio.wav")),
@@ -1026,6 +1196,37 @@ async function processJob(job) {
   }
 }
 
+async function downloadRemoteSource(job) {
+  try {
+    ensureJobRuntime(job);
+    updateJob(job, "extracting", 4, "Loading your uploaded video");
+    const response = await fetch(job.remote.sourceUrl, {
+      headers: remoteAuthorization(job),
+      signal: job.abortController.signal,
+    });
+    throwIfCancelled(job);
+    if (!response.ok || !response.body) {
+      throw new Error(
+        `Durable video storage returned ${response.status}.`,
+      );
+    }
+    await pipeline(
+      Readable.fromWeb(response.body),
+      createWriteStream(job.inputPath, { flags: "wx" }),
+    );
+    throwIfCancelled(job);
+    await processJob(job);
+  } catch (error) {
+    if (isCancelled(job)) return;
+    updateJob(
+      job,
+      "failed",
+      job.progress,
+      error instanceof Error ? error.message : "Could not load the source video.",
+    );
+  }
+}
+
 function objectFromField(value) {
   if (value && typeof value === "object") return value;
   if (typeof value !== "string" || !value.trim()) return {};
@@ -1042,6 +1243,7 @@ app.get("/health", (_request, response) => {
     ok: true,
     service: "syncword-render",
     sarvamConfigured: Boolean(process.env.SARVAM_API_KEY),
+    modalAlignerConfigured: Boolean(modalAlignerEndpoint()),
     ffmpeg: process.env.FFMPEG_PATH ?? "ffmpeg",
     queueDepth: taskQueue.length,
     active: queueRunning,
@@ -1135,6 +1337,125 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
   enqueue(job, () => processJob(job));
 });
 
+app.post("/v2/jobs", async (request, response) => {
+  const {
+    id,
+    sourceUrl,
+    callbackBase,
+    capabilityToken,
+    sitesAuthorization,
+    originalName,
+    contentType,
+    language: rawLanguage,
+    mode: rawMode,
+    style: rawStyle,
+  } = request.body ?? {};
+  if (
+    !/^[0-9a-f-]{36}$/i.test(String(id ?? "")) ||
+    !/^[0-9a-f]{64}$/i.test(String(capabilityToken ?? ""))
+  ) {
+    response.status(400).json({ error: "Invalid durable job capability." });
+    return;
+  }
+  if (jobs.has(id)) {
+    response.status(202).json(publicJob(jobs.get(id)));
+    return;
+  }
+
+  let source;
+  let callback;
+  try {
+    source = new URL(sourceUrl);
+    callback = new URL(callbackBase);
+  } catch {
+    response.status(400).json({ error: "Invalid durable storage URL." });
+    return;
+  }
+  const callbackOrigins = (
+    process.env.MEDIA_CALLBACK_ORIGINS ??
+    "https://syncword-caption-studio.dhrub404.chatgpt.site"
+  )
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  if (
+    source.protocol !== "https:" ||
+    source.origin !== callback.origin ||
+    !callbackOrigins.includes(callback.origin) ||
+    !source.pathname.startsWith(`/api/media/jobs/${id}/`) ||
+    callback.pathname !== `/api/media/jobs/${id}`
+  ) {
+    response.status(400).json({ error: "Durable storage origin is not allowed." });
+    return;
+  }
+
+  const activeJobs = [...jobs.values()].filter((job) =>
+    ["queued", "extracting", "transcribing", "rendering"].includes(
+      job.status,
+    ),
+  ).length;
+  if (activeJobs >= maxQueuedJobs) {
+    response.status(429).json({
+      error: "The render queue is full. Try again in a few minutes.",
+    });
+    return;
+  }
+
+  const directory = path.join(jobsRoot, id);
+  await mkdir(directory, { recursive: true });
+  const safeOriginalName =
+    path.basename(String(originalName ?? "video.mp4")).slice(0, 160) ||
+    "video.mp4";
+  const extension =
+    path.extname(safeOriginalName).replace(/[^a-zA-Z0-9.]/g, "") ||
+    ".mp4";
+  const inputPath = path.join(directory, `source${extension}`);
+  const language = ["as-IN", "brx-IN", "unknown"].includes(rawLanguage)
+    ? rawLanguage
+    : "unknown";
+  const mode = ["codemix", "verbatim", "transcribe"].includes(rawMode)
+    ? rawMode
+    : "codemix";
+  const job = {
+    id,
+    directory,
+    inputPath,
+    originalName: safeOriginalName,
+    contentType: String(contentType ?? "video/mp4"),
+    language,
+    mode,
+    style: objectFromField(rawStyle),
+    status: "queued",
+    progress: 3,
+    message: "Queued for captioning",
+    captions: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + jobLifetimeMs).toISOString(),
+  };
+  Object.defineProperty(job, "remote", {
+    value: {
+      sourceUrl: source.toString(),
+      callbackBase: callback.toString().replace(/\/+$/, ""),
+      capabilityToken,
+      sitesAuthorization:
+        typeof sitesAuthorization === "string" &&
+        sitesAuthorization.length >= 32
+          ? sitesAuthorization
+          : "",
+    },
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  ensureJobRuntime(job);
+  jobs.set(id, job);
+  await persistJob(job);
+  void syncRemoteJob(job);
+  response.status(202).json(publicJob(job));
+  enqueue(job, () => downloadRemoteSource(job));
+});
+
 app.get("/v1/jobs/:id", (request, response) => {
   const job = jobs.get(request.params.id);
   if (!job) {
@@ -1145,6 +1466,21 @@ app.get("/v1/jobs/:id", (request, response) => {
 });
 
 app.delete("/v1/jobs/:id", (request, response) => {
+  const job = jobs.get(request.params.id);
+  if (!job) {
+    response.status(404).json({ error: "Job not found." });
+    return;
+  }
+  if (!cancelJob(job)) {
+    response.status(409).json({
+      error: `Job cannot be cancelled. Current status: ${job.status}.`,
+    });
+    return;
+  }
+  response.status(202).json(publicJob(job));
+});
+
+app.delete("/v2/jobs/:id", (request, response) => {
   const job = jobs.get(request.params.id);
   if (!job) {
     response.status(404).json({ error: "Job not found." });
@@ -1179,6 +1515,31 @@ app.post("/v1/jobs/:id/render", (request, response) => {
     return;
   }
 
+  job.style = objectFromField(request.body.style);
+  updateJob(job, "rendering", 82, "Re-render queued");
+  enqueue(job, () => renderVideo(job, captions, job.style));
+  response.status(202).json(publicJob(job));
+});
+
+app.post("/v2/jobs/:id/render", (request, response) => {
+  const job = jobs.get(request.params.id);
+  if (!job?.remote) {
+    response.status(404).json({ error: "Job not found." });
+    return;
+  }
+  if (!["ready", "complete"].includes(job.status)) {
+    response.status(409).json({
+      error: `Job is not ready for a render. Current status: ${job.status}.`,
+    });
+    return;
+  }
+  const captions = Array.isArray(request.body.captions)
+    ? request.body.captions
+    : job.captions;
+  if (!captionsHaveWordTimings(captions)) {
+    response.status(400).json({ error: "Complete word timings are required." });
+    return;
+  }
   job.style = objectFromField(request.body.style);
   updateJob(job, "rendering", 82, "Re-render queued");
   enqueue(job, () => renderVideo(job, captions, job.style));

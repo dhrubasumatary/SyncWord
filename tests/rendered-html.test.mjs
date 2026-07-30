@@ -43,8 +43,8 @@ test("server-renders the SyncWord editor", async () => {
   assert.match(html, /Your words\./);
   assert.match(html, /On beat\./);
   assert.match(html, /Upload your reel/);
-  assert.match(html, /Hobby beta/);
-  assert.match(html, /3 min \/ 150 MB/);
+  assert.match(html, /3 min \/ 90 MB/);
+  assert.match(html, /GPU CTC alignment/);
   assert.match(html, /No mock transcript/);
   assert.match(html, /ASS/);
   assert.doesNotMatch(
@@ -74,6 +74,8 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /mode: job\.mode \?\? "codemix"/);
   assert.match(renderServer, /"codemix", "verbatim", "transcribe"/);
   assert.match(renderServer, /with_timestamps: true/);
+  assert.match(renderServer, /alignTranscriptWithModal/);
+  assert.match(renderServer, /\/v2\/jobs/);
   assert.doesNotMatch(renderServer, /\\kf\$\{duration\}/);
   assert.match(renderServer, /processJob/);
   assert.match(renderServer, /\/v1\/jobs\/:id\/result/);

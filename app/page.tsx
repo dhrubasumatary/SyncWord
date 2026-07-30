@@ -14,7 +14,12 @@ type WordTiming = {
   start: number;
   end: number;
   confidence: number;
-  source: "acoustic-dp" | "grapheme-prior" | "manual";
+  source:
+    | "mms-fa"
+    | "mms-fa-star"
+    | "acoustic-dp"
+    | "grapheme-prior"
+    | "manual";
 };
 
 type Caption = {
@@ -71,6 +76,9 @@ type JobResponse = {
   downloadUrl?: string;
   assUrl?: string;
   expiresAt?: string;
+  capabilityToken?: string;
+  uploadUrl?: string;
+  processUrl?: string;
 };
 
 type StudioTab = "captions" | "style" | "export";
@@ -348,21 +356,30 @@ export default function Home() {
 
   const configuredApi =
     process.env.NEXT_PUBLIC_RENDER_API_URL?.replace(/\/$/, "") ?? "";
+  const isLocalBrowser =
+    hydrated &&
+    ["localhost", "127.0.0.1"].includes(window.location.hostname);
   const apiBase =
     configuredApi ||
     (hydrated
-      ? ["localhost", "127.0.0.1"].includes(window.location.hostname)
+      ? isLocalBrowser
         ? "http://localhost:8787"
         : hostedRenderApi
       : "");
+  const usingDurableMedia = hydrated && !configuredApi && !isLocalBrowser;
+  const jobsBase = usingDurableMedia ? "" : apiBase;
+  const jobRoute = (jobId: string) =>
+    usingDurableMedia
+      ? `/api/media/jobs/${jobId}`
+      : `/v1/jobs/${jobId}`;
   const isProcessing = Boolean(
     uploading || (job && processingStatuses.includes(job.status)),
   );
   const isFinal = job?.status === "complete" && Boolean(job.previewUrl);
   const showingFinal = isFinal && !hasChanges;
   const finalVideoUrl =
-    showingFinal && apiBase && job?.previewUrl
-      ? `${apiBase}${job.previewUrl}?v=${encodeURIComponent(
+    showingFinal && job?.previewUrl
+      ? `${jobsBase}${job.previewUrl}?v=${encodeURIComponent(
           job.updatedAt ?? "",
         )}`
       : "";
@@ -443,22 +460,26 @@ export default function Home() {
   useEffect(() => {
     if (
       !job ||
-      !apiBase ||
+      (!usingDurableMedia && !apiBase) ||
       ["complete", "failed", "cancelled"].includes(job.status)
     ) {
       return;
     }
     const jobId = job.id;
+    const pollingRoute = usingDurableMedia
+      ? `/api/media/jobs/${jobId}`
+      : `/v1/jobs/${jobId}`;
     const interval = window.setInterval(async () => {
       try {
-        const response = await fetch(`${apiBase}/v1/jobs/${jobId}`);
+        const response = await fetch(`${jobsBase}${pollingRoute}`);
         if (response.status === 404) {
           const failedJob: JobResponse = {
             ...job,
             status: "failed",
             progress: job.progress,
-            message:
-              "The free render engine restarted. Tap Try again to rebuild this reel.",
+            message: usingDurableMedia
+              ? "This temporary project expired. Upload it again to rebuild."
+              : "The free render engine restarted. Tap Try again to rebuild this reel.",
           };
           setJob(failedJob);
           setToast(failedJob.message ?? "Render restarted.");
@@ -467,7 +488,10 @@ export default function Home() {
         if (!response.ok) return;
         setEngineState("online");
         const next = (await response.json()) as JobResponse;
-        setJob(next);
+        setJob((current) => ({
+          ...next,
+          capabilityToken: current?.capabilityToken,
+        }));
         const nextCaptions =
           Array.isArray(next.captions) &&
           next.captions.every(isAlignedCaption)
@@ -490,7 +514,7 @@ export default function Home() {
       }
     }, 2000);
     return () => window.clearInterval(interval);
-  }, [apiBase, job]);
+  }, [apiBase, job, jobsBase, usingDurableMedia]);
 
   const uploadVideo = async (nextFile: File) => {
     if (!apiBase) {
@@ -515,17 +539,72 @@ export default function Home() {
           "The free render engine is still waking. Tap Try again in a moment.",
         );
       }
-      const payload = new FormData();
-      payload.append("video", nextFile);
-      payload.append("language", language);
-      payload.append("mode", transcriptMode);
-      payload.append("style", JSON.stringify(captionStyle));
-      const response = await fetch(`${apiBase}/v1/jobs`, {
-        method: "POST",
-        body: payload,
-      });
-      const data = (await response.json()) as JobResponse & { error?: string };
-      if (!response.ok) throw new Error(data.error ?? "Upload failed.");
+      let data: JobResponse & { error?: string };
+      if (usingDurableMedia) {
+        const createResponse = await fetch("/api/media/jobs", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            originalName: nextFile.name,
+            contentType: nextFile.type || "video/mp4",
+            size: nextFile.size,
+            language,
+            mode: transcriptMode,
+            style: captionStyle,
+          }),
+        });
+        data = (await createResponse.json()) as JobResponse & {
+          error?: string;
+        };
+        if (!createResponse.ok) {
+          throw new Error(data.error ?? "Could not create the upload.");
+        }
+        if (!data.capabilityToken || !data.uploadUrl || !data.processUrl) {
+          throw new Error("Durable upload capability is incomplete.");
+        }
+        setJob(data);
+        setToast("Saving the video securely before processing.");
+        const uploadResponse = await fetch(data.uploadUrl, {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${data.capabilityToken}`,
+            "content-type": nextFile.type || "video/mp4",
+          },
+          body: nextFile,
+        });
+        const uploaded = (await uploadResponse.json()) as JobResponse & {
+          error?: string;
+        };
+        if (!uploadResponse.ok) {
+          throw new Error(uploaded.error ?? "Video upload failed.");
+        }
+        setJob({ ...uploaded, capabilityToken: data.capabilityToken });
+        const processResponse = await fetch(data.processUrl, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${data.capabilityToken}`,
+          },
+        });
+        const processing = (await processResponse.json()) as JobResponse & {
+          error?: string;
+        };
+        if (!processResponse.ok) {
+          throw new Error(processing.error ?? "Processing could not start.");
+        }
+        data = { ...processing, capabilityToken: data.capabilityToken };
+      } else {
+        const payload = new FormData();
+        payload.append("video", nextFile);
+        payload.append("language", language);
+        payload.append("mode", transcriptMode);
+        payload.append("style", JSON.stringify(captionStyle));
+        const response = await fetch(`${apiBase}/v1/jobs`, {
+          method: "POST",
+          body: payload,
+        });
+        data = (await response.json()) as JobResponse & { error?: string };
+        if (!response.ok) throw new Error(data.error ?? "Upload failed.");
+      }
       setJob(data);
       setToast("Upload complete. Captioning and final render started.");
     } catch (error) {
@@ -538,14 +617,20 @@ export default function Home() {
   const cancelRemoteJob = async (jobToCancel = job) => {
     if (
       !jobToCancel ||
-      !apiBase ||
+      (!usingDurableMedia && !apiBase) ||
       !processingStatuses.includes(jobToCancel.status)
     ) {
       return;
     }
     try {
-      const response = await fetch(`${apiBase}/v1/jobs/${jobToCancel.id}`, {
+      const response = await fetch(`${jobsBase}${jobRoute(jobToCancel.id)}`, {
         method: "DELETE",
+        headers:
+          usingDurableMedia && jobToCancel.capabilityToken
+            ? {
+                authorization: `Bearer ${jobToCancel.capabilityToken}`,
+              }
+            : undefined,
       });
       if (!response.ok && response.status !== 404) {
         const data = (await response.json()) as { error?: string };
@@ -587,8 +672,8 @@ export default function Home() {
       setToast("Choose an MP4, MOV, WebM, MKV, or M4V video.");
       return;
     }
-    if (nextFile.size > 150 * 1024 * 1024) {
-      setToast("Keep the reel under 150 MB for the hobby beta.");
+    if (nextFile.size > 90 * 1024 * 1024) {
+      setToast("Keep the reel under 90 MB for the MVP.");
       return;
     }
     const previousJob = job;
@@ -612,21 +697,34 @@ export default function Home() {
     if (
       !job ||
       !["ready", "complete"].includes(job.status) ||
-      !apiBase ||
+      (!usingDurableMedia && !apiBase) ||
       !captions.length
     ) {
       return;
     }
     setUploading(true);
     try {
-      const response = await fetch(`${apiBase}/v1/jobs/${job.id}/render`, {
+      const response = await fetch(
+        `${jobsBase}${jobRoute(job.id)}/render`,
+        {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(usingDurableMedia && job.capabilityToken
+            ? {
+                authorization: `Bearer ${job.capabilityToken}`,
+              }
+            : {}),
+        },
         body: JSON.stringify({ captions, style: captionStyle }),
-      });
+        },
+      );
       const data = (await response.json()) as JobResponse & { error?: string };
       if (!response.ok) throw new Error(data.error ?? "Render failed.");
-      setJob(data);
+      setJob({
+        ...data,
+        capabilityToken: job.capabilityToken,
+      });
       setHasChanges(false);
       setToast("Burning your changes into a new MP4.");
     } catch (error) {
@@ -638,11 +736,11 @@ export default function Home() {
 
   const downloadResult = (kind: "video" | "ass") => {
     const resultPath = kind === "video" ? job?.downloadUrl : job?.assUrl;
-    if (!apiBase || !resultPath) {
+    if (!resultPath) {
       setToast(`${kind === "video" ? "Video" : "ASS file"} is not ready.`);
       return;
     }
-    window.location.href = `${apiBase}${resultPath}`;
+    window.location.href = `${jobsBase}${resultPath}`;
   };
 
   const setStyle = (values: Partial<CaptionStyle>) => {
@@ -836,7 +934,7 @@ export default function Home() {
             >
               <i>＋</i>
               <strong>Upload your reel</strong>
-              <small>Hobby beta · up to 3 min / 150 MB</small>
+              <small>MVP · up to 3 min / 90 MB</small>
             </button>
           </div>
 
@@ -847,7 +945,7 @@ export default function Home() {
             </li>
             <li>
               <b>02</b>
-              <span>Phrase-aware acoustic alignment times each hit</span>
+              <span>GPU CTC alignment locks every word to speech</span>
             </li>
             <li>
               <b>03</b>
@@ -1018,7 +1116,8 @@ export default function Home() {
                   </h2>
                   <p>
                     Phrase timestamps come from Saaras v3. Word cuts come from
-                    20 ms waveform analysis—not invented transcript data.
+                    Meta&apos;s multilingual CTC acoustic frames—not guessed
+                    word duration.
                   </p>
                 </div>
               )}
@@ -1107,7 +1206,11 @@ export default function Home() {
                         <strong>
                           {selectedWord.source === "manual"
                             ? "manual"
-                            : "waveform"}
+                            : selectedWord.source === "mms-fa"
+                              ? "GPU align"
+                              : selectedWord.source === "mms-fa-star"
+                                ? "GPU recovery"
+                              : "fallback"}
                         </strong>
                       </div>
                       {selectedWordIndex <
@@ -1306,8 +1409,8 @@ export default function Home() {
                     </div>
                   )}
                   <p className="hobby-note">
-                    Hobby MVP files are temporary. Download the final MP4 in
-                    this session.
+                    MVP files are stored temporarily for 24 hours. Download
+                    your final MP4 before they expire.
                   </p>
                 </div>
               )}

@@ -12,6 +12,10 @@ services:
     envVars:
       - key: SARVAM_API_KEY
         sync: false
+      - key: MODAL_ALIGNER_URL
+        value: https://dhrubasumatary--syncword-aligner-alignment-api.modal.run
+      - key: MODAL_ALIGNMENT_REQUIRED
+        value: "true"
       - key: ALLOWED_ORIGINS
         value: https://syncword-caption-studio.dhrub404.chatgpt.site
       - key: RUNTIME_DIR

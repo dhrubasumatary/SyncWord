@@ -12,22 +12,26 @@ and the final burn-in.
    auto-detects the WAV container; `input_audio_codec` is intentionally omitted
    because that parameter is required only for raw PCM uploads.
 3. Saaras v3 Batch STT returns phrase-level timestamps.
-4. SyncWord splits each phrase into script-safe words, samples a 20 ms audio
-   energy envelope, and globally optimizes word boundaries around waveform
-   valleys. Grapheme length supplies the timing prior; Sarvam's phrase start
-   and end remain hard anchors.
+4. SyncWord sends each timestamped phrase and its audio window to a Modal T4
+   worker running Meta's dedicated `MMS_FA` forced-alignment model. Uroman
+   normalizes Assamese, Bodo, English, and code-mixed display words onto the
+   model's shared acoustic alphabet. MMS star spans absorb transcript/audio
+   mismatches instead of stretching a neighboring word across a long gap.
 5. The first upload automatically generates ASS `\kf` karaoke events and burns
    a social-ready H.264/AAC MP4 with ffmpeg.
 6. The player switches to that real rendered file. Optional transcript,
    boundary, or style changes preview instantly in the browser and create a new
    final MP4 only when the user taps **Update final video**.
 
-The API is deliberately client-agnostic so a future Expo app can remain a pure
+The browser stores source videos, job state, ASS files, and rendered MP4s in
+Cloudflare R2. Render remains a stateless Saaras/ffmpeg worker for the MVP, and
+the API stays client-agnostic so a future Expo app can remain a pure
 upload/status/download client.
 
 ## Local setup
 
-Copy `.env.example` to `.env`, set `SARVAM_API_KEY`, then run:
+Copy `.env.example` to `.env`, set `SARVAM_API_KEY` and
+`MODAL_ALIGNER_URL`, then run:
 
 ```bash
 npm install
@@ -43,11 +47,11 @@ The web editor runs at `http://localhost:3000`; the render API runs at
 `server/Dockerfile` installs ffmpeg plus Noto script fonts and starts the render
 API. Set `SARVAM_API_KEY` and `ALLOWED_ORIGINS` in production.
 
-`render.yaml` defines the hobby MVP topology: one free Docker web service in
-Singapore, one serialized in-process render queue, ephemeral `/tmp` storage,
-and two-hour artifact expiry. Reels are limited to 150 MB and three minutes.
-Users download results in the same session. Render restarts or free-tier sleep
-can discard active jobs; persistent storage and a durable queue are a v2 concern.
+`render.yaml` defines one serialized hobby render worker in Singapore. The
+production web app accepts reels up to 90 MB and three minutes, stores uploads
+and results in R2, and retains them for 24 hours. A Render restart can interrupt
+the current compute attempt, but it no longer deletes the uploaded source or a
+completed export.
 
 ## API
 
@@ -60,16 +64,22 @@ can discard active jobs; persistent storage and a durable queue are a v2 concern
 - `GET /v1/jobs/:id/captions.ass` — generated ASS file
 - `GET /health` — service readiness
 
+Production web clients use the durable `/api/media/jobs` surface. It creates
+an R2-backed job, accepts the source upload, starts the Render worker, persists
+progress, serves range-enabled video previews, and supports re-rendering edited
+captions. The legacy `/v1/jobs` routes remain useful for local development.
+
 ## WordSync timing model
 
 Sarvam Batch STT supplies chunk-level sentence or phrase timestamps, not
-word-level timings. SyncWord's word boundaries are therefore inferred by a
-phrase-anchored waveform aligner rather than claimed as model-provided
-timestamps. Each boundary carries a confidence score; weak boundaries are
-surfaced for manual review and fall back to a grapheme-weighted timing prior
-when the audio does not contain enough usable frames.
+word-level timings. SyncWord treats those timestamps as search windows rather
+than inventing uniform word durations. Meta's CTC model scores the actual
+speech frames against the known Sarvam transcript, and Viterbi decoding finds
+the highest-probability monotonic character path. Word boundaries come from
+that path. Each word carries a confidence score; unsupported or impossible
+phrases fall back explicitly to the older grapheme prior and are surfaced for
+review.
 
-This is deliberately script-agnostic and works with Assamese/Bengali and
-Devanagari text, but it is not phoneme-aware forced alignment. Music, crosstalk,
-and words spoken without an audible energy transition can still require a
-manual nudge.
+This is honest forced alignment rather than native Sarvam word timestamps.
+Transcript errors, heavy music, crosstalk, and fully overlapping speech can
+still require a manual nudge.
