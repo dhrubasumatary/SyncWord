@@ -759,7 +759,16 @@ async function alignTranscriptWithModal(job) {
   if (!captionsHaveWordTimings(result?.captions)) {
     throw new Error("GPU aligner returned incomplete word timings.");
   }
-  return result;
+  if (
+    !result?.alignment ||
+    !Number.isFinite(Number(result.alignment.totalWords))
+  ) {
+    throw new Error("GPU aligner returned an incomplete alignment summary.");
+  }
+  return {
+    captions: result.captions,
+    summary: result.alignment,
+  };
 }
 
 async function transcribe(job) {

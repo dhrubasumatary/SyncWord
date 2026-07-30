@@ -75,6 +75,7 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /"codemix", "verbatim", "transcribe"/);
   assert.match(renderServer, /with_timestamps: true/);
   assert.match(renderServer, /alignTranscriptWithModal/);
+  assert.match(renderServer, /summary: result\.alignment/);
   assert.match(renderServer, /\/v2\/jobs/);
   assert.doesNotMatch(renderServer, /\\kf\$\{duration\}/);
   assert.match(renderServer, /processJob/);
