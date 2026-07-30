@@ -354,7 +354,6 @@ async function transcribe(job) {
           model: "saaras:v3",
           mode: "codemix",
           language_code: job.language,
-          input_audio_codec: "pcm_s16le",
           with_timestamps: true,
           with_diarization: false,
         },

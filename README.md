@@ -8,7 +8,9 @@ and the final burn-in.
 ## Product flow
 
 1. Add a video and choose Assamese, Bodo, or automatic language detection.
-2. The render service extracts 16 kHz mono WAV audio with ffmpeg.
+2. The render service extracts 16 kHz mono WAV audio with ffmpeg. Sarvam
+   auto-detects the WAV container; `input_audio_codec` is intentionally omitted
+   because that parameter is required only for raw PCM uploads.
 3. Saaras v3 Batch STT returns phrase-level timestamps.
 4. SyncWord splits each phrase into script-safe words, samples a 20 ms audio
    energy envelope, and globally optimizes word boundaries around waveform

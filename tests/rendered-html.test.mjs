@@ -48,16 +48,21 @@ test("server-renders the SyncWord editor", async () => {
 });
 
 test("removes the disposable starter and wires product metadata", async () => {
-  const [page, layout, packageJson] = await Promise.all([
+  const [page, layout, packageJson, renderServer] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../server/index.mjs", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
   assert.match(layout, /og-wordsync\.png/);
   assert.match(layout, /x-forwarded-host/);
+  assert.match(renderServer, /model: "saaras:v3"/);
+  assert.match(renderServer, /mode: "codemix"/);
+  assert.match(renderServer, /with_timestamps: true/);
+  assert.doesNotMatch(renderServer, /input_audio_codec/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await assert.rejects(
     access(new URL("../app/_sites-preview/SkeletonPreview.tsx", templateRoot)),
