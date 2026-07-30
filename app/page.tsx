@@ -38,6 +38,7 @@ type CaptionStyle = {
   position: number;
   weight: "600" | "700" | "800";
   animation: "pop" | "fade" | "slide";
+  wordsPerCard: number;
 };
 
 type AlignmentSummary = {
@@ -48,86 +49,124 @@ type AlignmentSummary = {
   needsReview: number;
 };
 
+type JobStatus =
+  | "queued"
+  | "extracting"
+  | "transcribing"
+  | "ready"
+  | "rendering"
+  | "complete"
+  | "failed";
+
 type JobResponse = {
   id: string;
-  status:
-    | "queued"
-    | "extracting"
-    | "transcribing"
-    | "ready"
-    | "rendering"
-    | "complete"
-    | "failed";
+  status: JobStatus;
   progress: number;
   message?: string;
   captions?: Caption[];
   alignment?: AlignmentSummary;
+  updatedAt?: string;
+  previewUrl?: string;
   downloadUrl?: string;
   assUrl?: string;
+  expiresAt?: string;
 };
 
-type StudioTab = "words" | "look" | "export";
+type StudioTab = "captions" | "style" | "export";
 
 const defaultStyle: CaptionStyle = {
   fontFamily: "Noto Sans Bengali",
-  fontSize: 50,
+  fontSize: 54,
   textColor: "#FFFFFF",
-  highlightColor: "#DFFF57",
-  backgroundColor: "#101010",
-  backgroundOpacity: 72,
-  outlineColor: "#101010",
+  highlightColor: "#D7FF38",
+  backgroundColor: "#09090B",
+  backgroundOpacity: 76,
+  outlineColor: "#09090B",
   outlineWidth: 2,
-  position: 82,
+  position: 80,
   weight: "800",
   animation: "pop",
+  wordsPerCard: 4,
 };
 
-const stylePresets: Array<{
+const presets: Array<{
   name: string;
   note: string;
+  sample: string;
   values: Partial<CaptionStyle>;
 }> = [
   {
-    name: "Signal",
-    note: "acid word wipe",
+    name: "Viral",
+    note: "lime word hit",
+    sample: "HIT",
     values: {
       textColor: "#FFFFFF",
-      highlightColor: "#DFFF57",
-      backgroundColor: "#101010",
-      backgroundOpacity: 74,
-      outlineColor: "#101010",
+      highlightColor: "#D7FF38",
+      backgroundColor: "#09090B",
+      backgroundOpacity: 76,
+      outlineColor: "#09090B",
       outlineWidth: 2,
+      animation: "pop",
+      wordsPerCard: 4,
     },
   },
   {
-    name: "Paper",
-    note: "clean editorial",
-    values: {
-      textColor: "#111111",
-      highlightColor: "#FF593D",
-      backgroundColor: "#F4F0E7",
-      backgroundOpacity: 94,
-      outlineColor: "#F4F0E7",
-      outlineWidth: 1,
-    },
-  },
-  {
-    name: "Night",
-    note: "high contrast",
+    name: "Punch",
+    note: "hard outline",
+    sample: "LOUD",
     values: {
       textColor: "#FFFFFF",
-      highlightColor: "#65A7FF",
-      backgroundColor: "#080808",
-      backgroundOpacity: 42,
-      outlineColor: "#080808",
+      highlightColor: "#FF4D67",
+      backgroundColor: "#09090B",
+      backgroundOpacity: 0,
+      outlineColor: "#09090B",
+      outlineWidth: 6,
+      animation: "pop",
+      wordsPerCard: 3,
+    },
+  },
+  {
+    name: "Glow",
+    note: "electric blue",
+    sample: "NOW",
+    values: {
+      textColor: "#FFFFFF",
+      highlightColor: "#58A6FF",
+      backgroundColor: "#121A2A",
+      backgroundOpacity: 54,
+      outlineColor: "#070B12",
       outlineWidth: 4,
+      animation: "slide",
+      wordsPerCard: 4,
     },
   },
 ];
 
+const processingStatuses: JobStatus[] = [
+  "queued",
+  "extracting",
+  "transcribing",
+  "ready",
+  "rendering",
+];
 const subscribeHydration = () => () => {};
 const clientSnapshot = () => true;
 const serverSnapshot = () => false;
+
+function compactTime(seconds: number) {
+  const safe = Math.max(0, Number(seconds) || 0);
+  const minutes = Math.floor(safe / 60);
+  const wholeSeconds = Math.floor(safe % 60);
+  return `${minutes}:${wholeSeconds.toString().padStart(2, "0")}`;
+}
+
+function rgba(hex: string, opacity: number) {
+  const normalized = hex.replace("#", "").padEnd(6, "0").slice(0, 6);
+  const numeric = Number.parseInt(normalized, 16);
+  return `rgba(${(numeric >> 16) & 255}, ${(numeric >> 8) & 255}, ${
+    numeric & 255
+  }, ${opacity / 100})`;
+}
 
 function wordWeight(word: string) {
   const length = Array.from(
@@ -136,23 +175,18 @@ function wordWeight(word: string) {
   return Math.max(1, length ** 0.72);
 }
 
-function distributeWords(
-  text: string,
-  start: number,
-  end: number,
-): WordTiming[] {
+function distributeWords(text: string, start: number, end: number) {
   const tokens = text.trim().split(/\s+/u).filter(Boolean);
   const weights = tokens.map(wordWeight);
-  const totalWeight = weights.reduce((sum, value) => sum + value, 0);
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
   let cursor = start;
-
-  return tokens.map((token, index) => {
+  return tokens.map((token, index): WordTiming => {
     const wordEnd =
       index === tokens.length - 1
         ? end
-        : cursor + ((end - start) * weights[index]) / totalWeight;
+        : cursor + ((end - start) * weights[index]) / total;
     const word = {
-      id: `word-${index}-${Math.round(start * 1000)}`,
+      id: `edited-${index}-${Math.round(start * 1000)}`,
       text: token,
       start: Number(cursor.toFixed(3)),
       end: Number(wordEnd.toFixed(3)),
@@ -164,46 +198,65 @@ function distributeWords(
   });
 }
 
-function compactTime(seconds: number) {
-  const safe = Math.max(0, Number(seconds) || 0);
-  const minutes = Math.floor(safe / 60);
-  const wholeSeconds = Math.floor(safe % 60);
-  const milliseconds = Math.floor((safe % 1) * 1000);
-  return `${minutes}:${wholeSeconds.toString().padStart(2, "0")}.${milliseconds
-    .toString()
-    .padStart(3, "0")}`;
+function statusStep(status?: JobStatus) {
+  if (!status || status === "queued") return 0;
+  if (status === "extracting") return 1;
+  if (status === "transcribing" || status === "ready") return 2;
+  if (status === "rendering") return 3;
+  if (status === "complete") return 4;
+  return 0;
 }
 
-function rgba(hex: string, opacity: number) {
-  const normalized = hex.replace("#", "").padEnd(6, "0").slice(0, 6);
-  const numeric = Number.parseInt(normalized, 16);
-  return `rgba(${(numeric >> 16) & 255}, ${(numeric >> 8) & 255}, ${
-    numeric & 255
-  }, ${opacity / 100})`;
+function groupWordsForReels(words: WordTiming[], maxWords: number) {
+  const groups: WordTiming[][] = [];
+  let current: WordTiming[] = [];
+  for (const word of words) {
+    const nextDuration = current.length
+      ? word.end - current[0].start
+      : word.end - word.start;
+    const nextGlyphs = [...current, word].reduce(
+      (sum, item) => sum + Array.from(item.text).length,
+      0,
+    );
+    if (
+      current.length &&
+      (current.length >= maxWords || nextDuration > 2.6 || nextGlyphs > 30)
+    ) {
+      groups.push(current);
+      current = [];
+    }
+    current.push(word);
+    if (current.length >= 2 && /[.!?।॥…]$/u.test(word.text)) {
+      groups.push(current);
+      current = [];
+    }
+  }
+  if (current.length) groups.push(current);
+  return groups;
 }
 
 export default function Home() {
-  const [tab, setTab] = useState<StudioTab>("words");
-  const [captions, setCaptions] = useState<Caption[]>([]);
-  const [selectedCaptionId, setSelectedCaptionId] = useState("");
-  const [selectedWordIndex, setSelectedWordIndex] = useState(0);
-  const [captionStyle, setCaptionStyle] = useState(defaultStyle);
-  const [videoUrl, setVideoUrl] = useState("");
+  const [tab, setTab] = useState<StudioTab>("captions");
   const [file, setFile] = useState<File | null>(null);
+  const [videoUrl, setVideoUrl] = useState("");
   const [duration, setDuration] = useState(0);
-  const [videoRatio, setVideoRatio] = useState(16 / 9);
+  const [videoRatio, setVideoRatio] = useState(9 / 16);
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [language, setLanguage] = useState("unknown");
+  const [captionStyle, setCaptionStyle] = useState(defaultStyle);
+  const [captions, setCaptions] = useState<Caption[]>([]);
+  const [selectedCaptionId, setSelectedCaptionId] = useState("");
+  const [selectedWordIndex, setSelectedWordIndex] = useState(0);
   const [job, setJob] = useState<JobResponse | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [hasChanges, setHasChanges] = useState(false);
   const [toast, setToast] = useState("");
   const hydrated = useSyncExternalStore(
     subscribeHydration,
     clientSnapshot,
     serverSnapshot,
   );
-
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
 
@@ -215,9 +268,21 @@ export default function Home() {
     ["localhost", "127.0.0.1"].includes(window.location.hostname)
       ? "http://localhost:8787"
       : "");
-
+  const isProcessing = Boolean(
+    uploading || (job && processingStatuses.includes(job.status)),
+  );
+  const isFinal = job?.status === "complete" && Boolean(job.previewUrl);
+  const showingFinal = isFinal && !hasChanges;
+  const finalVideoUrl =
+    showingFinal && apiBase && job?.previewUrl
+      ? `${apiBase}${job.previewUrl}?v=${encodeURIComponent(
+          job.updatedAt ?? "",
+        )}`
+      : "";
+  const playbackUrl = finalVideoUrl || videoUrl;
   const selectedCaption =
     captions.find((caption) => caption.id === selectedCaptionId) ?? captions[0];
+  const selectedWord = selectedCaption?.words[selectedWordIndex];
   const activeCaption =
     captions.find(
       (caption) =>
@@ -226,67 +291,21 @@ export default function Home() {
   const activeWord = activeCaption?.words.find(
     (word) => currentTime >= word.start && currentTime < word.end,
   );
-  const selectedWord = selectedCaption?.words[selectedWordIndex];
-
-  const alignment: AlignmentSummary = (() => {
-    if (job?.alignment) return job.alignment;
-    const words = captions.flatMap((caption) => caption.words);
-    return {
-      method: "phrase-anchored-waveform-dp",
-      totalWords: words.length,
-      waveformAlignedWords: words.filter(
-        (word) => word.source === "waveform-dp",
-      ).length,
-      averageConfidence: words.length
-        ? words.reduce((sum, word) => sum + word.confidence, 0) / words.length
-        : 0,
-      needsReview: words.filter((word) => word.confidence < 0.62).length,
-    };
-  })();
-
-  useEffect(() => {
-    if (!toast) return;
-    const timeout = window.setTimeout(() => setToast(""), 4200);
-    return () => window.clearTimeout(timeout);
-  }, [toast]);
-
-  useEffect(() => {
-    if (
-      !job ||
-      !apiBase ||
-      ["ready", "complete", "failed"].includes(job.status)
-    ) {
-      return;
-    }
-
-    const interval = window.setInterval(async () => {
-      try {
-        const response = await fetch(`${apiBase}/v1/jobs/${job.id}`);
-        if (!response.ok) return;
-        const nextJob = (await response.json()) as JobResponse;
-        setJob(nextJob);
-
-        if (nextJob.status === "ready" && nextJob.captions?.length) {
-          setCaptions(nextJob.captions);
-          setSelectedCaptionId(nextJob.captions[0].id);
-          setSelectedWordIndex(0);
-          setTab("words");
-          setToast(
-            `${nextJob.alignment?.totalWords ?? 0} words aligned. Review the amber cuts.`,
-          );
-        } else if (nextJob.status === "complete") {
-          setTab("export");
-          setToast("Your ASS-burned video is ready.");
-        } else if (nextJob.status === "failed") {
-          setToast(nextJob.message ?? "Processing failed.");
-        }
-      } catch {
-        setToast("The render engine is not reachable.");
-      }
-    }, 2500);
-
-    return () => window.clearInterval(interval);
-  }, [apiBase, job]);
+  const activeWordGroup = activeCaption
+    ? groupWordsForReels(
+        activeCaption.words,
+        captionStyle.wordsPerCard,
+      ).find(
+        (group) =>
+          currentTime >= group[0].start &&
+          currentTime < group[group.length - 1].end,
+      ) ??
+      groupWordsForReels(
+        activeCaption.words,
+        captionStyle.wordsPerCard,
+      )[0]
+    : [];
+  const alignment = job?.alignment;
 
   const previewStyle = {
     "--caption-font-size": `${captionStyle.fontSize}px`,
@@ -306,59 +325,52 @@ export default function Home() {
         : '"Noto Sans Bengali", "Nirmala UI", sans-serif',
   } as CSSProperties;
 
-  const seek = (seconds: number) => {
-    const next = Math.max(0, Math.min(duration, seconds));
-    setCurrentTime(next);
-    if (videoRef.current) videoRef.current.currentTime = next;
-  };
+  useEffect(() => {
+    if (!toast) return;
+    const timeout = window.setTimeout(() => setToast(""), 4200);
+    return () => window.clearTimeout(timeout);
+  }, [toast]);
 
-  const togglePlayback = () => {
-    if (!videoRef.current) return;
-    if (videoRef.current.paused) void videoRef.current.play();
-    else videoRef.current.pause();
-  };
-
-  const acceptVideo = (nextFile: File) => {
-    const looksLikeVideo =
-      nextFile.type.startsWith("video/") ||
-      /\.(mp4|mov|webm|mkv|m4v)$/i.test(nextFile.name);
-    if (!looksLikeVideo) {
-      setToast("Choose an MP4, MOV, WebM, or MKV video.");
+  useEffect(() => {
+    if (!job || !apiBase || ["complete", "failed"].includes(job.status)) {
       return;
     }
+    const jobId = job.id;
+    const interval = window.setInterval(async () => {
+      try {
+        const response = await fetch(`${apiBase}/v1/jobs/${jobId}`);
+        if (!response.ok) return;
+        const next = (await response.json()) as JobResponse;
+        setJob(next);
+        if (next.captions?.length) {
+          setCaptions(next.captions);
+          setSelectedCaptionId((current) => current || next.captions![0].id);
+        }
+        if (next.status === "complete") {
+          setTab("export");
+          setToast("Final ASS-burned MP4 is ready.");
+        } else if (next.status === "failed") {
+          setToast(next.message ?? "Processing failed.");
+        }
+      } catch {
+        setToast("The render engine is unreachable.");
+      }
+    }, 2000);
+    return () => window.clearInterval(interval);
+  }, [apiBase, job]);
 
-    if (videoUrl) URL.revokeObjectURL(videoUrl);
-    setVideoUrl(URL.createObjectURL(nextFile));
-    setFile(nextFile);
-    setDuration(0);
-    setVideoRatio(16 / 9);
-    setCurrentTime(0);
-    setCaptions([]);
-    setSelectedCaptionId("");
-    setSelectedWordIndex(0);
-    setJob(null);
-    setTab("words");
-    setToast("Video loaded on this device. Nothing uploaded yet.");
-  };
-
-  const startTranscription = async () => {
-    if (!file) {
-      videoInputRef.current?.click();
-      return;
-    }
+  const uploadVideo = async (nextFile: File) => {
     if (!apiBase) {
-      setToast(
-        "Preview is ready. Connect the private render engine to upload and transcribe.",
-      );
+      setToast("The render engine is not connected to this deployment yet.");
       return;
     }
-
-    setBusy(true);
+    setUploading(true);
     try {
       const payload = new FormData();
-      payload.append("video", file);
+      payload.append("video", nextFile);
       payload.append("language", language);
       payload.append("mode", "codemix");
+      payload.append("style", JSON.stringify(captionStyle));
       const response = await fetch(`${apiBase}/v1/jobs`, {
         method: "POST",
         body: payload,
@@ -366,17 +378,47 @@ export default function Home() {
       const data = (await response.json()) as JobResponse & { error?: string };
       if (!response.ok) throw new Error(data.error ?? "Upload failed.");
       setJob(data);
-      setToast("Extracting audio, then Saaras finds the phrase anchors.");
+      setToast("Upload complete. Captioning and final render started.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Upload failed.");
     } finally {
-      setBusy(false);
+      setUploading(false);
     }
   };
 
+  const acceptVideo = (nextFile: File) => {
+    const looksLikeVideo =
+      nextFile.type.startsWith("video/") ||
+      /\.(mp4|mov|webm|mkv|m4v)$/i.test(nextFile.name);
+    if (!looksLikeVideo) {
+      setToast("Choose an MP4, MOV, WebM, MKV, or M4V video.");
+      return;
+    }
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    const localUrl = URL.createObjectURL(nextFile);
+    setFile(nextFile);
+    setVideoUrl(localUrl);
+    setDuration(0);
+    setCurrentTime(0);
+    setCaptions([]);
+    setSelectedCaptionId("");
+    setSelectedWordIndex(0);
+    setJob(null);
+    setHasChanges(false);
+    setTab("captions");
+    void uploadVideo(nextFile);
+  };
+
   const startRender = async () => {
-    if (!job || job.status !== "ready" || !apiBase) return;
-    setBusy(true);
+    if (
+      !job ||
+      !["ready", "complete"].includes(job.status) ||
+      !apiBase ||
+      !captions.length
+    ) {
+      return;
+    }
+    setUploading(true);
     try {
       const response = await fetch(`${apiBase}/v1/jobs/${job.id}/render`, {
         method: "POST",
@@ -386,22 +428,27 @@ export default function Home() {
       const data = (await response.json()) as JobResponse & { error?: string };
       if (!response.ok) throw new Error(data.error ?? "Render failed.");
       setJob(data);
-      setTab("export");
-      setToast("Rendering ASS word wipes into the video.");
+      setHasChanges(false);
+      setToast("Burning your changes into a new MP4.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Render failed.");
     } finally {
-      setBusy(false);
+      setUploading(false);
     }
   };
 
   const downloadResult = (kind: "video" | "ass") => {
-    const path = kind === "video" ? job?.downloadUrl : job?.assUrl;
-    if (!apiBase || !path) {
-      setToast(`${kind === "video" ? "Video" : "ASS file"} is not ready yet.`);
+    const resultPath = kind === "video" ? job?.downloadUrl : job?.assUrl;
+    if (!apiBase || !resultPath) {
+      setToast(`${kind === "video" ? "Video" : "ASS file"} is not ready.`);
       return;
     }
-    window.location.href = `${apiBase}${path}`;
+    window.location.href = `${apiBase}${resultPath}`;
+  };
+
+  const setStyle = (values: Partial<CaptionStyle>) => {
+    setCaptionStyle((current) => ({ ...current, ...values }));
+    setHasChanges(true);
   };
 
   const updateCaptionText = (text: string) => {
@@ -418,6 +465,7 @@ export default function Home() {
       ),
     );
     setSelectedWordIndex(0);
+    setHasChanges(true);
   };
 
   const nudgeBoundary = (delta: number) => {
@@ -428,7 +476,6 @@ export default function Home() {
     ) {
       return;
     }
-
     setCaptions((items) =>
       items.map((caption) => {
         if (caption.id !== selectedCaption.id) return caption;
@@ -448,14 +495,27 @@ export default function Home() {
         return { ...caption, words };
       }),
     );
+    setHasChanges(true);
+  };
+
+  const seek = (seconds: number) => {
+    const next = Math.max(0, Math.min(duration, seconds));
+    setCurrentTime(next);
+    if (videoRef.current) videoRef.current.currentTime = next;
+  };
+
+  const togglePlayback = () => {
+    if (!videoRef.current) return;
+    if (videoRef.current.paused) void videoRef.current.play();
+    else videoRef.current.pause();
   };
 
   const primaryAction = () => {
     if (!file) {
       videoInputRef.current?.click();
-    } else if (!job || job.status === "failed") {
-      void startTranscription();
-    } else if (job.status === "ready") {
+    } else if (job?.status === "failed" || !job) {
+      void uploadVideo(file);
+    } else if (job.status === "complete" && hasChanges) {
       void startRender();
     } else if (job.status === "complete") {
       downloadResult("video");
@@ -463,120 +523,134 @@ export default function Home() {
   };
 
   const primaryLabel = (() => {
-    if (busy) return "Starting…";
-    if (!file) return "Choose a video";
-    if (!job) return "Find words";
-    if (["queued", "extracting", "transcribing"].includes(job.status)) {
-      return `${job.message ?? "Listening"} · ${job.progress}%`;
-    }
-    if (job.status === "ready") return "Render with ASS";
-    if (job.status === "rendering") return `Rendering · ${job.progress}%`;
-    if (job.status === "complete") return "Download video";
-    return "Try again";
+    if (uploading) return "Uploading video…";
+    if (!file) return "Choose video";
+    if (!job || job.status === "failed") return "Try again";
+    if (isProcessing) return `${job.message ?? "Processing"} · ${job.progress}%`;
+    if (hasChanges) return "Update final video";
+    return "Download MP4";
   })();
 
-  const processing = Boolean(
-    busy ||
-      (job &&
-        ["queued", "extracting", "transcribing", "rendering"].includes(
-          job.status,
-        )),
-  );
-
   return (
-    <main className="mobile-studio">
-      <header className="studio-header">
-        <a className="wordmark" href="#" aria-label="SyncWord home">
-          <span>SYNC</span>
-          <b>WORD</b>
+    <main className={`creator-app ${file ? "has-project" : ""}`}>
+      <header className="app-header">
+        <a className="brand" href="#" aria-label="SyncWord home">
+          <i aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </i>
+          <strong>syncword</strong>
         </a>
-        <div className={`engine-pill ${apiBase ? "online" : ""}`}>
-          <i />
-          {apiBase ? "engine ready" : "preview mode"}
+        <div className={`engine-state ${apiBase ? "online" : ""}`}>
+          <span />
+          {apiBase ? "render online" : "engine offline"}
         </div>
       </header>
 
       {!file ? (
-        <section className="start-screen">
-          <div className="start-copy">
-            <p>ASS CAPTION WORKSHOP</p>
+        <section className="launch">
+          <div className="launch-copy">
+            <span className="eyebrow">WORD-ACCURATE REEL CAPTIONS</span>
             <h1>
-              Make every word
-              <em>hit on time.</em>
+              Your words.
+              <br />
+              <em>On beat.</em>
             </h1>
-            <span>
-              Assamese and Bodo captions with phrase-anchored word timing.
-              Nothing fake appears before your video does.
-            </span>
+            <p>
+              Upload a reel. Get a finished MP4 with modern, animated,
+              word-by-word captions burned into every frame.
+            </p>
           </div>
 
-          <button
-            className="drop-zone"
-            onClick={() => videoInputRef.current?.click()}
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={(event) => {
-              event.preventDefault();
-              const dropped = event.dataTransfer.files[0];
-              if (dropped) acceptVideo(dropped);
-            }}
-          >
-            <span className="drop-icon">
-              <i />
-            </span>
-            <strong>Choose a video</strong>
-            <small>MP4, MOV, WebM or MKV</small>
-          </button>
+          <div className="launch-card">
+            <div className="language-row">
+              <span>Spoken language</span>
+              <div>
+                {[
+                  ["unknown", "Auto"],
+                  ["as-IN", "অসমীয়া"],
+                  ["brx-IN", "बड़ो"],
+                ].map(([value, label]) => (
+                  <button
+                    key={value}
+                    className={language === value ? "active" : ""}
+                    onClick={() => {
+                      setLanguage(value);
+                      setStyle({
+                        fontFamily:
+                          value === "brx-IN"
+                            ? "Noto Sans Devanagari"
+                            : "Noto Sans Bengali",
+                      });
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-          <ol className="pipeline-strip" aria-label="Captioning pipeline">
+            <button
+              className="upload-reel"
+              onClick={() => videoInputRef.current?.click()}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                const dropped = event.dataTransfer.files[0];
+                if (dropped) acceptVideo(dropped);
+              }}
+            >
+              <i>＋</i>
+              <strong>Upload your reel</strong>
+              <small>Processing starts automatically · up to 500 MB</small>
+            </button>
+          </div>
+
+          <ol className="promise-row">
             <li>
               <b>01</b>
-              <span>Video</span>
+              <span>Saaras v3 hears the real phrases</span>
             </li>
             <li>
               <b>02</b>
-              <span>Audio</span>
+              <span>Waveform alignment snaps every word</span>
             </li>
             <li>
               <b>03</b>
-              <span>Saaras</span>
-            </li>
-            <li>
-              <b>04</b>
-              <span>Words</span>
-            </li>
-            <li>
-              <b>05</b>
-              <span>ASS</span>
+              <span>ASS + ffmpeg returns a social-ready MP4</span>
             </li>
           </ol>
 
-          <div className="start-footnote">
-            <span>No account theatre.</span>
-            <span>No mock transcript.</span>
-            <span>Your video stays local until you tap Find words.</span>
-          </div>
+          <p className="truth-line">
+            No account. No mock transcript. No fake final preview.
+          </p>
         </section>
       ) : (
-        <>
-          <section className="project-intro">
-            <p>NOW WORKING ON</p>
-            <h1>{file.name}</h1>
-            <button onClick={() => videoInputRef.current?.click()}>
-              Replace video
-            </button>
-          </section>
+        <div className="creator-workspace">
+          <section className="reel-column">
+            <div className="project-bar">
+              <button onClick={() => videoInputRef.current?.click()}>
+                ← New video
+              </button>
+              <span title={file.name}>{file.name}</span>
+              {showingFinal && <b>FINAL</b>}
+            </div>
 
-          <section className="video-stage" style={previewStyle}>
             <div
-              className={`video-frame ${videoRatio < 1 ? "portrait" : ""}`}
+              className={`reel-frame ${videoRatio >= 1 ? "landscape" : ""}`}
+              style={previewStyle}
             >
               <video
+                key={playbackUrl}
                 ref={videoRef}
-                src={videoUrl}
+                src={playbackUrl}
                 onLoadedMetadata={(event) => {
-                  if (Number.isFinite(event.currentTarget.duration)) {
-                    setDuration(event.currentTarget.duration);
-                  }
+                  setDuration(
+                    Number.isFinite(event.currentTarget.duration)
+                      ? event.currentTarget.duration
+                      : 0,
+                  );
                   if (
                     event.currentTarget.videoWidth &&
                     event.currentTarget.videoHeight
@@ -595,9 +669,9 @@ export default function Home() {
                 playsInline
               />
 
-              {activeCaption && (
-                <div className="ass-preview">
-                  {activeCaption.words.map((word) => (
+              {!showingFinal && activeCaption && (
+                <div className="live-caption">
+                  {activeWordGroup.map((word) => (
                     <span
                       key={word.id}
                       className={activeWord?.id === word.id ? "active" : ""}
@@ -608,17 +682,52 @@ export default function Home() {
                 </div>
               )}
 
-              {!captions.length && (
-                <div className="uncaptioned-label">NO CAPTIONS YET</div>
+              {isProcessing && (
+                <div className="processing-cover">
+                  <div
+                    className="processing-orbit"
+                    style={
+                      { "--progress": job?.progress ?? 4 } as CSSProperties
+                    }
+                  >
+                    <span>
+                      {job?.progress ?? 4}%
+                    </span>
+                  </div>
+                  <strong>{job?.message ?? "Uploading your reel"}</strong>
+                  <small>Keep this tab open while we make the final MP4.</small>
+                  <ol>
+                    {["Upload", "Audio", "Words", "ASS burn"].map(
+                      (label, index) => (
+                        <li
+                          key={label}
+                          className={
+                            index <= statusStep(job?.status) ? "active" : ""
+                          }
+                        >
+                          <i />
+                          <span>{label}</span>
+                        </li>
+                      ),
+                    )}
+                  </ol>
+                </div>
+              )}
+
+              {job?.status === "failed" && (
+                <div className="failed-cover">
+                  <b>Render stopped</b>
+                  <span>{job.message}</span>
+                </div>
+              )}
+
+              {showingFinal && (
+                <div className="final-chip">BURNED-IN MP4</div>
               )}
             </div>
 
-            <div className="player-row">
-              <button
-                className="play-button"
-                onClick={togglePlayback}
-                aria-label={playing ? "Pause video" : "Play video"}
-              >
+            <div className="transport">
+              <button onClick={togglePlayback} aria-label="Play or pause">
                 {playing ? "Ⅱ" : "▶"}
               </button>
               <span>{compactTime(currentTime)}</span>
@@ -635,408 +744,328 @@ export default function Home() {
             </div>
           </section>
 
-          <nav className="studio-tabs" aria-label="Caption workflow">
-            {(
-              [
-                ["words", "01", "Words"],
-                ["look", "02", "Look"],
-                ["export", "03", "Export"],
-              ] as const
-            ).map(([value, number, label]) => (
-              <button
-                key={value}
-                className={tab === value ? "active" : ""}
-                onClick={() => setTab(value)}
-              >
-                <small>{number}</small>
-                <span>{label}</span>
-              </button>
-            ))}
-          </nav>
+          <section className="tool-column">
+            <nav className="tool-tabs" aria-label="Caption controls">
+              {(
+                [
+                  ["captions", "Captions"],
+                  ["style", "Style"],
+                  ["export", "Export"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  className={tab === value ? "active" : ""}
+                  onClick={() => setTab(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
 
-          <section className="control-sheet">
-            {tab === "words" && !captions.length && (
-              <div className="generate-panel">
-                <div className="section-kicker">LISTEN</div>
-                <h2>Turn phrase timing into word timing.</h2>
-                <p>
-                  Saaras v3 finds the real phrase edges. WordSync then places
-                  each word against the waveform and flags uncertain cuts.
-                </p>
+            <div className="tool-body">
+              {tab === "captions" && !captions.length && (
+                <div className="waiting-panel">
+                  <span className="panel-icon">⌁</span>
+                  <h2>
+                    {job?.status === "failed"
+                      ? "That render needs another go."
+                      : "Your captions are being built."}
+                  </h2>
+                  <p>
+                    Phrase timestamps come from Saaras v3. Word cuts come from
+                    20 ms waveform analysis—not invented transcript data.
+                  </p>
+                </div>
+              )}
 
-                <div className="language-block">
-                  <span>Spoken language</span>
-                  <div className="language-pills">
-                    {[
-                      ["unknown", "Auto"],
-                      ["as-IN", "অসমীয়া"],
-                      ["brx-IN", "बड़ो"],
-                    ].map(([value, label]) => (
+              {tab === "captions" && selectedCaption && (
+                <div className="caption-editor">
+                  <div className="score-row">
+                    <div>
+                      <small>WORD SYNC</small>
+                      <strong>
+                        {alignment?.totalWords ?? 0} words ·{" "}
+                        {Math.round(
+                          (alignment?.averageConfidence ?? 0) * 100,
+                        )}
+                        % confidence
+                      </strong>
+                    </div>
+                    <span>
+                      {alignment?.needsReview
+                        ? `${alignment.needsReview} review`
+                        : "clean"}
+                    </span>
+                  </div>
+
+                  <div className="phrase-picker">
+                    {captions.map((caption, index) => (
                       <button
-                        key={value}
-                        className={language === value ? "active" : ""}
+                        key={caption.id}
+                        className={
+                          caption.id === selectedCaption.id ? "active" : ""
+                        }
                         onClick={() => {
-                          setLanguage(value);
-                          if (value === "brx-IN") {
-                            setCaptionStyle((current) => ({
-                              ...current,
-                              fontFamily: "Noto Sans Devanagari",
-                            }));
-                          } else if (value === "as-IN") {
-                            setCaptionStyle((current) => ({
-                              ...current,
-                              fontFamily: "Noto Sans Bengali",
-                            }));
-                          }
+                          setSelectedCaptionId(caption.id);
+                          setSelectedWordIndex(0);
+                          seek(caption.start + 0.01);
                         }}
                       >
-                        {label}
+                        <small>{String(index + 1).padStart(2, "0")}</small>
+                        <span>{caption.text}</span>
                       </button>
                     ))}
                   </div>
-                </div>
 
-                <div className="truth-card">
-                  <span>WHAT ACTUALLY HAPPENS</span>
-                  <ol>
-                    <li>
-                      <b>Phrase anchors</b>
-                      <small>Saaras v3 Batch · codemix</small>
-                    </li>
-                    <li>
-                      <b>Word boundaries</b>
-                      <small>20ms waveform analysis</small>
-                    </li>
-                    <li>
-                      <b>Review</b>
-                      <small>Only low-confidence cuts</small>
-                    </li>
-                  </ol>
-                </div>
-              </div>
-            )}
-
-            {tab === "words" && selectedCaption && (
-              <div className="word-editor">
-                <div className="alignment-head">
-                  <div>
-                    <span className="section-kicker">WORD SYNC</span>
-                    <h2>
-                      {alignment.needsReview
-                        ? `${alignment.needsReview} cuts need ears.`
-                        : "Every cut reviewed."}
-                    </h2>
-                  </div>
-                  <div className="confidence-orbit">
-                    <strong>
-                      {Math.round(alignment.averageConfidence * 100)}
-                    </strong>
-                    <span>%</span>
-                  </div>
-                </div>
-
-                <div className="phrase-tabs">
-                  {captions.map((caption, index) => (
-                    <button
-                      key={caption.id}
-                      className={
-                        selectedCaption.id === caption.id ? "active" : ""
+                  <label className="transcript-field">
+                    Phrase text
+                    <textarea
+                      rows={3}
+                      value={selectedCaption.text}
+                      onChange={(event) =>
+                        updateCaptionText(event.target.value)
                       }
-                      onClick={() => {
-                        setSelectedCaptionId(caption.id);
-                        setSelectedWordIndex(0);
-                        seek(caption.start + 0.01);
-                      }}
-                    >
-                      <small>{String(index + 1).padStart(2, "0")}</small>
-                      <span>{caption.text}</span>
-                    </button>
-                  ))}
-                </div>
+                    />
+                  </label>
 
-                <label className="phrase-copy">
-                  <span>Phrase transcript</span>
-                  <textarea
-                    rows={2}
-                    value={selectedCaption.text}
-                    onChange={(event) => updateCaptionText(event.target.value)}
-                  />
-                  <small>
-                    {compactTime(selectedCaption.start)} —{" "}
-                    {compactTime(selectedCaption.end)}
-                  </small>
-                </label>
-
-                <div className="word-ribbon" aria-label="Aligned words">
-                  {selectedCaption.words.map((word, index) => (
-                    <button
-                      key={word.id}
-                      className={`${selectedWordIndex === index ? "active" : ""} ${
-                        word.confidence < 0.62 ? "review" : ""
-                      }`}
-                      onClick={() => {
-                        setSelectedWordIndex(index);
-                        seek(word.start + 0.01);
-                      }}
-                    >
-                      <span>{word.text}</span>
-                      <i style={{ width: `${word.confidence * 100}%` }} />
-                    </button>
-                  ))}
-                </div>
-
-                {selectedWord && (
-                  <div className="cut-inspector">
-                    <div>
-                      <span>Selected word</span>
-                      <strong>{selectedWord.text}</strong>
-                    </div>
-                    <div>
-                      <span>Starts</span>
-                      <strong>{compactTime(selectedWord.start)}</strong>
-                    </div>
-                    <div>
-                      <span>Ends</span>
-                      <strong>{compactTime(selectedWord.end)}</strong>
-                    </div>
-                    <div>
-                      <span>Source</span>
-                      <strong>
-                        {selectedWord.source === "manual"
-                          ? "manual"
-                          : `${Math.round(selectedWord.confidence * 100)}%`}
-                      </strong>
-                    </div>
-                    {selectedWordIndex < selectedCaption.words.length - 1 && (
-                      <div className="nudge-row">
-                        <button onClick={() => nudgeBoundary(-0.03)}>
-                          − 30ms
-                        </button>
-                        <span>move next cut</span>
-                        <button onClick={() => nudgeBoundary(0.03)}>
-                          + 30ms
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {tab === "look" && (
-              <div className="look-panel">
-                <span className="section-kicker">ASS STYLE</span>
-                <h2>Style the burn, not a screenshot.</h2>
-                <p>
-                  This preview becomes an ASS style and ffmpeg renders the same
-                  font, outline, position, word wipe, and line motion.
-                </p>
-
-                <div className="preset-stack">
-                  {stylePresets.map((preset) => (
-                    <button
-                      key={preset.name}
-                      onClick={() =>
-                        setCaptionStyle((value) => ({
-                          ...value,
-                          ...preset.values,
-                        }))
-                      }
-                    >
-                      <i
-                        style={{
-                          color: preset.values.textColor,
-                          background: rgba(
-                            preset.values.backgroundColor ?? "#101010",
-                            preset.values.backgroundOpacity ?? 70,
-                          ),
-                          boxShadow: `inset 0 -3px ${
-                            preset.values.highlightColor
-                          }`,
+                  <span className="field-label">Tap a word to inspect its cut</span>
+                  <div className="word-grid">
+                    {selectedCaption.words.map((word, index) => (
+                      <button
+                        key={word.id}
+                        className={`${index === selectedWordIndex ? "active" : ""} ${
+                          word.confidence < 0.62 ? "review" : ""
+                        }`}
+                        onClick={() => {
+                          setSelectedWordIndex(index);
+                          seek(word.start + 0.01);
                         }}
                       >
-                        WORD
-                      </i>
-                      <span>
+                        <span>{word.text}</span>
+                        <i style={{ width: `${word.confidence * 100}%` }} />
+                      </button>
+                    ))}
+                  </div>
+
+                  {selectedWord && (
+                    <div className="timing-card">
+                      <div>
+                        <small>Start</small>
+                        <strong>{selectedWord.start.toFixed(3)}s</strong>
+                      </div>
+                      <div>
+                        <small>End</small>
+                        <strong>{selectedWord.end.toFixed(3)}s</strong>
+                      </div>
+                      <div>
+                        <small>Source</small>
+                        <strong>
+                          {selectedWord.source === "manual"
+                            ? "manual"
+                            : "waveform"}
+                        </strong>
+                      </div>
+                      {selectedWordIndex <
+                        selectedCaption.words.length - 1 && (
+                        <div className="nudge-buttons">
+                          <button onClick={() => nudgeBoundary(-0.03)}>
+                            −30 ms
+                          </button>
+                          <span>next cut</span>
+                          <button onClick={() => nudgeBoundary(0.03)}>
+                            +30 ms
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {tab === "style" && (
+                <div className="style-panel">
+                  <div className="panel-heading">
+                    <small>LIVE ASS PREVIEW</small>
+                    <h2>Make the words hit.</h2>
+                    <p>
+                      Preview instantly here. Re-render only when the look is
+                      right.
+                    </p>
+                  </div>
+
+                  <div className="preset-row">
+                    {presets.map((preset) => (
+                      <button
+                        key={preset.name}
+                        onClick={() => setStyle(preset.values)}
+                      >
+                        <i
+                          style={{
+                            color: preset.values.textColor,
+                            background: rgba(
+                              preset.values.backgroundColor ?? "#09090B",
+                              preset.values.backgroundOpacity ?? 0,
+                            ),
+                            WebkitTextStroke: `${
+                              (preset.values.outlineWidth ?? 0) / 2
+                            }px ${preset.values.outlineColor}`,
+                          }}
+                        >
+                          {preset.sample}
+                        </i>
                         <strong>{preset.name}</strong>
                         <small>{preset.note}</small>
-                      </span>
-                      <b>→</b>
-                    </button>
-                  ))}
-                </div>
+                      </button>
+                    ))}
+                  </div>
 
-                <div className="style-grid">
-                  <label>
-                    Script font
-                    <select
-                      aria-label="Script font"
-                      value={captionStyle.fontFamily}
-                      onChange={(event) =>
-                        setCaptionStyle((value) => ({
-                          ...value,
-                          fontFamily: event.target.value,
-                        }))
-                      }
-                    >
-                      <option>Noto Sans Bengali</option>
-                      <option>Noto Sans Devanagari</option>
-                    </select>
-                  </label>
-                  <label>
-                    Line motion
-                    <select
-                      aria-label="Line motion"
-                      value={captionStyle.animation}
-                      onChange={(event) =>
-                        setCaptionStyle((value) => ({
-                          ...value,
-                          animation: event.target
-                            .value as CaptionStyle["animation"],
-                        }))
-                      }
-                    >
-                      <option value="pop">Pop in</option>
-                      <option value="fade">Fade</option>
-                      <option value="slide">Slide up</option>
-                    </select>
-                  </label>
-                </div>
-
-                <div className="color-row">
-                  {(
-                    [
-                      ["Text", "textColor"],
-                      ["Active", "highlightColor"],
-                      ["Box", "backgroundColor"],
-                    ] as const
-                  ).map(([label, key]) => (
-                    <label key={key}>
-                      <input
-                        type="color"
-                        value={captionStyle[key]}
+                  <div className="select-grid">
+                    <label>
+                      Script font
+                      <select
+                        value={captionStyle.fontFamily}
                         onChange={(event) =>
-                          setCaptionStyle((value) => ({
-                            ...value,
-                            [key]: event.target.value,
-                          }))
+                          setStyle({ fontFamily: event.target.value })
                         }
-                      />
-                      <span>{label}</span>
+                      >
+                        <option>Noto Sans Bengali</option>
+                        <option>Noto Sans Devanagari</option>
+                      </select>
                     </label>
-                  ))}
-                </div>
-
-                <div className="slider-stack">
-                  {[
-                    ["Size", "fontSize", 28, 84, "px"],
-                    ["Position", "position", 56, 90, "%"],
-                    [
-                      "Background",
-                      "backgroundOpacity",
-                      0,
-                      100,
-                      "%",
-                    ],
-                    ["Outline", "outlineWidth", 0, 8, "px"],
-                  ].map(([label, key, min, max, suffix]) => (
-                    <label key={String(key)}>
-                      <span>
-                        {label}
-                        <b>
-                          {captionStyle[key as keyof CaptionStyle]}
-                          {suffix}
-                        </b>
-                      </span>
-                      <input
-                        type="range"
-                        min={Number(min)}
-                        max={Number(max)}
-                        value={Number(
-                          captionStyle[key as keyof CaptionStyle],
-                        )}
+                    <label>
+                      Motion
+                      <select
+                        value={captionStyle.animation}
                         onChange={(event) =>
-                          setCaptionStyle((value) => ({
-                            ...value,
-                            [key]: Number(event.target.value),
-                          }))
+                          setStyle({
+                            animation: event.target
+                              .value as CaptionStyle["animation"],
+                          })
                         }
-                      />
+                      >
+                        <option value="pop">Pop</option>
+                        <option value="slide">Slide up</option>
+                        <option value="fade">Fade</option>
+                      </select>
                     </label>
-                  ))}
+                  </div>
+
+                  <div className="color-grid">
+                    {(
+                      [
+                        ["Words", "textColor"],
+                        ["Active", "highlightColor"],
+                        ["Box", "backgroundColor"],
+                      ] as const
+                    ).map(([label, key]) => (
+                      <label key={key}>
+                        <input
+                          type="color"
+                          value={captionStyle[key]}
+                          onChange={(event) =>
+                            setStyle({ [key]: event.target.value })
+                          }
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+
+                  <div className="range-stack">
+                    {[
+                      ["Size", "fontSize", 28, 84, "px"],
+                      ["Words on screen", "wordsPerCard", 2, 7, ""],
+                      ["Position", "position", 56, 90, "%"],
+                      ["Box", "backgroundOpacity", 0, 100, "%"],
+                      ["Outline", "outlineWidth", 0, 8, "px"],
+                    ].map(([label, key, min, max, suffix]) => (
+                      <label key={String(key)}>
+                        <span>
+                          {label}
+                          <b>
+                            {captionStyle[key as keyof CaptionStyle]}
+                            {suffix}
+                          </b>
+                        </span>
+                        <input
+                          type="range"
+                          min={Number(min)}
+                          max={Number(max)}
+                          value={Number(
+                            captionStyle[key as keyof CaptionStyle],
+                          )}
+                          onChange={(event) =>
+                            setStyle({ [key]: Number(event.target.value) })
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            {tab === "export" && (
-              <div className="export-panel">
-                <span className="section-kicker">FINAL BURN</span>
-                <h2>ASS in. Captioned MP4 out.</h2>
-                <p>
-                  No plain SRT compromise. The render keeps the chosen script
-                  font, active-word color, outline, position, and line motion.
-                </p>
+              {tab === "export" && (
+                <div className="export-panel">
+                  <div
+                    className={`export-status ${showingFinal ? "ready" : ""}`}
+                  >
+                    <span>{showingFinal ? "✓" : "↻"}</span>
+                    <div>
+                      <small>
+                        {showingFinal ? "FINAL VIDEO" : "RENDER STATUS"}
+                      </small>
+                      <h2>
+                        {showingFinal
+                          ? "Ready to post."
+                          : isFinal && hasChanges
+                            ? "Preview has new changes."
+                            : "Still making the MP4."}
+                      </h2>
+                      <p>
+                        {showingFinal
+                          ? "What you see in the player is the real burned-in file."
+                          : isFinal && hasChanges
+                            ? "Tap Update final video to burn this look into the MP4."
+                          : job?.message ?? "Waiting for caption processing."}
+                      </p>
+                    </div>
+                  </div>
 
-                <div className="export-receipt">
-                  <div>
-                    <span>Format</span>
-                    <strong>Advanced SubStation Alpha</strong>
+                  <div className="export-spec">
+                    <div>
+                      <span>Video</span>
+                      <strong>H.264 · AAC · fast start</strong>
+                    </div>
+                    <div>
+                      <span>Captions</span>
+                      <strong>Advanced SubStation Alpha</strong>
+                    </div>
+                    <div>
+                      <span>Word effect</span>
+                      <strong>ASS \kf sweep</strong>
+                    </div>
+                    <div>
+                      <span>Compatibility</span>
+                      <strong>Instagram · TikTok · YouTube</strong>
+                    </div>
                   </div>
-                  <div>
-                    <span>Word timing</span>
-                    <strong>
-                      {alignment.totalWords
-                        ? `${alignment.totalWords} aligned words`
-                        : "Waiting for transcript"}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Karaoke</span>
-                    <strong>ASS \kf sweep</strong>
-                  </div>
-                  <div>
-                    <span>Line motion</span>
-                    <strong>{captionStyle.animation}</strong>
-                  </div>
-                  <div>
-                    <span>Render</span>
-                    <strong>ffmpeg · H.264</strong>
-                  </div>
+
+                  {showingFinal && (
+                    <div className="download-actions">
+                      <button onClick={() => downloadResult("video")}>
+                        Download final MP4
+                      </button>
+                      <button onClick={() => downloadResult("ass")}>
+                        Download source .ASS
+                      </button>
+                    </div>
+                  )}
                 </div>
-
-                {job?.status === "complete" && (
-                  <div className="download-pair">
-                    <button onClick={() => downloadResult("video")}>
-                      Download video
-                    </button>
-                    <button onClick={() => downloadResult("ass")}>
-                      Download .ASS
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
+              )}
+            </div>
           </section>
-
-          <div className="action-dock">
-            {job && (
-              <div className="progress-copy">
-                <span>{job.message}</span>
-                <i>
-                  <b style={{ width: `${job.progress}%` }} />
-                </i>
-              </div>
-            )}
-            <button
-              className="primary-action"
-              onClick={primaryAction}
-              disabled={processing}
-            >
-              <span>{primaryLabel}</span>
-              <b>↗</b>
-            </button>
-          </div>
-        </>
+        </div>
       )}
 
       <input
@@ -1051,10 +1080,30 @@ export default function Home() {
         }}
       />
 
+      {file && (
+        <div className="action-dock">
+          {job && (
+            <div className="mini-progress">
+              <i>
+                <b style={{ width: `${job.progress}%` }} />
+              </i>
+            </div>
+          )}
+          <button
+            onClick={primaryAction}
+            disabled={isProcessing}
+            className={isFinal && !hasChanges ? "download" : ""}
+          >
+            <span>{primaryLabel}</span>
+            <b>{isFinal && !hasChanges ? "↓" : "→"}</b>
+          </button>
+        </div>
+      )}
+
       {toast && (
-        <div className="studio-toast" role="status">
+        <div className="toast" role="status">
           <span>{toast}</span>
-          <button onClick={() => setToast("")} aria-label="Dismiss message">
+          <button onClick={() => setToast("")} aria-label="Dismiss">
             ×
           </button>
         </div>

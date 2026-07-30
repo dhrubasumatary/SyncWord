@@ -16,11 +16,11 @@ and the final burn-in.
    energy envelope, and globally optimizes word boundaries around waveform
    valleys. Grapheme length supplies the timing prior; Sarvam's phrase start
    and end remain hard anchors.
-5. Review low-confidence boundaries, nudge them when needed, and tune font,
-   highlight, outline, placement, and motion in the browser without
-   re-rendering the video.
-6. Approve the result to generate ASS `\kf` karaoke events and burn the final
-   MP4 with ffmpeg.
+5. The first upload automatically generates ASS `\kf` karaoke events and burns
+   a social-ready H.264/AAC MP4 with ffmpeg.
+6. The player switches to that real rendered file. Optional transcript,
+   boundary, or style changes preview instantly in the browser and create a new
+   final MP4 only when the user taps **Update final video**.
 
 The API is deliberately client-agnostic so a future Expo app can remain a pure
 upload/status/download client.
@@ -44,11 +44,19 @@ The web editor runs at `http://localhost:3000`; the render API runs at
 API. Set `SARVAM_API_KEY`, `ALLOWED_ORIGINS`, and a persistent volume mounted at
 `/data/syncword` in production.
 
+`render.yaml` defines the v1 production topology: one Docker web service in
+Singapore, one serialized in-process render queue, and one encrypted persistent
+disk. Job metadata and artifacts survive restarts and expire after 24 hours.
+There is deliberately no product database, account system, or distributed queue
+in v1.
+
 ## API
 
-- `POST /v1/jobs` — multipart video upload; begins extraction and Batch STT
+- `POST /v1/jobs` — multipart video upload; runs the complete caption + render
+  pipeline automatically
 - `GET /v1/jobs/:id` — processing state and phrase captions
-- `POST /v1/jobs/:id/render` — approved caption blocks and style
+- `POST /v1/jobs/:id/render` — re-render edited captions or style
+- `GET /v1/jobs/:id/result` — inline final MP4 used by the real final preview
 - `GET /v1/jobs/:id/download` — final MP4
 - `GET /v1/jobs/:id/captions.ass` — generated ASS file
 - `GET /health` — service readiness

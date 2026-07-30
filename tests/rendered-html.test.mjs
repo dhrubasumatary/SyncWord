@@ -40,9 +40,10 @@ test("server-renders the SyncWord editor", async () => {
     html,
     /<title>SyncWord — Make every word hit on time<\/title>/i,
   );
-  assert.match(html, /Make every word/);
-  assert.match(html, /hit on time\./);
-  assert.match(html, /Choose a video/);
+  assert.match(html, /Your words\./);
+  assert.match(html, /On beat\./);
+  assert.match(html, /Upload your reel/);
+  assert.match(html, /Processing starts automatically/);
   assert.match(html, /No mock transcript/);
   assert.match(html, /ASS/);
   assert.doesNotMatch(
@@ -70,6 +71,9 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /model: "saaras:v3"/);
   assert.match(renderServer, /mode: "codemix"/);
   assert.match(renderServer, /with_timestamps: true/);
+  assert.match(renderServer, /processJob/);
+  assert.match(renderServer, /\/v1\/jobs\/:id\/result/);
+  assert.match(renderServer, /JOB_RETENTION_HOURS/);
   assert.doesNotMatch(renderServer, /input_audio_codec/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await assert.rejects(

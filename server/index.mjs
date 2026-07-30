@@ -7,8 +7,11 @@ import { randomUUID } from "node:crypto";
 import {
   copyFile,
   mkdir,
+  readdir,
   readFile,
   rename,
+  rm,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
@@ -20,10 +23,32 @@ const runtimeRoot = path.resolve(
   process.env.RUNTIME_DIR ?? path.join(process.cwd(), ".runtime"),
 );
 const uploadRoot = path.join(runtimeRoot, "incoming");
-const sarvamBaseUrl = "https://api.sarvam.ai";
+const jobsRoot = path.join(runtimeRoot, "jobs");
+const sarvamBaseUrl =
+  process.env.SARVAM_BASE_URL ?? "https://api.sarvam.ai";
 const jobs = new Map();
+const taskQueue = [];
+const persistenceQueue = new Map();
+const configuredRetentionHours = Number(
+  process.env.JOB_RETENTION_HOURS ?? 24,
+);
+const jobLifetimeMs =
+  (Number.isFinite(configuredRetentionHours)
+    ? Math.max(1, Math.min(168, configuredRetentionHours))
+    : 24) *
+  60 *
+  60 *
+  1000;
+const configuredQueueLimit = Number(process.env.MAX_QUEUED_JOBS ?? 4);
+const maxQueuedJobs = Number.isFinite(configuredQueueLimit)
+  ? Math.max(1, Math.min(20, configuredQueueLimit))
+  : 4;
+let queueRunning = false;
 
-await mkdir(uploadRoot, { recursive: true });
+await Promise.all([
+  mkdir(uploadRoot, { recursive: true }),
+  mkdir(jobsRoot, { recursive: true }),
+]);
 
 const configuredOrigins = (process.env.ALLOWED_ORIGINS ?? "*")
   .split(",")
@@ -50,7 +75,7 @@ app.use(express.json({ limit: "2mb" }));
 const upload = multer({
   dest: uploadRoot,
   limits: {
-    fileSize: Number(process.env.MAX_UPLOAD_BYTES ?? 4_294_967_296),
+    fileSize: Number(process.env.MAX_UPLOAD_BYTES ?? 524_288_000),
     files: 1,
   },
 });
@@ -64,6 +89,20 @@ function publicJob(job) {
     captions: job.captions,
     alignment: job.alignment,
     languageCode: job.languageCode,
+    style: job.style,
+    updatedAt: job.updatedAt,
+    expiresAt: job.expiresAt,
+    queuePosition:
+      job.status === "queued"
+        ? Math.max(
+            1,
+            taskQueue.findIndex((item) => item.job.id === job.id) + 1,
+          )
+        : undefined,
+    previewUrl:
+      job.status === "complete"
+        ? `/v1/jobs/${job.id}/result`
+        : undefined,
     downloadUrl:
       job.status === "complete" ? `/v1/jobs/${job.id}/download` : undefined,
     assUrl:
@@ -74,6 +113,21 @@ function publicJob(job) {
   };
 }
 
+function persistJob(job) {
+  const snapshot = JSON.stringify(job, null, 2);
+  const previous = persistenceQueue.get(job.id) ?? Promise.resolve();
+  const pending = previous
+    .catch(() => {})
+    .then(() =>
+      writeFile(path.join(job.directory, "job.json"), snapshot, "utf8"),
+    )
+    .catch((error) => {
+      console.error(`Could not persist job ${job.id}:`, error);
+    });
+  persistenceQueue.set(job.id, pending);
+  return pending;
+}
+
 function updateJob(job, status, progress, message) {
   Object.assign(job, {
     status,
@@ -81,6 +135,90 @@ function updateJob(job, status, progress, message) {
     message,
     updatedAt: new Date().toISOString(),
   });
+  void persistJob(job);
+}
+
+async function removeJob(job) {
+  jobs.delete(job.id);
+  await rm(job.directory, { recursive: true, force: true });
+}
+
+async function cleanupExpiredJobs() {
+  const now = Date.now();
+  const expired = [...jobs.values()].filter(
+    (job) =>
+      !["extracting", "transcribing", "rendering"].includes(job.status) &&
+      Date.parse(job.expiresAt ?? 0) <= now,
+  );
+  await Promise.all(expired.map(removeJob));
+}
+
+async function restoreJobs() {
+  const entries = await readdir(jobsRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const directory = path.join(jobsRoot, entry.name);
+    try {
+      const job = JSON.parse(
+        await readFile(path.join(directory, "job.json"), "utf8"),
+      );
+      if (!job?.id || Date.parse(job.expiresAt ?? 0) <= Date.now()) {
+        await rm(directory, { recursive: true, force: true });
+        continue;
+      }
+      job.directory = directory;
+      for (const pathKey of [
+        "inputPath",
+        "transcriptPath",
+        "assPath",
+        "outputPath",
+      ]) {
+        if (job[pathKey]) {
+          job[pathKey] = path.join(directory, path.basename(job[pathKey]));
+        }
+      }
+      if (
+        ["queued", "extracting", "transcribing", "rendering"].includes(
+          job.status,
+        )
+      ) {
+        Object.assign(job, {
+          status: "failed",
+          message:
+            "The render service restarted during processing. Upload the video again.",
+          updatedAt: new Date().toISOString(),
+        });
+        await persistJob(job);
+      }
+      jobs.set(job.id, job);
+    } catch (error) {
+      console.warn(`Skipping unreadable job directory ${entry.name}:`, error);
+    }
+  }
+}
+
+async function drainQueue() {
+  if (queueRunning) return;
+  queueRunning = true;
+  while (taskQueue.length) {
+    const task = taskQueue.shift();
+    try {
+      await task.run();
+    } catch (error) {
+      updateJob(
+        task.job,
+        "failed",
+        task.job.progress,
+        error instanceof Error ? error.message : "Processing failed.",
+      );
+    }
+  }
+  queueRunning = false;
+}
+
+function enqueue(job, runTask) {
+  taskQueue.push({ job, run: runTask });
+  void drainQueue();
 }
 
 function sleep(milliseconds) {
@@ -113,9 +251,67 @@ function run(command, args, options = {}) {
   });
 }
 
+function runCapture(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      ...options,
+    });
+    let output = "";
+    let errorOutput = "";
+    child.stdout.on("data", (chunk) => {
+      output = `${output}${chunk.toString()}`;
+    });
+    child.stderr.on("data", (chunk) => {
+      errorOutput = `${errorOutput}${chunk.toString()}`.slice(-12_000);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(output);
+      } else {
+        reject(
+          new Error(
+            `${command} exited with code ${code}. ${errorOutput}`.trim(),
+          ),
+        );
+      }
+    });
+  });
+}
+
+async function probeVideo(job) {
+  const output = await runCapture(
+    process.env.FFPROBE_PATH ?? "ffprobe",
+    [
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=width,height,r_frame_rate",
+      "-of",
+      "json",
+      path.basename(job.inputPath),
+    ],
+    { cwd: job.directory },
+  );
+  const stream = JSON.parse(output).streams?.[0];
+  if (!stream?.width || !stream?.height) {
+    throw new Error("The upload does not contain a readable video stream.");
+  }
+  job.video = {
+    width: Number(stream.width),
+    height: Number(stream.height),
+    frameRate: String(stream.r_frame_rate ?? ""),
+  };
+  void persistJob(job);
+}
+
 async function sarvamJson(endpoint, options = {}) {
   const apiKey = process.env.SARVAM_API_KEY;
-  if (!apiKey) {
+  if (!apiKey && sarvamBaseUrl === "https://api.sarvam.ai") {
     throw new Error(
       "SARVAM_API_KEY is not configured on the render service.",
     );
@@ -124,7 +320,7 @@ async function sarvamJson(endpoint, options = {}) {
   const response = await fetch(`${sarvamBaseUrl}${endpoint}`, {
     ...options,
     headers: {
-      "api-subscription-key": apiKey,
+      ...(apiKey ? { "api-subscription-key": apiKey } : {}),
       "content-type": "application/json",
       ...(options.headers ?? {}),
     },
@@ -197,11 +393,14 @@ async function waitForSarvamJob(job, sarvamJobId) {
       { method: "GET" },
     );
     const state = String(status.job_state ?? "").toLowerCase();
-    job.progress = Math.min(76, 31 + Math.floor(attempt / 3));
-    job.message =
+    updateJob(
+      job,
+      "transcribing",
+      Math.min(76, 31 + Math.floor(attempt / 3)),
       state === "running"
         ? "Saaras is aligning phrases"
-        : "Waiting for Saaras Batch";
+        : "Waiting for Saaras Batch",
+    );
 
     if (["completed", "partiallycompleted"].includes(state)) return status;
     if (state === "failed") {
@@ -323,6 +522,8 @@ async function downloadTranscript(sarvamJobId, status) {
 
 async function transcribe(job) {
   try {
+    updateJob(job, "extracting", 7, "Inspecting the video");
+    await probeVideo(job);
     updateJob(job, "extracting", 10, "Extracting clean mono audio");
     await run(
       process.env.FFMPEG_PATH ?? "ffmpeg",
@@ -435,11 +636,16 @@ function clamp(value, min, max, fallback) {
     : fallback;
 }
 
+function safeHex(value, fallback) {
+  const candidate = String(value ?? "").trim();
+  return /^#[0-9a-f]{6}$/i.test(candidate) ? candidate : fallback;
+}
+
 function hexToAss(hex, opacity = 100) {
-  const normalized = String(hex ?? "#ffffff")
-    .replace("#", "")
-    .padEnd(6, "f")
-    .slice(0, 6);
+  const candidate = String(hex ?? "").trim();
+  const normalized = /^#[0-9a-f]{6}$/i.test(candidate)
+    ? candidate.slice(1)
+    : "ffffff";
   const red = normalized.slice(0, 2);
   const green = normalized.slice(2, 4);
   const blue = normalized.slice(4, 6);
@@ -475,26 +681,67 @@ function escapeAssText(text, uppercaseEnglish) {
   return value;
 }
 
-function animationTag(animation) {
+function animationTag(animation, position, playResX, playResY) {
   if (animation === "fade") return "{\\fad(150,120)}";
-  if (animation === "slide")
-    return "{\\move(960,1010,960,900,0,240)\\fad(90,120)}";
+  if (animation === "slide") {
+    const x = Math.round(playResX / 2);
+    const endY = Math.round(playResY * (position / 100));
+    const startY = Math.round(endY + playResY * 0.055);
+    return `{\\move(${x},${startY},${x},${endY},0,240)\\fad(90,120)}`;
+  }
   return "{\\fscx84\\fscy84\\t(0,190,\\fscx100\\fscy100)\\fad(60,100)}";
 }
 
-function createAss(captions, rawStyle, languageCode) {
+function groupWordsForReels(words, maxWords) {
+  const groups = [];
+  let current = [];
+  for (const word of words) {
+    const nextDuration = current.length
+      ? Number(word.end) - Number(current[0].start)
+      : Number(word.end) - Number(word.start);
+    const nextGlyphs = [...current, word].reduce(
+      (sum, item) => sum + Array.from(String(item.text ?? "")).length,
+      0,
+    );
+    if (
+      current.length &&
+      (current.length >= maxWords || nextDuration > 2.6 || nextGlyphs > 30)
+    ) {
+      groups.push(current);
+      current = [];
+    }
+    current.push(word);
+    if (
+      current.length >= 2 &&
+      /[.!?।॥…]$/u.test(String(word.text ?? ""))
+    ) {
+      groups.push(current);
+      current = [];
+    }
+  }
+  if (current.length) groups.push(current);
+  return groups;
+}
+
+function createAss(captions, rawStyle, languageCode, video = {}) {
+  const supportedFonts = new Set([
+    "Noto Sans Bengali",
+    "Noto Sans Devanagari",
+  ]);
+  const fallbackFont =
+    languageCode === "brx-IN"
+      ? "Noto Sans Devanagari"
+      : "Noto Sans Bengali";
   const style = {
-    fontFamily:
-      rawStyle?.fontFamily ??
-      (languageCode === "brx-IN"
-        ? "Noto Sans Devanagari"
-        : "Noto Sans Bengali"),
+    fontFamily: supportedFonts.has(rawStyle?.fontFamily)
+      ? rawStyle.fontFamily
+      : fallbackFont,
     fontSize: clamp(rawStyle?.fontSize, 24, 84, 48),
-    textColor: rawStyle?.textColor ?? "#fff9ee",
-    backgroundColor: rawStyle?.backgroundColor ?? "#171a27",
+    textColor: safeHex(rawStyle?.textColor, "#fff9ee"),
+    backgroundColor: safeHex(rawStyle?.backgroundColor, "#171a27"),
     backgroundOpacity: clamp(rawStyle?.backgroundOpacity, 0, 100, 78),
-    highlightColor: rawStyle?.highlightColor ?? "#ffde59",
-    outlineColor: rawStyle?.outlineColor ?? "#171a27",
+    highlightColor: safeHex(rawStyle?.highlightColor, "#ffde59"),
+    outlineColor: safeHex(rawStyle?.outlineColor, "#171a27"),
     outlineWidth: clamp(rawStyle?.outlineWidth, 0, 8, 2),
     position: clamp(rawStyle?.position, 52, 92, 83),
     animation: ["pop", "fade", "slide"].includes(rawStyle?.animation)
@@ -503,10 +750,14 @@ function createAss(captions, rawStyle, languageCode) {
     weight: ["600", "700", "800"].includes(String(rawStyle?.weight))
       ? Number(rawStyle.weight)
       : 700,
+    wordsPerCard: Math.round(clamp(rawStyle?.wordsPerCard, 2, 7, 4)),
     uppercaseEnglish: Boolean(rawStyle?.uppercaseEnglish),
   };
 
-  const marginV = Math.round(1080 * (1 - style.position / 100));
+  const portrait = Number(video.width) < Number(video.height);
+  const playResX = portrait ? 1080 : 1920;
+  const playResY = portrait ? 1920 : 1080;
+  const marginV = Math.round(playResY * (1 - style.position / 100));
   const borderStyle = style.backgroundOpacity > 0 ? 3 : 1;
   const bold = style.weight >= 700 ? -1 : 0;
   const primary = hexToAss(style.textColor);
@@ -523,10 +774,23 @@ function createAss(captions, rawStyle, languageCode) {
         Number(caption.end) > Number(caption.start) &&
         String(caption.text ?? "").trim(),
     )
-    .map((caption) => {
-      const text =
+    .flatMap((caption) => {
+      const groups =
         Array.isArray(caption.words) && caption.words.length
-          ? caption.words
+          ? groupWordsForReels(caption.words, style.wordsPerCard)
+          : [
+              [
+                {
+                  text: caption.text,
+                  start: caption.start,
+                  end: caption.end,
+                },
+              ],
+            ];
+      return groups.map((words) => {
+        const text =
+          Array.isArray(caption.words) && caption.words.length
+            ? words
               .map((word, index) => {
                 const duration = Math.max(
                   1,
@@ -539,22 +803,28 @@ function createAss(captions, rawStyle, languageCode) {
                   style.uppercaseEnglish,
                 );
                 return `{\\kf${duration}}${wordText}${
-                  index === caption.words.length - 1 ? "" : " "
+                  index === words.length - 1 ? "" : " "
                 }`;
               })
               .join("")
-          : escapeAssText(caption.text, style.uppercaseEnglish);
-      return `Dialogue: 0,${assTime(caption.start)},${assTime(
-        caption.end,
-      )},Default,,0,0,0,,${animationTag(style.animation)}${text}`;
+            : escapeAssText(words[0].text, style.uppercaseEnglish);
+        return `Dialogue: 0,${assTime(words[0].start)},${assTime(
+          words.at(-1).end,
+        )},Default,,0,0,0,,${animationTag(
+          style.animation,
+          style.position,
+          playResX,
+          playResY,
+        )}${text}`;
+      });
     })
     .join("\n");
 
   return `[Script Info]
 Title: SyncWord captions
 ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
+PlayResX: ${playResX}
+PlayResY: ${playResY}
 ScaledBorderAndShadow: yes
 WrapStyle: 0
 YCbCr Matrix: TV.709
@@ -573,10 +843,11 @@ async function renderVideo(job, captions, style) {
   try {
     updateJob(job, "rendering", 82, "Writing styled ASS captions");
     job.captions = captions;
+    job.style = style;
     job.assPath = path.join(job.directory, "captions.ass");
     await writeFile(
       job.assPath,
-      createAss(captions, style, job.languageCode),
+      createAss(captions, style, job.languageCode, job.video),
       "utf8",
     );
 
@@ -600,13 +871,15 @@ async function renderVideo(job, captions, style) {
         "-i",
         path.basename(job.inputPath),
         "-vf",
-        `ass=captions.ass${fontOption}`,
+        `ass=captions.ass${fontOption},format=yuv420p`,
         "-c:v",
         "libx264",
         "-preset",
         process.env.FFMPEG_PRESET ?? "medium",
         "-crf",
         process.env.FFMPEG_CRF ?? "18",
+        "-pix_fmt",
+        "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
@@ -629,12 +902,33 @@ async function renderVideo(job, captions, style) {
   }
 }
 
+async function processJob(job) {
+  await transcribe(job);
+  if (job.status === "ready") {
+    await renderVideo(job, job.captions, job.style ?? {});
+  }
+}
+
+function objectFromField(value) {
+  if (value && typeof value === "object") return value;
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 app.get("/health", (_request, response) => {
   response.json({
     ok: true,
     service: "syncword-render",
     sarvamConfigured: Boolean(process.env.SARVAM_API_KEY),
     ffmpeg: process.env.FFMPEG_PATH ?? "ffmpeg",
+    queueDepth: taskQueue.length,
+    active: queueRunning,
+    retentionHours: jobLifetimeMs / 3_600_000,
   });
 });
 
@@ -644,8 +938,40 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
     return;
   }
 
+  const acceptedExtensions = new Set([
+    ".mp4",
+    ".mov",
+    ".webm",
+    ".mkv",
+    ".m4v",
+  ]);
+  const sourceExtension = path.extname(request.file.originalname).toLowerCase();
+  if (
+    !acceptedExtensions.has(sourceExtension) &&
+    !request.file.mimetype.startsWith("video/")
+  ) {
+    await unlink(request.file.path).catch(() => {});
+    response.status(415).json({
+      error: "Choose an MP4, MOV, WebM, MKV, or M4V video.",
+    });
+    return;
+  }
+
+  const activeJobs = [...jobs.values()].filter((job) =>
+    ["queued", "extracting", "transcribing", "rendering"].includes(
+      job.status,
+    ),
+  ).length;
+  if (activeJobs >= maxQueuedJobs) {
+    await unlink(request.file.path).catch(() => {});
+    response.status(429).json({
+      error: "The render queue is full. Try again in a few minutes.",
+    });
+    return;
+  }
+
   const id = randomUUID();
-  const directory = path.join(runtimeRoot, "jobs", id);
+  const directory = path.join(jobsRoot, id);
   await mkdir(directory, { recursive: true });
   const extension =
     path.extname(request.file.originalname).replace(/[^a-zA-Z0-9.]/g, "") ||
@@ -669,16 +995,19 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
     inputPath,
     originalName: request.file.originalname,
     language,
+    style: objectFromField(request.body.style),
     status: "queued",
     progress: 3,
-    message: "Queued for audio extraction",
+    message: "Queued for captioning",
     captions: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + jobLifetimeMs).toISOString(),
   };
   jobs.set(id, job);
+  await persistJob(job);
   response.status(202).json(publicJob(job));
-  void transcribe(job);
+  enqueue(job, () => processJob(job));
 });
 
 app.get("/v1/jobs/:id", (request, response) => {
@@ -696,9 +1025,9 @@ app.post("/v1/jobs/:id/render", (request, response) => {
     response.status(404).json({ error: "Job not found." });
     return;
   }
-  if (job.status !== "ready") {
+  if (!["ready", "complete"].includes(job.status)) {
     response.status(409).json({
-      error: `Job must be ready before rendering. Current status: ${job.status}.`,
+      error: `Job is not ready for a render. Current status: ${job.status}.`,
     });
     return;
   }
@@ -710,8 +1039,24 @@ app.post("/v1/jobs/:id/render", (request, response) => {
     return;
   }
 
-  void renderVideo(job, captions, request.body.style ?? {});
+  job.style = objectFromField(request.body.style);
+  updateJob(job, "rendering", 82, "Re-render queued");
+  enqueue(job, () => renderVideo(job, captions, job.style));
   response.status(202).json(publicJob(job));
+});
+
+app.get("/v1/jobs/:id/result", (request, response) => {
+  const job = jobs.get(request.params.id);
+  if (!job?.outputPath || job.status !== "complete") {
+    response.status(404).json({ error: "Rendered video is not ready." });
+    return;
+  }
+  response.setHeader("content-type", "video/mp4");
+  response.setHeader("cache-control", "private, no-store");
+  response.sendFile(path.basename(job.outputPath), {
+    root: job.directory,
+    dotfiles: "deny",
+  });
 });
 
 app.get("/v1/jobs/:id/download", (request, response) => {
@@ -745,6 +1090,13 @@ app.use((error, _request, response, _next) => {
     error: error instanceof Error ? error.message : "Unexpected server error.",
   });
 });
+
+await restoreJobs();
+await cleanupExpiredJobs();
+const cleanupTimer = setInterval(() => {
+  void cleanupExpiredJobs();
+}, 60 * 60 * 1000);
+cleanupTimer.unref();
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`SyncWord render API listening on http://localhost:${port}`);
