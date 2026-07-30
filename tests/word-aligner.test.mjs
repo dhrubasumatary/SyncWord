@@ -53,12 +53,33 @@ test("uses low-energy valleys to place monotonic word boundaries", () => {
 
   const words = result.captions[0].words;
   assert.equal(words.length, 4);
+  assert.equal(words[0].start, 0);
+  assert.equal(words.at(-1).end, 4);
   assert.ok(words.every((word) => word.end > word.start));
   assert.ok(words.every((word, index) => !index || word.start >= words[index - 1].end));
   assert.ok(Math.abs(words[0].end - 0.9) < 0.3);
   assert.ok(Math.abs(words[1].end - 1.8) < 0.3);
   assert.equal(result.summary.method, "phrase-anchored-acoustic-dp");
   assert.equal(result.summary.totalWords, 4);
+});
+
+test("never expands aligned words beyond Saaras phrase anchors", () => {
+  const result = alignTranscriptWords(
+    [
+      {
+        id: "fractional-phrase",
+        start: 1.113,
+        end: 3.947,
+        text: "आंनि राव",
+        language: "brx",
+      },
+    ],
+    syntheticPcm(5, [2.4]),
+  );
+
+  const words = result.captions[0].words;
+  assert.equal(words[0].start, 1.113);
+  assert.equal(words.at(-1).end, 3.947);
 });
 
 test("uses acoustic changes when a word boundary has no silence", () => {

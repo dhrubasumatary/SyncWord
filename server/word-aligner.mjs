@@ -323,11 +323,19 @@ export function alignCaptionWords(
       leftConfidence && rightConfidence
         ? (leftConfidence + rightConfidence) / 2
         : leftConfidence ?? rightConfidence ?? 0.72;
+    const wordStart =
+      index === 0
+        ? start
+        : (boundaryFrames[index] * frameMs) / 1000;
+    const wordEnd =
+      index === words.length - 1
+        ? end
+        : (boundaryFrames[index + 1] * frameMs) / 1000;
     return {
       id: captionWordId(caption, index),
       text: word,
-      start: Number(((boundaryFrames[index] * frameMs) / 1000).toFixed(3)),
-      end: Number(((boundaryFrames[index + 1] * frameMs) / 1000).toFixed(3)),
+      start: Number(wordStart.toFixed(3)),
+      end: Number(wordEnd.toFixed(3)),
       confidence: Number(confidence.toFixed(2)),
       source: "acoustic-dp",
     };
