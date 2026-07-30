@@ -9,7 +9,6 @@ services:
     healthCheckPath: /health
     autoDeployTrigger: commit
     numInstances: 1
-    maxShutdownDelaySeconds: 300
     envVars:
       - key: SARVAM_API_KEY
         sync: false
