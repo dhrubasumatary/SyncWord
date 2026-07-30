@@ -138,7 +138,67 @@ function updateJob(job, status, progress, message) {
   void persistJob(job);
 }
 
+function isCancelled(job) {
+  return Boolean(job) && (job.cancelRequested === true || job.status === "cancelled");
+}
+
+function cancelledError() {
+  const error = new Error("Processing cancelled.");
+  error.code = "SYNCWORD_CANCELLED";
+  return error;
+}
+
+function throwIfCancelled(job) {
+  if (isCancelled(job)) throw cancelledError();
+}
+
+function ensureJobRuntime(job) {
+  if (!job.abortController) {
+    Object.defineProperty(job, "abortController", {
+      value: new AbortController(),
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    });
+  }
+  if (!job.children) {
+    Object.defineProperty(job, "children", {
+      value: new Set(),
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    });
+  }
+  return job;
+}
+
+function trackChild(job, child) {
+  if (!job) return;
+  ensureJobRuntime(job).children.add(child);
+  child.once("close", () => job.children.delete(child));
+}
+
+function removeQueuedTasks(job) {
+  for (let index = taskQueue.length - 1; index >= 0; index -= 1) {
+    if (taskQueue[index].job.id === job.id) taskQueue.splice(index, 1);
+  }
+}
+
+function cancelJob(job) {
+  if (isCancelled(job) || ["complete", "failed"].includes(job.status)) {
+    return false;
+  }
+  job.cancelRequested = true;
+  removeQueuedTasks(job);
+  ensureJobRuntime(job).abortController.abort();
+  for (const child of job.children) child.kill("SIGTERM");
+  job.expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  updateJob(job, "cancelled", job.progress, "Processing cancelled");
+  return true;
+}
+
 async function removeJob(job) {
+  removeQueuedTasks(job);
   jobs.delete(job.id);
   await rm(job.directory, { recursive: true, force: true });
 }
@@ -167,6 +227,7 @@ async function restoreJobs() {
         continue;
       }
       job.directory = directory;
+      ensureJobRuntime(job);
       for (const pathKey of [
         "inputPath",
         "transcriptPath",
@@ -202,9 +263,11 @@ async function drainQueue() {
   queueRunning = true;
   while (taskQueue.length) {
     const task = taskQueue.shift();
+    if (isCancelled(task.job)) continue;
     try {
       await task.run();
     } catch (error) {
+      if (isCancelled(task.job)) continue;
       updateJob(
         task.job,
         "failed",
@@ -217,6 +280,7 @@ async function drainQueue() {
 }
 
 function enqueue(job, runTask) {
+  if (isCancelled(job)) return;
   taskQueue.push({ job, run: runTask });
   void drainQueue();
 }
@@ -227,17 +291,23 @@ function sleep(milliseconds) {
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    const { job, ...spawnOptions } = options;
     const child = spawn(command, args, {
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe"],
-      ...options,
+      ...spawnOptions,
     });
+    trackChild(job, child);
     let errorOutput = "";
     child.stderr.on("data", (chunk) => {
       errorOutput = `${errorOutput}${chunk.toString()}`.slice(-12_000);
     });
     child.on("error", reject);
     child.on("close", (code) => {
+      if (job && isCancelled(job)) {
+        reject(cancelledError());
+        return;
+      }
       if (code === 0) {
         resolve();
       } else {
@@ -253,11 +323,13 @@ function run(command, args, options = {}) {
 
 function runCapture(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    const { job, ...spawnOptions } = options;
     const child = spawn(command, args, {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
-      ...options,
+      ...spawnOptions,
     });
+    trackChild(job, child);
     let output = "";
     let errorOutput = "";
     child.stdout.on("data", (chunk) => {
@@ -268,6 +340,10 @@ function runCapture(command, args, options = {}) {
     });
     child.on("error", reject);
     child.on("close", (code) => {
+      if (job && isCancelled(job)) {
+        reject(cancelledError());
+        return;
+      }
       if (code === 0) {
         resolve(output);
       } else {
@@ -295,7 +371,7 @@ async function probeVideo(job) {
       "json",
       path.basename(job.inputPath),
     ],
-    { cwd: job.directory },
+    { cwd: job.directory, job },
   );
   const probe = JSON.parse(output);
   const stream = probe.streams?.[0];
@@ -324,7 +400,8 @@ async function probeVideo(job) {
   void persistJob(job);
 }
 
-async function sarvamJson(endpoint, options = {}) {
+async function sarvamJson(endpoint, options = {}, job) {
+  throwIfCancelled(job);
   const apiKey = process.env.SARVAM_API_KEY;
   if (!apiKey && sarvamBaseUrl === "https://api.sarvam.ai") {
     throw new Error(
@@ -334,12 +411,14 @@ async function sarvamJson(endpoint, options = {}) {
 
   const response = await fetch(`${sarvamBaseUrl}${endpoint}`, {
     ...options,
+    signal: job ? ensureJobRuntime(job).abortController.signal : options.signal,
     headers: {
       ...(apiKey ? { "api-subscription-key": apiKey } : {}),
       "content-type": "application/json",
       ...(options.headers ?? {}),
     },
   });
+  throwIfCancelled(job);
 
   const text = await response.text();
   let payload;
@@ -374,13 +453,14 @@ function resolveStorageUrl(record) {
   );
 }
 
-async function uploadAudio(jobId, fileName, audioPath, storageType) {
+async function uploadAudio(job, jobId, fileName, audioPath, storageType) {
   const uploadResponse = await sarvamJson(
     "/speech-to-text/job/v1/upload-files",
     {
       method: "POST",
       body: JSON.stringify({ job_id: jobId, files: [fileName] }),
     },
+    job,
   );
   const target = resolveStorageUrl(uploadResponse.upload_urls?.[fileName]);
   if (!target) throw new Error("Sarvam did not return an audio upload URL.");
@@ -395,7 +475,9 @@ async function uploadAudio(jobId, fileName, audioPath, storageType) {
     method: "PUT",
     headers,
     body: audio,
+    signal: ensureJobRuntime(job).abortController.signal,
   });
+  throwIfCancelled(job);
   if (!response.ok) {
     throw new Error(`Audio upload failed with status ${response.status}.`);
   }
@@ -403,9 +485,11 @@ async function uploadAudio(jobId, fileName, audioPath, storageType) {
 
 async function waitForSarvamJob(job, sarvamJobId) {
   for (let attempt = 0; attempt < 360; attempt += 1) {
+    throwIfCancelled(job);
     const status = await sarvamJson(
       `/speech-to-text/job/v1/${encodeURIComponent(sarvamJobId)}/status`,
       { method: "GET" },
+      job,
     );
     const state = String(status.job_state ?? "").toLowerCase();
     updateJob(
@@ -505,7 +589,7 @@ function transcriptToCaptions(transcript) {
   );
 }
 
-async function downloadTranscript(sarvamJobId, status) {
+async function downloadTranscript(job, sarvamJobId, status) {
   const outputFiles = (status.job_details ?? [])
     .flatMap((detail) => detail.outputs ?? [])
     .map((output) => output.file_name)
@@ -521,12 +605,16 @@ async function downloadTranscript(sarvamJobId, status) {
       method: "POST",
       body: JSON.stringify({ job_id: sarvamJobId, files: outputFiles }),
     },
+    job,
   );
 
   const source = resolveStorageUrl(response.download_urls?.[outputFiles[0]]);
   if (!source) throw new Error("Sarvam did not return a transcript URL.");
 
-  const transcriptResponse = await fetch(source);
+  const transcriptResponse = await fetch(source, {
+    signal: ensureJobRuntime(job).abortController.signal,
+  });
+  throwIfCancelled(job);
   if (!transcriptResponse.ok) {
     throw new Error(
       `Transcript download failed with status ${transcriptResponse.status}.`,
@@ -537,8 +625,10 @@ async function downloadTranscript(sarvamJobId, status) {
 
 async function transcribe(job) {
   try {
+    ensureJobRuntime(job);
     updateJob(job, "extracting", 7, "Inspecting the video");
     await probeVideo(job);
+    throwIfCancelled(job);
     updateJob(job, "extracting", 10, "Extracting clean mono audio");
     await run(
       process.env.FFMPEG_PATH ?? "ffmpeg",
@@ -558,26 +648,32 @@ async function transcribe(job) {
         "pcm_s16le",
         "audio.wav",
       ],
-      { cwd: job.directory },
+      { cwd: job.directory, job },
     );
+    throwIfCancelled(job);
 
     updateJob(job, "transcribing", 24, "Creating Saaras v3 Batch job");
     const audioFileName = `${job.id}.wav`;
-    const init = await sarvamJson("/speech-to-text/job/v1", {
-      method: "POST",
-      body: JSON.stringify({
-        job_parameters: {
-          model: "saaras:v3",
-          mode: "codemix",
-          language_code: job.language,
-          with_timestamps: true,
-          with_diarization: false,
-        },
-      }),
-    });
+    const init = await sarvamJson(
+      "/speech-to-text/job/v1",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          job_parameters: {
+            model: "saaras:v3",
+            mode: "codemix",
+            language_code: job.language,
+            with_timestamps: true,
+            with_diarization: false,
+          },
+        }),
+      },
+      job,
+    );
 
     job.sarvamJobId = init.job_id;
     await uploadAudio(
+      job,
       init.job_id,
       audioFileName,
       path.join(job.directory, "audio.wav"),
@@ -586,11 +682,12 @@ async function transcribe(job) {
     await sarvamJson(
       `/speech-to-text/job/v1/${encodeURIComponent(init.job_id)}/start`,
       { method: "POST", body: "{}" },
+      job,
     );
 
     updateJob(job, "transcribing", 32, "Saaras is aligning phrases");
     const status = await waitForSarvamJob(job, init.job_id);
-    const transcript = await downloadTranscript(init.job_id, status);
+    const transcript = await downloadTranscript(job, init.job_id, status);
     job.languageCode = transcript.language_code ?? job.language;
     job.captions = transcriptToCaptions(transcript);
     job.transcriptPath = path.join(job.directory, "transcript.json");
@@ -619,8 +716,9 @@ async function transcribe(job) {
         "16000",
         "audio.pcm",
       ],
-      { cwd: job.directory },
+      { cwd: job.directory, job },
     );
+    throwIfCancelled(job);
     const aligned = alignTranscriptWords(
       job.captions,
       await readFile(path.join(job.directory, "audio.pcm")),
@@ -635,6 +733,7 @@ async function transcribe(job) {
       `${aligned.summary.totalWords} words aligned · ${aligned.summary.needsReview} need review`,
     );
   } catch (error) {
+    if (isCancelled(job)) return;
     updateJob(
       job,
       "failed",
@@ -856,6 +955,8 @@ ${events}
 
 async function renderVideo(job, captions, style) {
   try {
+    ensureJobRuntime(job);
+    throwIfCancelled(job);
     updateJob(job, "rendering", 82, "Writing styled ASS captions");
     job.captions = captions;
     job.style = style;
@@ -903,8 +1004,9 @@ async function renderVideo(job, captions, style) {
         "+faststart",
         path.basename(job.outputPath),
       ],
-      { cwd: job.directory },
+      { cwd: job.directory, job },
     );
+    throwIfCancelled(job);
 
     updateJob(job, "complete", 100, "Captioned video ready");
     await Promise.allSettled([
@@ -912,6 +1014,7 @@ async function renderVideo(job, captions, style) {
       unlink(path.join(job.directory, "audio.pcm")),
     ]);
   } catch (error) {
+    if (isCancelled(job)) return;
     updateJob(
       job,
       "failed",
@@ -1024,6 +1127,7 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
     updatedAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + jobLifetimeMs).toISOString(),
   };
+  ensureJobRuntime(job);
   jobs.set(id, job);
   await persistJob(job);
   response.status(202).json(publicJob(job));
@@ -1037,6 +1141,21 @@ app.get("/v1/jobs/:id", (request, response) => {
     return;
   }
   response.json(publicJob(job));
+});
+
+app.delete("/v1/jobs/:id", (request, response) => {
+  const job = jobs.get(request.params.id);
+  if (!job) {
+    response.status(404).json({ error: "Job not found." });
+    return;
+  }
+  if (!cancelJob(job)) {
+    response.status(409).json({
+      error: `Job cannot be cancelled. Current status: ${job.status}.`,
+    });
+    return;
+  }
+  response.status(202).json(publicJob(job));
 });
 
 app.post("/v1/jobs/:id/render", (request, response) => {

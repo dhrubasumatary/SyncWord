@@ -56,7 +56,8 @@ type JobStatus =
   | "ready"
   | "rendering"
   | "complete"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 type JobResponse = {
   id: string;
@@ -383,7 +384,11 @@ export default function Home() {
   }, [apiBase]);
 
   useEffect(() => {
-    if (!job || !apiBase || ["complete", "failed"].includes(job.status)) {
+    if (
+      !job ||
+      !apiBase ||
+      ["complete", "failed", "cancelled"].includes(job.status)
+    ) {
       return;
     }
     const jobId = job.id;
@@ -413,7 +418,7 @@ export default function Home() {
         if (next.status === "complete") {
           setTab("export");
           setToast("Final ASS-burned MP4 is ready.");
-        } else if (next.status === "failed") {
+        } else if (["failed", "cancelled"].includes(next.status)) {
           setToast(next.message ?? "Processing failed.");
         }
       } catch {
@@ -466,7 +471,51 @@ export default function Home() {
     }
   };
 
-  const acceptVideo = (nextFile: File) => {
+  const cancelRemoteJob = async (jobToCancel = job) => {
+    if (
+      !jobToCancel ||
+      !apiBase ||
+      !processingStatuses.includes(jobToCancel.status)
+    ) {
+      return;
+    }
+    try {
+      const response = await fetch(`${apiBase}/v1/jobs/${jobToCancel.id}`, {
+        method: "DELETE",
+      });
+      if (!response.ok && response.status !== 404) {
+        const data = (await response.json()) as { error?: string };
+        throw new Error(data.error ?? "Could not cancel the render.");
+      }
+    } catch (error) {
+      setToast(
+        error instanceof Error ? error.message : "Could not cancel the render.",
+      );
+    }
+  };
+
+  const clearProject = () => {
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    setFile(null);
+    setVideoUrl("");
+    setDuration(0);
+    setCurrentTime(0);
+    setCaptions([]);
+    setSelectedCaptionId("");
+    setSelectedWordIndex(0);
+    setJob(null);
+    setHasChanges(false);
+    setTab("captions");
+  };
+
+  const cancelProcessing = () => {
+    const jobToCancel = job;
+    clearProject();
+    void cancelRemoteJob(jobToCancel);
+    setToast("Processing cancelled. Your hobby queue slot is free.");
+  };
+
+  const acceptVideo = async (nextFile: File) => {
     const looksLikeVideo =
       nextFile.type.startsWith("video/") ||
       /\.(mp4|mov|webm|mkv|m4v)$/i.test(nextFile.name);
@@ -478,6 +527,8 @@ export default function Home() {
       setToast("Keep the reel under 150 MB for the hobby beta.");
       return;
     }
+    const previousJob = job;
+    await cancelRemoteJob(previousJob);
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     const localUrl = URL.createObjectURL(nextFile);
     setFile(nextFile);
@@ -597,7 +648,7 @@ export default function Home() {
   const primaryAction = () => {
     if (!file) {
       videoInputRef.current?.click();
-    } else if (job?.status === "failed" || !job) {
+    } else if (["failed", "cancelled"].includes(job?.status ?? "") || !job) {
       void uploadVideo(file);
     } else if (job.status === "complete" && hasChanges) {
       void startRender();
@@ -609,7 +660,9 @@ export default function Home() {
   const primaryLabel = (() => {
     if (uploading) return "Uploading video…";
     if (!file) return "Choose video";
-    if (!job || job.status === "failed") return "Try again";
+    if (!job || ["failed", "cancelled"].includes(job.status)) {
+      return "Try again";
+    }
     if (isProcessing) return `${job.message ?? "Processing"} · ${job.progress}%`;
     if (hasChanges) return "Update final video";
     return "Download MP4";
@@ -718,8 +771,13 @@ export default function Home() {
         <div className="creator-workspace">
           <section className="reel-column">
             <div className="project-bar">
-              <button onClick={() => videoInputRef.current?.click()}>
-                ← New video
+              <button
+                onClick={() => {
+                  if (isProcessing) cancelProcessing();
+                  videoInputRef.current?.click();
+                }}
+              >
+                {isProcessing ? "Cancel & new video" : "← New video"}
               </button>
               <span title={file.name}>{file.name}</span>
               {showingFinal && <b>FINAL</b>}
@@ -784,6 +842,12 @@ export default function Home() {
                   </div>
                   <strong>{job?.message ?? "Uploading your reel"}</strong>
                   <small>Keep this tab open while we make the final MP4.</small>
+                  <button
+                    className="cancel-processing"
+                    onClick={cancelProcessing}
+                  >
+                    Cancel processing
+                  </button>
                   <ol>
                     {["Upload", "Audio", "Words", "ASS burn"].map(
                       (label, index) => (
@@ -802,10 +866,10 @@ export default function Home() {
                 </div>
               )}
 
-              {job?.status === "failed" && (
+              {["failed", "cancelled"].includes(job?.status ?? "") && (
                 <div className="failed-cover">
                   <b>Render stopped</b>
-                  <span>{job.message}</span>
+                  <span>{job?.message}</span>
                 </div>
               )}
 
@@ -1167,7 +1231,7 @@ export default function Home() {
         hidden
         onChange={(event) => {
           const nextFile = event.target.files?.[0];
-          if (nextFile) acceptVideo(nextFile);
+          if (nextFile) void acceptVideo(nextFile);
           event.target.value = "";
         }}
       />

@@ -74,6 +74,8 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /with_timestamps: true/);
   assert.match(renderServer, /processJob/);
   assert.match(renderServer, /\/v1\/jobs\/:id\/result/);
+  assert.match(renderServer, /app\.delete\("\/v1\/jobs\/:id"/);
+  assert.match(renderServer, /Processing cancelled/);
   assert.match(renderServer, /JOB_RETENTION_HOURS/);
   assert.doesNotMatch(renderServer, /input_audio_codec/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
