@@ -295,6 +295,28 @@ function groupWordsForReels(words: WordTiming[], maxWords: number) {
   return groups;
 }
 
+function isAlignedCaption(value: unknown): value is Caption {
+  if (!value || typeof value !== "object") return false;
+  const caption = value as Partial<Caption>;
+  return (
+    typeof caption.id === "string" &&
+    typeof caption.text === "string" &&
+    Number.isFinite(caption.start) &&
+    Number.isFinite(caption.end) &&
+    Number(caption.end) > Number(caption.start) &&
+    Array.isArray(caption.words) &&
+    caption.words.length > 0 &&
+    caption.words.every(
+      (word) =>
+        word &&
+        typeof word.text === "string" &&
+        Number.isFinite(word.start) &&
+        Number.isFinite(word.end) &&
+        word.end > word.start,
+    )
+  );
+}
+
 export default function Home() {
   const [tab, setTab] = useState<StudioTab>("captions");
   const [file, setFile] = useState<File | null>(null);
@@ -347,28 +369,27 @@ export default function Home() {
   const playbackUrl = finalVideoUrl || videoUrl;
   const selectedCaption =
     captions.find((caption) => caption.id === selectedCaptionId) ?? captions[0];
-  const selectedWord = selectedCaption?.words[selectedWordIndex];
+  const selectedWords = selectedCaption?.words ?? [];
+  const selectedWord = selectedWords[selectedWordIndex];
   const activeCaption =
     captions.find(
       (caption) =>
         currentTime >= caption.start && currentTime < caption.end,
     ) ?? selectedCaption;
-  const activeWord = activeCaption?.words.find(
+  const activeWords = activeCaption?.words ?? [];
+  const activeWord = activeWords.find(
     (word) => currentTime >= word.start && currentTime < word.end,
   );
+  const activeGroups = groupWordsForReels(
+    activeWords,
+    captionStyle.wordsPerCard,
+  );
   const activeWordGroup = activeCaption
-    ? groupWordsForReels(
-        activeCaption.words,
-        captionStyle.wordsPerCard,
-      ).find(
+    ? activeGroups.find(
         (group) =>
           currentTime >= group[0].start &&
           currentTime < group[group.length - 1].end,
-      ) ??
-      groupWordsForReels(
-        activeCaption.words,
-        captionStyle.wordsPerCard,
-      )[0]
+      ) ?? activeGroups[0]
     : [];
   const alignment = job?.alignment;
 
@@ -447,9 +468,16 @@ export default function Home() {
         setEngineState("online");
         const next = (await response.json()) as JobResponse;
         setJob(next);
-        if (next.captions?.length) {
-          setCaptions(next.captions);
-          setSelectedCaptionId((current) => current || next.captions![0].id);
+        const nextCaptions =
+          Array.isArray(next.captions) &&
+          next.captions.every(isAlignedCaption)
+            ? next.captions
+            : [];
+        if (nextCaptions.length) {
+          setCaptions(nextCaptions);
+          setSelectedCaptionId(
+            (current) => current || nextCaptions[0].id,
+          );
         }
         if (next.status === "complete") {
           setTab("export");
@@ -643,14 +671,14 @@ export default function Home() {
     if (
       !selectedCaption ||
       !selectedWord ||
-      selectedWordIndex >= selectedCaption.words.length - 1
+      selectedWordIndex >= selectedWords.length - 1
     ) {
       return;
     }
     setCaptions((items) =>
       items.map((caption) => {
         if (caption.id !== selectedCaption.id) return caption;
-        const words = caption.words.map((word) => ({ ...word }));
+        const words = (caption.words ?? []).map((word) => ({ ...word }));
         const left = words[selectedWordIndex];
         const right = words[selectedWordIndex + 1];
         const boundary = Math.max(
@@ -1047,7 +1075,7 @@ export default function Home() {
 
                   <span className="field-label">Tap a word to inspect its cut</span>
                   <div className="word-grid">
-                    {selectedCaption.words.map((word, index) => (
+                    {selectedWords.map((word, index) => (
                       <button
                         key={word.id}
                         className={`${index === selectedWordIndex ? "active" : ""} ${
@@ -1083,7 +1111,7 @@ export default function Home() {
                         </strong>
                       </div>
                       {selectedWordIndex <
-                        selectedCaption.words.length - 1 && (
+                        selectedWords.length - 1 && (
                         <div className="nudge-buttons">
                           <button onClick={() => nudgeBoundary(-0.03)}>
                             −30 ms

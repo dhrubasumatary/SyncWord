@@ -16,6 +16,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import {
+  captionsHaveWordTimings,
   groupWordsForReels,
   stitchShortCaptionPhrases,
 } from "./caption-groups.mjs";
@@ -85,12 +86,15 @@ const upload = multer({
 });
 
 function publicJob(job) {
+  const captions = captionsHaveWordTimings(job.captions)
+    ? job.captions
+    : [];
   return {
     id: job.id,
     status: job.status,
     progress: job.progress,
     message: job.message,
-    captions: job.captions,
+    captions,
     alignment: job.alignment,
     languageCode: job.languageCode,
     style: job.style,

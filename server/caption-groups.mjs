@@ -2,6 +2,30 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+export function captionsHaveWordTimings(captions) {
+  return (
+    Array.isArray(captions) &&
+    captions.length > 0 &&
+    captions.every(
+      (caption) =>
+        caption &&
+        Number.isFinite(Number(caption.start)) &&
+        Number.isFinite(Number(caption.end)) &&
+        Number(caption.end) > Number(caption.start) &&
+        Array.isArray(caption.words) &&
+        caption.words.length > 0 &&
+        caption.words.every(
+          (word) =>
+            word &&
+            String(word.text ?? "").trim() &&
+            Number.isFinite(Number(word.start)) &&
+            Number.isFinite(Number(word.end)) &&
+            Number(word.end) > Number(word.start),
+        ),
+    )
+  );
+}
+
 function wordCount(caption) {
   if (Array.isArray(caption?.words) && caption.words.length) {
     return caption.words.length;

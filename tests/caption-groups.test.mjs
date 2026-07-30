@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  captionsHaveWordTimings,
   groupWordsForReels,
   stitchShortCaptionPhrases,
 } from "../server/caption-groups.mjs";
@@ -59,4 +60,33 @@ test("stitches a one-word Sarvam edge chunk to its nearby phrase", () => {
   assert.equal(stitched.length, 1);
   assert.equal(stitched[0].text, "আৰু মোৰ নিজৰ পৰিচয়।");
   assert.equal(stitched[0].words.length, 4);
+});
+
+test("does not publish phrase chunks before word timings exist", () => {
+  assert.equal(
+    captionsHaveWordTimings([
+      {
+        id: "partial",
+        start: 1,
+        end: 3,
+        text: "आंनि राव",
+      },
+    ]),
+    false,
+  );
+  assert.equal(
+    captionsHaveWordTimings([
+      {
+        id: "ready",
+        start: 1,
+        end: 3,
+        text: "आंनि राव",
+        words: [
+          { text: "आंनि", start: 1, end: 2 },
+          { text: "राव", start: 2, end: 3 },
+        ],
+      },
+    ]),
+    true,
+  );
 });

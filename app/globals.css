@@ -1281,6 +1281,71 @@ button {
   cursor: pointer;
 }
 
+.fatal-shell {
+  display: grid;
+  min-height: 100dvh;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at 50% 20%, rgba(215, 255, 56, 0.1), transparent 34%),
+    var(--bg);
+}
+
+.fatal-card {
+  width: min(100%, 430px);
+  padding: 28px;
+  background: #111114;
+  border: 1px solid var(--line-strong);
+  border-radius: 20px;
+}
+
+.fatal-card > span {
+  color: var(--lime);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.fatal-card h1 {
+  margin: 16px 0 10px;
+  font-size: clamp(32px, 9vw, 48px);
+  line-height: 0.95;
+  letter-spacing: -0.06em;
+}
+
+.fatal-card p {
+  margin: 0 0 22px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.fatal-card button,
+.fatal-card a {
+  display: flex;
+  min-height: 46px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 11px;
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.fatal-card button {
+  width: 100%;
+  color: var(--bg);
+  background: var(--lime);
+  border: 0;
+  cursor: pointer;
+}
+
+.fatal-card a {
+  margin-top: 8px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
 @media (min-width: 780px) {
   .app-header {
     padding-right: max(26px, calc((100vw - 1120px) / 2));
