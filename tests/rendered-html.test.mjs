@@ -38,12 +38,17 @@ test("server-renders the SyncWord editor", async () => {
   const html = await response.text();
   assert.match(
     html,
-    /<title>SyncWord — Word timing without word timestamps<\/title>/i,
+    /<title>SyncWord — Make every word hit on time<\/title>/i,
   );
-  assert.match(html, /Word\s?Sync/i);
-  assert.match(html, /Sarvam phrase/);
-  assert.match(html, /Audio valleys/);
-  assert.match(html, /ASS karaoke/);
+  assert.match(html, /Make every word/);
+  assert.match(html, /hit on time\./);
+  assert.match(html, /Choose a video/);
+  assert.match(html, /No mock transcript/);
+  assert.match(html, /ASS/);
+  assert.doesNotMatch(
+    html,
+    /মোৰ ভাষা|आंनि राव|brahmaputra-stories|MAJULI/i,
+  );
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
@@ -57,7 +62,10 @@ test("removes the disposable starter and wires product metadata", async () => {
 
   assert.match(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
-  assert.match(layout, /og-wordsync\.png/);
+  assert.match(page, /Advanced SubStation Alpha/);
+  assert.match(page, /ASS \\kf sweep/);
+  assert.doesNotMatch(page, /initialCaptions|demoDuration|importSrt|Download SRT/);
+  assert.match(layout, /og-mobile\.png/);
   assert.match(layout, /x-forwarded-host/);
   assert.match(renderServer, /model: "saaras:v3"/);
   assert.match(renderServer, /mode: "codemix"/);

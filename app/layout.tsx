@@ -26,7 +26,7 @@ export async function generateMetadata(): Promise<Metadata> {
 
   return {
     metadataBase: new URL(origin),
-    title: "SyncWord — Word timing without word timestamps",
+    title: "SyncWord — Make every word hit on time",
     description:
       "Phrase-anchored waveform alignment for Assamese and Bodo karaoke captions, with confidence review and ASS-powered rendering.",
     icons: {
@@ -35,23 +35,23 @@ export async function generateMetadata(): Promise<Metadata> {
     },
     openGraph: {
       title: "SyncWord",
-      description: "Word timing without word timestamps.",
+      description: "Make every word hit on time.",
       type: "website",
       url: origin,
       images: [
         {
-          url: `${origin}/og-wordsync.png`,
+          url: `${origin}/og-mobile.png`,
           width: 1536,
           height: 1024,
-          alt: "SyncWord phrase-to-word timing editor",
+          alt: "SyncWord mobile word-timing caption workshop",
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
       title: "SyncWord",
-      description: "Word timing without word timestamps.",
-      images: [`${origin}/og-wordsync.png`],
+      description: "Make every word hit on time.",
+      images: [`${origin}/og-mobile.png`],
     },
   };
 }

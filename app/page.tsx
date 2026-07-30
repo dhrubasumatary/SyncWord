@@ -2,10 +2,9 @@
 
 import {
   useEffect,
-  useMemo,
   useRef,
   useState,
-  type ChangeEvent,
+  useSyncExternalStore,
   type CSSProperties,
 } from "react";
 
@@ -34,10 +33,11 @@ type CaptionStyle = {
   highlightColor: string;
   backgroundColor: string;
   backgroundOpacity: number;
+  outlineColor: string;
   outlineWidth: number;
   position: number;
   weight: "600" | "700" | "800";
-  karaokeMode: "wipe" | "pop" | "box";
+  animation: "pop" | "fade" | "slide";
 };
 
 type AlignmentSummary = {
@@ -63,11 +63,73 @@ type JobResponse = {
   captions?: Caption[];
   alignment?: AlignmentSummary;
   downloadUrl?: string;
+  assUrl?: string;
 };
 
-const demoDuration = 26.4;
+type StudioTab = "words" | "look" | "export";
 
-function weightForWord(word: string) {
+const defaultStyle: CaptionStyle = {
+  fontFamily: "Noto Sans Bengali",
+  fontSize: 50,
+  textColor: "#FFFFFF",
+  highlightColor: "#DFFF57",
+  backgroundColor: "#101010",
+  backgroundOpacity: 72,
+  outlineColor: "#101010",
+  outlineWidth: 2,
+  position: 82,
+  weight: "800",
+  animation: "pop",
+};
+
+const stylePresets: Array<{
+  name: string;
+  note: string;
+  values: Partial<CaptionStyle>;
+}> = [
+  {
+    name: "Signal",
+    note: "acid word wipe",
+    values: {
+      textColor: "#FFFFFF",
+      highlightColor: "#DFFF57",
+      backgroundColor: "#101010",
+      backgroundOpacity: 74,
+      outlineColor: "#101010",
+      outlineWidth: 2,
+    },
+  },
+  {
+    name: "Paper",
+    note: "clean editorial",
+    values: {
+      textColor: "#111111",
+      highlightColor: "#FF593D",
+      backgroundColor: "#F4F0E7",
+      backgroundOpacity: 94,
+      outlineColor: "#F4F0E7",
+      outlineWidth: 1,
+    },
+  },
+  {
+    name: "Night",
+    note: "high contrast",
+    values: {
+      textColor: "#FFFFFF",
+      highlightColor: "#65A7FF",
+      backgroundColor: "#080808",
+      backgroundOpacity: 42,
+      outlineColor: "#080808",
+      outlineWidth: 4,
+    },
+  },
+];
+
+const subscribeHydration = () => () => {};
+const clientSnapshot = () => true;
+const serverSnapshot = () => false;
+
+function wordWeight(word: string) {
   const length = Array.from(
     word.replace(/[\p{P}\p{S}]+/gu, "") || word,
   ).length;
@@ -78,174 +140,38 @@ function distributeWords(
   text: string,
   start: number,
   end: number,
-  confidence = 0.74,
-  source: WordTiming["source"] = "waveform-dp",
-) {
+): WordTiming[] {
   const tokens = text.trim().split(/\s+/u).filter(Boolean);
-  const weights = tokens.map(weightForWord);
+  const weights = tokens.map(wordWeight);
   const totalWeight = weights.reduce((sum, value) => sum + value, 0);
   let cursor = start;
-  return tokens.map((word, index) => {
+
+  return tokens.map((token, index) => {
     const wordEnd =
       index === tokens.length - 1
         ? end
         : cursor + ((end - start) * weights[index]) / totalWeight;
-    const timing: WordTiming = {
+    const word = {
       id: `word-${index}-${Math.round(start * 1000)}`,
-      text: word,
+      text: token,
       start: Number(cursor.toFixed(3)),
       end: Number(wordEnd.toFixed(3)),
-      confidence,
-      source,
+      confidence: 0.38,
+      source: "grapheme-prior" as const,
     };
     cursor = wordEnd;
-    return timing;
+    return word;
   });
 }
 
-function makeCaption(
-  id: string,
-  start: number,
-  end: number,
-  text: string,
-  language: Caption["language"],
-  confidences?: number[],
-): Caption {
-  const words = distributeWords(text, start, end);
-  if (confidences) {
-    words.forEach((word, index) => {
-      word.confidence = confidences[index] ?? word.confidence;
-    });
-  }
-  return { id, start, end, text, language, words };
-}
-
-const initialCaptions: Caption[] = [
-  makeCaption(
-    "c-1",
-    0.4,
-    4.7,
-    "মোৰ ভাষা, মোৰ পৰিচয়।",
-    "as",
-    [0.91, 0.86, 0.82, 0.9],
-  ),
-  makeCaption(
-    "c-2",
-    4.9,
-    9.2,
-    "আজিৰ story টো একেবাৰে simple.",
-    "mix",
-    [0.78, 0.93, 0.68, 0.59, 0.88],
-  ),
-  makeCaption(
-    "c-3",
-    9.45,
-    14.1,
-    "आंनि राव, आंनि सिनायथि।",
-    "brx",
-    [0.84, 0.72, 0.76, 0.62],
-  ),
-  makeCaption(
-    "c-4",
-    14.35,
-    19.2,
-    "কথাবোৰে আমাক একেলগে ৰাখে।",
-    "as",
-    [0.81, 0.67, 0.71, 0.87],
-  ),
-  makeCaption(
-    "c-5",
-    19.45,
-    25.8,
-    "Every voice deserves a beautiful frame.",
-    "mix",
-    [0.95, 0.89, 0.85, 0.91, 0.93, 0.87],
-  ),
-];
-
-const defaultStyle: CaptionStyle = {
-  fontFamily: "Noto Sans Bengali",
-  fontSize: 48,
-  textColor: "#FFFFFF",
-  highlightColor: "#FFDE59",
-  backgroundColor: "#11131C",
-  backgroundOpacity: 82,
-  outlineWidth: 2,
-  position: 81,
-  weight: "800",
-  karaokeMode: "wipe",
-};
-
-const waveform = [
-  18, 26, 38, 56, 74, 45, 34, 64, 82, 52, 39, 71, 48, 29, 59, 78, 43, 67,
-  36, 51, 84, 62, 31, 46, 72, 54, 26, 63, 79, 41, 58, 87, 49, 35, 68, 76,
-  44, 61, 28, 53, 81, 47, 69, 37, 57, 73, 32, 65, 85, 43, 55, 77, 39, 64,
-  30, 51, 80, 46, 71, 34, 60, 75, 42, 66, 29, 54, 83, 48, 62, 36, 69, 78,
-];
-
-function formatShortTime(seconds: number) {
+function compactTime(seconds: number) {
   const safe = Math.max(0, Number(seconds) || 0);
   const minutes = Math.floor(safe / 60);
   const wholeSeconds = Math.floor(safe % 60);
-  const tenths = Math.floor((safe % 1) * 10);
-  return `${minutes}:${wholeSeconds.toString().padStart(2, "0")}.${tenths}`;
-}
-
-function formatTimecode(seconds: number) {
-  const safe = Math.max(0, Number(seconds) || 0);
-  const hours = Math.floor(safe / 3600);
-  const minutes = Math.floor((safe % 3600) / 60);
-  const wholeSeconds = Math.floor(safe % 60);
-  const milliseconds = Math.round((safe % 1) * 1000);
-  return `${hours.toString().padStart(2, "0")}:${minutes
+  const milliseconds = Math.floor((safe % 1) * 1000);
+  return `${minutes}:${wholeSeconds.toString().padStart(2, "0")}.${milliseconds
     .toString()
-    .padStart(2, "0")}:${wholeSeconds
-    .toString()
-    .padStart(2, "0")},${milliseconds.toString().padStart(3, "0")}`;
-}
-
-function parseTimecode(value: string) {
-  const match = value
-    .trim()
-    .match(/(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/);
-  if (!match) return null;
-  return (
-    Number(match[1]) * 3600 +
-    Number(match[2]) * 60 +
-    Number(match[3]) +
-    Number(match[4].padEnd(3, "0")) / 1000
-  );
-}
-
-function parseSrt(source: string): Caption[] {
-  const normalized = source.replace(/\r/g, "").trim();
-  if (!normalized) return [];
-  return normalized
-    .split(/\n{2,}/)
-    .map((block, index) => {
-      const lines = block.split("\n");
-      const timingIndex = lines.findIndex((line) => line.includes("-->"));
-      if (timingIndex < 0) return null;
-      const [startValue, endValue] = lines[timingIndex]
-        .split("-->")
-        .map((value) => value.trim());
-      const start = parseTimecode(startValue);
-      const end = parseTimecode(endValue);
-      const text = lines
-        .slice(timingIndex + 1)
-        .join(" ")
-        .replace(/<[^>]+>/g, "")
-        .trim();
-      if (start === null || end === null || end <= start || !text) return null;
-      return makeCaption(
-        `srt-${index}-${Date.now()}`,
-        start,
-        end,
-        text,
-        "mix",
-      );
-    })
-    .filter((caption): caption is Caption => Boolean(caption));
+    .padStart(3, "0")}`;
 }
 
 function rgba(hex: string, opacity: number) {
@@ -257,57 +183,52 @@ function rgba(hex: string, opacity: number) {
 }
 
 export default function Home() {
-  const [panel, setPanel] = useState<"subtitles" | "words" | "styles">(
-    "words",
-  );
-  const [captions, setCaptions] = useState(initialCaptions);
-  const [selectedCaptionId, setSelectedCaptionId] = useState("c-1");
+  const [tab, setTab] = useState<StudioTab>("words");
+  const [captions, setCaptions] = useState<Caption[]>([]);
+  const [selectedCaptionId, setSelectedCaptionId] = useState("");
+  const [selectedWordIndex, setSelectedWordIndex] = useState(0);
   const [captionStyle, setCaptionStyle] = useState(defaultStyle);
   const [videoUrl, setVideoUrl] = useState("");
   const [file, setFile] = useState<File | null>(null);
-  const [fileName, setFileName] = useState("brahmaputra-stories.mp4");
-  const [duration, setDuration] = useState(demoDuration);
-  const [currentTime, setCurrentTime] = useState(2.15);
+  const [duration, setDuration] = useState(0);
+  const [videoRatio, setVideoRatio] = useState(16 / 9);
+  const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [language, setLanguage] = useState("unknown");
-  const [toast, setToast] = useState("");
   const [job, setJob] = useState<JobResponse | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [zoom, setZoom] = useState(100);
-  const [previewRatio, setPreviewRatio] = useState<"16:9" | "9:16">("16:9");
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState("");
+  const hydrated = useSyncExternalStore(
+    subscribeHydration,
+    clientSnapshot,
+    serverSnapshot,
+  );
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
-  const srtInputRef = useRef<HTMLInputElement>(null);
 
-  const apiBase = useMemo(() => {
-    const configured = process.env.NEXT_PUBLIC_RENDER_API_URL;
-    if (configured) return configured.replace(/\/$/, "");
-    if (
-      typeof window !== "undefined" &&
-      ["localhost", "127.0.0.1"].includes(window.location.hostname)
-    ) {
-      return "http://localhost:8787";
-    }
-    return "";
-  }, []);
+  const configuredApi =
+    process.env.NEXT_PUBLIC_RENDER_API_URL?.replace(/\/$/, "") ?? "";
+  const apiBase =
+    configuredApi ||
+    (hydrated &&
+    ["localhost", "127.0.0.1"].includes(window.location.hostname)
+      ? "http://localhost:8787"
+      : "");
 
+  const selectedCaption =
+    captions.find((caption) => caption.id === selectedCaptionId) ?? captions[0];
   const activeCaption =
     captions.find(
       (caption) =>
         currentTime >= caption.start && currentTime < caption.end,
-    ) ??
-    captions.find((caption) => caption.id === selectedCaptionId) ??
-    captions[0];
-  const selectedCaption =
-    captions.find((caption) => caption.id === selectedCaptionId) ??
-    activeCaption;
+    ) ?? selectedCaption;
   const activeWord = activeCaption?.words.find(
     (word) => currentTime >= word.start && currentTime < word.end,
   );
-  const progress = duration ? (currentTime / duration) * 100 : 0;
+  const selectedWord = selectedCaption?.words[selectedWordIndex];
 
-  const alignmentSummary = useMemo<AlignmentSummary>(() => {
+  const alignment: AlignmentSummary = (() => {
     if (job?.alignment) return job.alignment;
     const words = captions.flatMap((caption) => caption.words);
     return {
@@ -321,215 +242,199 @@ export default function Home() {
         : 0,
       needsReview: words.filter((word) => word.confidence < 0.62).length,
     };
-  }, [captions, job?.alignment]);
+  })();
 
   useEffect(() => {
     if (!toast) return;
-    const timeout = window.setTimeout(() => setToast(""), 4000);
+    const timeout = window.setTimeout(() => setToast(""), 4200);
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
   useEffect(() => {
-    if (!playing || videoUrl) return;
-    let frame = 0;
-    let previous = performance.now();
-    const tick = (timestamp: number) => {
-      const delta = (timestamp - previous) / 1000;
-      previous = timestamp;
-      setCurrentTime((value) => {
-        if (value + delta >= duration) {
-          setPlaying(false);
-          return 0;
-        }
-        return value + delta;
-      });
-      frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [duration, playing, videoUrl]);
-
-  useEffect(() => {
-    if (!job || ["complete", "failed"].includes(job.status) || !apiBase)
+    if (
+      !job ||
+      !apiBase ||
+      ["ready", "complete", "failed"].includes(job.status)
+    ) {
       return;
+    }
+
     const interval = window.setInterval(async () => {
       try {
         const response = await fetch(`${apiBase}/v1/jobs/${job.id}`);
         if (!response.ok) return;
         const nextJob = (await response.json()) as JobResponse;
         setJob(nextJob);
+
         if (nextJob.status === "ready" && nextJob.captions?.length) {
           setCaptions(nextJob.captions);
           setSelectedCaptionId(nextJob.captions[0].id);
-          setPanel("words");
+          setSelectedWordIndex(0);
+          setTab("words");
           setToast(
-            `${nextJob.alignment?.totalWords ?? 0} word boundaries are ready to review.`,
+            `${nextJob.alignment?.totalWords ?? 0} words aligned. Review the amber cuts.`,
           );
-        }
-        if (nextJob.status === "complete") {
-          setToast("Word-synced captioned video is ready.");
-        }
-        if (nextJob.status === "failed") {
-          setToast(nextJob.message ?? "The job failed.");
+        } else if (nextJob.status === "complete") {
+          setTab("export");
+          setToast("Your ASS-burned video is ready.");
+        } else if (nextJob.status === "failed") {
+          setToast(nextJob.message ?? "Processing failed.");
         }
       } catch {
-        setToast("The render service is not reachable.");
+        setToast("The render engine is not reachable.");
       }
     }, 2500);
+
     return () => window.clearInterval(interval);
   }, [apiBase, job]);
 
-  const seek = (value: number) => {
-    const next = Math.max(0, Math.min(duration, value));
+  const previewStyle = {
+    "--caption-font-size": `${captionStyle.fontSize}px`,
+    "--caption-color": captionStyle.textColor,
+    "--highlight-color": captionStyle.highlightColor,
+    "--caption-background": rgba(
+      captionStyle.backgroundColor,
+      captionStyle.backgroundOpacity,
+    ),
+    "--caption-position": `${captionStyle.position}%`,
+    "--caption-weight": captionStyle.weight,
+    "--caption-outline": `${captionStyle.outlineWidth}px`,
+    "--caption-outline-color": captionStyle.outlineColor,
+    "--caption-font":
+      captionStyle.fontFamily === "Noto Sans Devanagari"
+        ? '"Noto Sans Devanagari", "Nirmala UI", sans-serif'
+        : '"Noto Sans Bengali", "Nirmala UI", sans-serif',
+  } as CSSProperties;
+
+  const seek = (seconds: number) => {
+    const next = Math.max(0, Math.min(duration, seconds));
     setCurrentTime(next);
     if (videoRef.current) videoRef.current.currentTime = next;
   };
 
   const togglePlayback = () => {
-    if (videoRef.current) {
-      if (videoRef.current.paused) void videoRef.current.play();
-      else videoRef.current.pause();
-      return;
-    }
-    setPlaying((value) => !value);
+    if (!videoRef.current) return;
+    if (videoRef.current.paused) void videoRef.current.play();
+    else videoRef.current.pause();
   };
 
   const acceptVideo = (nextFile: File) => {
-    if (!nextFile.type.startsWith("video/")) {
-      setToast("Choose an MP4, MOV, WebM, or another video file.");
+    const looksLikeVideo =
+      nextFile.type.startsWith("video/") ||
+      /\.(mp4|mov|webm|mkv|m4v)$/i.test(nextFile.name);
+    if (!looksLikeVideo) {
+      setToast("Choose an MP4, MOV, WebM, or MKV video.");
       return;
     }
+
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     setVideoUrl(URL.createObjectURL(nextFile));
     setFile(nextFile);
-    setFileName(nextFile.name);
+    setDuration(0);
+    setVideoRatio(16 / 9);
     setCurrentTime(0);
+    setCaptions([]);
+    setSelectedCaptionId("");
+    setSelectedWordIndex(0);
     setJob(null);
-    setToast("Video loaded locally. Generate captions when you’re ready.");
+    setTab("words");
+    setToast("Video loaded on this device. Nothing uploaded yet.");
   };
 
-  const importSrt = async (event: ChangeEvent<HTMLInputElement>) => {
-    const srtFile = event.target.files?.[0];
-    if (!srtFile) return;
-    const imported = parseSrt(await srtFile.text());
-    if (!imported.length) {
-      setToast("That file does not contain readable SRT caption blocks.");
+  const startTranscription = async () => {
+    if (!file) {
+      videoInputRef.current?.click();
       return;
     }
-    setCaptions(imported);
-    setSelectedCaptionId(imported[0].id);
-    setDuration((value) => Math.max(value, imported.at(-1)?.end ?? value));
-    setPanel("words");
-    setToast(
-      `Imported ${imported.length} phrase anchors. Word timings need waveform alignment.`,
-    );
-    event.target.value = "";
+    if (!apiBase) {
+      setToast(
+        "Preview is ready. Connect the private render engine to upload and transcribe.",
+      );
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const payload = new FormData();
+      payload.append("video", file);
+      payload.append("language", language);
+      payload.append("mode", "codemix");
+      const response = await fetch(`${apiBase}/v1/jobs`, {
+        method: "POST",
+        body: payload,
+      });
+      const data = (await response.json()) as JobResponse & { error?: string };
+      if (!response.ok) throw new Error(data.error ?? "Upload failed.");
+      setJob(data);
+      setToast("Extracting audio, then Saaras finds the phrase anchors.");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Upload failed.");
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const downloadSrt = () => {
-    const srt = captions
-      .map(
-        (caption, index) =>
-          `${index + 1}\n${formatTimecode(caption.start)} --> ${formatTimecode(
-            caption.end,
-          )}\n${caption.text}\n`,
-      )
-      .join("\n");
-    const url = URL.createObjectURL(
-      new Blob([srt], { type: "application/x-subrip;charset=utf-8" }),
-    );
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${fileName.replace(/\.[^.]+$/, "") || "captions"}.srt`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+  const startRender = async () => {
+    if (!job || job.status !== "ready" || !apiBase) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`${apiBase}/v1/jobs/${job.id}/render`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ captions, style: captionStyle }),
+      });
+      const data = (await response.json()) as JobResponse & { error?: string };
+      if (!response.ok) throw new Error(data.error ?? "Render failed.");
+      setJob(data);
+      setTab("export");
+      setToast("Rendering ASS word wipes into the video.");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Render failed.");
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const updateCaptionText = (id: string, text: string) => {
+  const downloadResult = (kind: "video" | "ass") => {
+    const path = kind === "video" ? job?.downloadUrl : job?.assUrl;
+    if (!apiBase || !path) {
+      setToast(`${kind === "video" ? "Video" : "ASS file"} is not ready yet.`);
+      return;
+    }
+    window.location.href = `${apiBase}${path}`;
+  };
+
+  const updateCaptionText = (text: string) => {
+    if (!selectedCaption) return;
     setCaptions((items) =>
       items.map((caption) =>
-        caption.id === id
+        caption.id === selectedCaption.id
           ? {
               ...caption,
               text,
-              words: distributeWords(
-                text,
-                caption.start,
-                caption.end,
-                0.38,
-                "grapheme-prior",
-              ),
+              words: distributeWords(text, caption.start, caption.end),
             }
           : caption,
       ),
     );
+    setSelectedWordIndex(0);
   };
 
-  const updateCaptionTime = (
-    id: string,
-    key: "start" | "end",
-    value: string,
-  ) => {
-    const parsed = parseTimecode(value);
-    if (parsed === null) return;
+  const nudgeBoundary = (delta: number) => {
+    if (
+      !selectedCaption ||
+      !selectedWord ||
+      selectedWordIndex >= selectedCaption.words.length - 1
+    ) {
+      return;
+    }
+
     setCaptions((items) =>
       items.map((caption) => {
-        if (caption.id !== id) return caption;
-        const next = { ...caption, [key]: parsed };
-        if (next.end <= next.start) return caption;
-        return {
-          ...next,
-          words: distributeWords(
-            next.text,
-            next.start,
-            next.end,
-            0.38,
-            "grapheme-prior",
-          ),
-        };
-      }),
-    );
-  };
-
-  const addCaption = () => {
-    const previous = captions.at(-1);
-    const start = Math.min(duration - 0.5, (previous?.end ?? 0) + 0.15);
-    const end = Math.min(duration, start + 2.8);
-    const caption = makeCaption(
-      `manual-${Date.now()}`,
-      start,
-      end,
-      "নতুন caption",
-      "mix",
-    );
-    caption.words.forEach((word) => {
-      word.confidence = 0.38;
-      word.source = "grapheme-prior";
-    });
-    setCaptions((items) => [...items, caption]);
-    setSelectedCaptionId(caption.id);
-    setPanel("subtitles");
-  };
-
-  const deleteCaption = (id: string) => {
-    if (captions.length === 1) return;
-    const remaining = captions.filter((caption) => caption.id !== id);
-    setCaptions(remaining);
-    if (selectedCaptionId === id) setSelectedCaptionId(remaining[0].id);
-  };
-
-  const nudgeBoundary = (
-    captionId: string,
-    wordIndex: number,
-    delta: number,
-  ) => {
-    setCaptions((items) =>
-      items.map((caption) => {
-        if (caption.id !== captionId || wordIndex >= caption.words.length - 1)
-          return caption;
+        if (caption.id !== selectedCaption.id) return caption;
         const words = caption.words.map((word) => ({ ...word }));
-        const left = words[wordIndex];
-        const right = words[wordIndex + 1];
+        const left = words[selectedWordIndex];
+        const right = words[selectedWordIndex + 1];
         const boundary = Math.max(
           left.start + 0.08,
           Math.min(right.end - 0.08, left.end + delta),
@@ -545,480 +450,427 @@ export default function Home() {
     );
   };
 
-  const redistributeSelected = () => {
-    if (!selectedCaption) return;
-    setCaptions((items) =>
-      items.map((caption) =>
-        caption.id === selectedCaption.id
-          ? {
-              ...caption,
-              words: distributeWords(
-                caption.text,
-                caption.start,
-                caption.end,
-                0.38,
-                "grapheme-prior",
-              ),
-            }
-          : caption,
-      ),
-    );
-    setToast("Reset to grapheme-weighted timing. Run alignment for audio cues.");
-  };
-
-  const startTranscription = async () => {
+  const primaryAction = () => {
     if (!file) {
       videoInputRef.current?.click();
-      setToast("Upload a video first.");
-      return;
-    }
-    if (!apiBase) {
-      setToast(
-        "The editor works here; connect the render API to run waveform alignment.",
-      );
-      return;
-    }
-    setIsSubmitting(true);
-    try {
-      const payload = new FormData();
-      payload.append("video", file);
-      payload.append("language", language);
-      payload.append("mode", "codemix");
-      const response = await fetch(`${apiBase}/v1/jobs`, {
-        method: "POST",
-        body: payload,
-      });
-      const data = (await response.json()) as JobResponse & { error?: string };
-      if (!response.ok) throw new Error(data.error ?? "Upload failed.");
-      setJob(data);
-      setToast("Phrase transcription and waveform alignment started.");
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : "Upload failed.");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const startRender = async () => {
-    if (!job || job.status !== "ready") {
+    } else if (!job || job.status === "failed") {
       void startTranscription();
-      return;
-    }
-    setIsSubmitting(true);
-    try {
-      const response = await fetch(`${apiBase}/v1/jobs/${job.id}/render`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ captions, style: captionStyle }),
-      });
-      const data = (await response.json()) as JobResponse & { error?: string };
-      if (!response.ok) throw new Error(data.error ?? "Render failed.");
-      setJob(data);
-      setToast("ASS karaoke render started with approved word boundaries.");
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : "Render failed.");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const primaryAction = () => {
-    if (job?.status === "complete" && job.downloadUrl) {
-      window.location.href = `${apiBase}${job.downloadUrl}`;
-    } else if (job?.status === "ready") {
+    } else if (job.status === "ready") {
       void startRender();
-    } else {
-      void startTranscription();
+    } else if (job.status === "complete") {
+      downloadResult("video");
     }
   };
 
   const primaryLabel = (() => {
-    if (isSubmitting) return "Starting…";
-    if (!file) return "Upload video";
-    if (!job) return "Generate + align words";
-    if (["queued", "extracting", "transcribing"].includes(job.status))
-      return `${job.message ?? "Aligning"} · ${job.progress}%`;
-    if (job.status === "ready") return "Render word karaoke";
+    if (busy) return "Starting…";
+    if (!file) return "Choose a video";
+    if (!job) return "Find words";
+    if (["queued", "extracting", "transcribing"].includes(job.status)) {
+      return `${job.message ?? "Listening"} · ${job.progress}%`;
+    }
+    if (job.status === "ready") return "Render with ASS";
     if (job.status === "rendering") return `Rendering · ${job.progress}%`;
     if (job.status === "complete") return "Download video";
     return "Try again";
   })();
 
-  const previewStyle = {
-    "--caption-font-size": `${captionStyle.fontSize}px`,
-    "--caption-color": captionStyle.textColor,
-    "--highlight-color": captionStyle.highlightColor,
-    "--caption-background": rgba(
-      captionStyle.backgroundColor,
-      captionStyle.backgroundOpacity,
-    ),
-    "--caption-position": `${captionStyle.position}%`,
-    "--caption-weight": captionStyle.weight,
-    "--caption-outline": `${captionStyle.outlineWidth}px`,
-    "--caption-font":
-      captionStyle.fontFamily === "Noto Sans Devanagari"
-        ? '"Noto Sans Devanagari", "Nirmala UI", sans-serif'
-        : '"Noto Sans Bengali", "Nirmala UI", sans-serif',
-  } as CSSProperties;
+  const processing = Boolean(
+    busy ||
+      (job &&
+        ["queued", "extracting", "transcribing", "rendering"].includes(
+          job.status,
+        )),
+  );
 
   return (
-    <main className="editor-shell">
-      <header className="editor-topbar">
-        <div className="editor-brand">
-          <span className="editor-logo">S</span>
-          <strong>SyncWord</strong>
-        </div>
-        <div className="history-buttons">
-          <button aria-label="Undo" onClick={() => setToast("Nothing to undo.")}>
-            ↶
-          </button>
-          <button aria-label="Redo" onClick={() => setToast("Nothing to redo.")}>
-            ↷
-          </button>
-        </div>
-        <button className="project-title">
-          {fileName}
-          <span>Saved</span>
-        </button>
-        <div className="top-actions">
-          <button className="share-button" onClick={downloadSrt}>
-            Download SRT
-          </button>
-          <button className="export-button" onClick={primaryAction}>
-            Export
-            <span>↗</span>
-          </button>
+    <main className="mobile-studio">
+      <header className="studio-header">
+        <a className="wordmark" href="#" aria-label="SyncWord home">
+          <span>SYNC</span>
+          <b>WORD</b>
+        </a>
+        <div className={`engine-pill ${apiBase ? "online" : ""}`}>
+          <i />
+          {apiBase ? "engine ready" : "preview mode"}
         </div>
       </header>
 
-      <div className="editor-body">
-        <nav className="asset-rail" aria-label="Editor tools">
-          <button onClick={() => videoInputRef.current?.click()}>
-            <span>▣</span>
-            Media
-          </button>
-          <button
-            className={panel === "subtitles" ? "active" : ""}
-            onClick={() => setPanel("subtitles")}
-          >
-            <span>CC</span>
-            Subtitles
-          </button>
-          <button
-            className={panel === "words" ? "active innovation" : "innovation"}
-            onClick={() => setPanel("words")}
-          >
-            <span>W</span>
-            WordSync
-          </button>
-          <button
-            className={panel === "styles" ? "active" : ""}
-            onClick={() => setPanel("styles")}
-          >
-            <span>Aa</span>
-            Styles
-          </button>
-          <button onClick={() => setToast("Audio remains unchanged.")}>
-            <span>◒</span>
-            Audio
-          </button>
-        </nav>
-
-        <aside className="subtitle-sidebar">
-          <div className="sidebar-head">
-            <div>
-              <h1>Subtitles</h1>
-              <span>Phrase anchors + word timing</span>
-            </div>
-            <button aria-label="Close sidebar">×</button>
+      {!file ? (
+        <section className="start-screen">
+          <div className="start-copy">
+            <p>ASS CAPTION WORKSHOP</p>
+            <h1>
+              Make every word
+              <em>hit on time.</em>
+            </h1>
+            <span>
+              Assamese and Bodo captions with phrase-anchored word timing.
+              Nothing fake appears before your video does.
+            </span>
           </div>
 
-          <div className="sidebar-tabs">
-            <button
-              className={panel === "subtitles" ? "active" : ""}
-              onClick={() => setPanel("subtitles")}
-            >
-              Edit
-            </button>
-            <button
-              className={panel === "words" ? "active" : ""}
-              onClick={() => setPanel("words")}
-            >
-              Word sync
-              <i>Beta</i>
-            </button>
-            <button
-              className={panel === "styles" ? "active" : ""}
-              onClick={() => setPanel("styles")}
-            >
-              Styles
-            </button>
+          <button
+            className="drop-zone"
+            onClick={() => videoInputRef.current?.click()}
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              event.preventDefault();
+              const dropped = event.dataTransfer.files[0];
+              if (dropped) acceptVideo(dropped);
+            }}
+          >
+            <span className="drop-icon">
+              <i />
+            </span>
+            <strong>Choose a video</strong>
+            <small>MP4, MOV, WebM or MKV</small>
+          </button>
+
+          <ol className="pipeline-strip" aria-label="Captioning pipeline">
+            <li>
+              <b>01</b>
+              <span>Video</span>
+            </li>
+            <li>
+              <b>02</b>
+              <span>Audio</span>
+            </li>
+            <li>
+              <b>03</b>
+              <span>Saaras</span>
+            </li>
+            <li>
+              <b>04</b>
+              <span>Words</span>
+            </li>
+            <li>
+              <b>05</b>
+              <span>ASS</span>
+            </li>
+          </ol>
+
+          <div className="start-footnote">
+            <span>No account theatre.</span>
+            <span>No mock transcript.</span>
+            <span>Your video stays local until you tap Find words.</span>
           </div>
+        </section>
+      ) : (
+        <>
+          <section className="project-intro">
+            <p>NOW WORKING ON</p>
+            <h1>{file.name}</h1>
+            <button onClick={() => videoInputRef.current?.click()}>
+              Replace video
+            </button>
+          </section>
 
-          <div className="sidebar-scroll">
-            {panel === "subtitles" && (
-              <div className="edit-panel">
-                <div className="subtitle-source-actions">
-                  <button
-                    className="auto-subtitle"
-                    onClick={() => void startTranscription()}
-                  >
-                    ✦ Auto subtitle
-                  </button>
-                  <button
-                    className="import-srt"
-                    onClick={() => srtInputRef.current?.click()}
-                  >
-                    ↑ Import SRT
-                  </button>
-                </div>
-                <label className="language-select">
-                  Spoken language
-                  <select
-                    value={language}
-                    onChange={(event) => setLanguage(event.target.value)}
-                  >
-                    <option value="unknown">Auto-detect</option>
-                    <option value="as-IN">Assamese · as-IN</option>
-                    <option value="brx-IN">Bodo · brx-IN</option>
-                  </select>
-                </label>
-                <div className="source-meta">
-                  <span>Saaras v3</span>
-                  <span>codemix</span>
-                  <small>chunk anchors</small>
-                </div>
+          <section className="video-stage" style={previewStyle}>
+            <div
+              className={`video-frame ${videoRatio < 1 ? "portrait" : ""}`}
+            >
+              <video
+                ref={videoRef}
+                src={videoUrl}
+                onLoadedMetadata={(event) => {
+                  if (Number.isFinite(event.currentTarget.duration)) {
+                    setDuration(event.currentTarget.duration);
+                  }
+                  if (
+                    event.currentTarget.videoWidth &&
+                    event.currentTarget.videoHeight
+                  ) {
+                    setVideoRatio(
+                      event.currentTarget.videoWidth /
+                        event.currentTarget.videoHeight,
+                    );
+                  }
+                }}
+                onTimeUpdate={(event) =>
+                  setCurrentTime(event.currentTarget.currentTime)
+                }
+                onPlay={() => setPlaying(true)}
+                onPause={() => setPlaying(false)}
+                playsInline
+              />
 
-                <div className="caption-toolbar">
-                  <strong>{captions.length} subtitle blocks</strong>
-                  <button onClick={addCaption}>+ Add subtitle</button>
-                </div>
-
-                <div className="srt-list">
-                  {captions.map((caption, index) => (
-                    <article
-                      key={caption.id}
-                      className={
-                        selectedCaptionId === caption.id ? "selected" : ""
-                      }
-                      onClick={() => {
-                        setSelectedCaptionId(caption.id);
-                        seek(caption.start + 0.02);
-                      }}
-                    >
-                      <div className="caption-number">
-                        {String(index + 1).padStart(2, "0")}
-                      </div>
-                      <div className="caption-fields">
-                        <textarea
-                          value={caption.text}
-                          onClick={(event) => event.stopPropagation()}
-                          onChange={(event) =>
-                            updateCaptionText(caption.id, event.target.value)
-                          }
-                          aria-label={`Subtitle ${index + 1}`}
-                          rows={2}
-                        />
-                        <div className="timecode-row">
-                          <input
-                            key={`start-${caption.start}`}
-                            defaultValue={formatTimecode(caption.start)}
-                            onBlur={(event) =>
-                              updateCaptionTime(
-                                caption.id,
-                                "start",
-                                event.target.value,
-                              )
-                            }
-                            aria-label={`Subtitle ${index + 1} start time`}
-                          />
-                          <span>→</span>
-                          <input
-                            key={`end-${caption.end}`}
-                            defaultValue={formatTimecode(caption.end)}
-                            onBlur={(event) =>
-                              updateCaptionTime(
-                                caption.id,
-                                "end",
-                                event.target.value,
-                              )
-                            }
-                            aria-label={`Subtitle ${index + 1} end time`}
-                          />
-                        </div>
-                      </div>
-                      <button
-                        className="caption-menu"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          deleteCaption(caption.id);
-                        }}
-                        aria-label={`Delete subtitle ${index + 1}`}
-                      >
-                        ⋮
-                      </button>
-                    </article>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {panel === "words" && selectedCaption && (
-              <div className="words-panel">
-                <div className="innovation-card">
-                  <div className="innovation-label">
-                    <span>WordSync</span>
-                    <i>Beta</i>
-                  </div>
-                  <h2>Word timing without word timestamps.</h2>
-                  <p>
-                    Phrase anchors keep us honest. Waveform valleys place the
-                    words. You only review uncertain cuts.
-                  </p>
-                  <div className="alignment-flow">
-                    <span>Sarvam phrase</span>
-                    <b>→</b>
-                    <span>Audio valleys</span>
-                    <b>→</b>
-                    <span>ASS karaoke</span>
-                  </div>
-                </div>
-
-                <div className="alignment-stats">
-                  <div>
-                    <strong>{alignmentSummary.totalWords}</strong>
-                    <span>words</span>
-                  </div>
-                  <div>
-                    <strong>
-                      {Math.round(alignmentSummary.averageConfidence * 100)}%
-                    </strong>
-                    <span>confidence</span>
-                  </div>
-                  <div className={alignmentSummary.needsReview ? "warning" : ""}>
-                    <strong>{alignmentSummary.needsReview}</strong>
-                    <span>review</span>
-                  </div>
-                </div>
-
-                <div className="selected-phrase">
-                  <span>
-                    Phrase{" "}
-                    {captions.findIndex(
-                      (caption) => caption.id === selectedCaption.id,
-                    ) + 1}
-                  </span>
-                  <p>{selectedCaption.text}</p>
-                  <small>
-                    {formatTimecode(selectedCaption.start)} →{" "}
-                    {formatTimecode(selectedCaption.end)}
-                  </small>
-                </div>
-
-                <div className="word-list-head">
-                  <span>Word boundaries</span>
-                  <button onClick={redistributeSelected}>Reset spacing</button>
-                </div>
-
-                <div className="word-boundary-list">
-                  {selectedCaption.words.map((word, index) => (
-                    <article
+              {activeCaption && (
+                <div className="ass-preview">
+                  {activeCaption.words.map((word) => (
+                    <span
                       key={word.id}
-                      className={`${word.confidence < 0.62 ? "low" : ""} ${
-                        activeWord?.id === word.id ? "active" : ""
-                      }`}
-                      onClick={() => seek(word.start + 0.01)}
+                      className={activeWord?.id === word.id ? "active" : ""}
                     >
-                      <div className="word-copy">
-                        <strong>{word.text}</strong>
-                        <span>
-                          {formatShortTime(word.start)} —{" "}
-                          {formatShortTime(word.end)}
-                        </span>
-                      </div>
-                      <div className="confidence-meter">
-                        <i style={{ width: `${word.confidence * 100}%` }} />
-                      </div>
-                      <small>
-                        {word.source === "manual"
-                          ? "fixed"
-                          : `${Math.round(word.confidence * 100)}%`}
-                      </small>
-                      {index < selectedCaption.words.length - 1 ? (
-                        <div className="nudge-buttons">
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              nudgeBoundary(selectedCaption.id, index, -0.03);
-                            }}
-                            aria-label={`Move boundary after ${word.text} earlier`}
-                          >
-                            −30
-                          </button>
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              nudgeBoundary(selectedCaption.id, index, 0.03);
-                            }}
-                            aria-label={`Move boundary after ${word.text} later`}
-                          >
-                            +30
-                          </button>
-                        </div>
-                      ) : (
-                        <span className="phrase-end">END</span>
-                      )}
-                    </article>
+                      {word.text}
+                    </span>
                   ))}
                 </div>
+              )}
 
-                <div className="review-note">
-                  <span>◉</span>
-                  <p>
-                    Amber rows are low-confidence. Play the phrase and nudge
-                    only those boundaries by 30ms.
-                  </p>
-                </div>
-              </div>
-            )}
+              {!captions.length && (
+                <div className="uncaptioned-label">NO CAPTIONS YET</div>
+              )}
+            </div>
 
-            {panel === "styles" && (
-              <div className="styles-panel">
-                <section>
-                  <div className="settings-title">
-                    <strong>Karaoke style</strong>
-                    <button onClick={() => setCaptionStyle(defaultStyle)}>
-                      Reset
-                    </button>
-                  </div>
-                  <div className="style-presets">
-                    {(["wipe", "pop", "box"] as const).map((mode) => (
+            <div className="player-row">
+              <button
+                className="play-button"
+                onClick={togglePlayback}
+                aria-label={playing ? "Pause video" : "Play video"}
+              >
+                {playing ? "Ⅱ" : "▶"}
+              </button>
+              <span>{compactTime(currentTime)}</span>
+              <input
+                aria-label="Video position"
+                type="range"
+                min="0"
+                max={Math.max(duration, 0.01)}
+                step="0.01"
+                value={Math.min(currentTime, duration)}
+                onChange={(event) => seek(Number(event.target.value))}
+              />
+              <span>{compactTime(duration)}</span>
+            </div>
+          </section>
+
+          <nav className="studio-tabs" aria-label="Caption workflow">
+            {(
+              [
+                ["words", "01", "Words"],
+                ["look", "02", "Look"],
+                ["export", "03", "Export"],
+              ] as const
+            ).map(([value, number, label]) => (
+              <button
+                key={value}
+                className={tab === value ? "active" : ""}
+                onClick={() => setTab(value)}
+              >
+                <small>{number}</small>
+                <span>{label}</span>
+              </button>
+            ))}
+          </nav>
+
+          <section className="control-sheet">
+            {tab === "words" && !captions.length && (
+              <div className="generate-panel">
+                <div className="section-kicker">LISTEN</div>
+                <h2>Turn phrase timing into word timing.</h2>
+                <p>
+                  Saaras v3 finds the real phrase edges. WordSync then places
+                  each word against the waveform and flags uncertain cuts.
+                </p>
+
+                <div className="language-block">
+                  <span>Spoken language</span>
+                  <div className="language-pills">
+                    {[
+                      ["unknown", "Auto"],
+                      ["as-IN", "অসমীয়া"],
+                      ["brx-IN", "बड़ो"],
+                    ].map(([value, label]) => (
                       <button
-                        key={mode}
-                        className={
-                          captionStyle.karaokeMode === mode ? "active" : ""
-                        }
-                        onClick={() =>
-                          setCaptionStyle((value) => ({
-                            ...value,
-                            karaokeMode: mode,
-                          }))
-                        }
+                        key={value}
+                        className={language === value ? "active" : ""}
+                        onClick={() => {
+                          setLanguage(value);
+                          if (value === "brx-IN") {
+                            setCaptionStyle((current) => ({
+                              ...current,
+                              fontFamily: "Noto Sans Devanagari",
+                            }));
+                          } else if (value === "as-IN") {
+                            setCaptionStyle((current) => ({
+                              ...current,
+                              fontFamily: "Noto Sans Bengali",
+                            }));
+                          }
+                        }}
                       >
-                        <span className={`preset-preview ${mode}`}>
-                          <i>WORD</i>
-                        </span>
-                        {mode}
+                        {label}
                       </button>
                     ))}
                   </div>
-                </section>
+                </div>
 
-                <section>
-                  <strong className="section-label">Typography</strong>
-                  <label className="setting-row">
-                    Font
+                <div className="truth-card">
+                  <span>WHAT ACTUALLY HAPPENS</span>
+                  <ol>
+                    <li>
+                      <b>Phrase anchors</b>
+                      <small>Saaras v3 Batch · codemix</small>
+                    </li>
+                    <li>
+                      <b>Word boundaries</b>
+                      <small>20ms waveform analysis</small>
+                    </li>
+                    <li>
+                      <b>Review</b>
+                      <small>Only low-confidence cuts</small>
+                    </li>
+                  </ol>
+                </div>
+              </div>
+            )}
+
+            {tab === "words" && selectedCaption && (
+              <div className="word-editor">
+                <div className="alignment-head">
+                  <div>
+                    <span className="section-kicker">WORD SYNC</span>
+                    <h2>
+                      {alignment.needsReview
+                        ? `${alignment.needsReview} cuts need ears.`
+                        : "Every cut reviewed."}
+                    </h2>
+                  </div>
+                  <div className="confidence-orbit">
+                    <strong>
+                      {Math.round(alignment.averageConfidence * 100)}
+                    </strong>
+                    <span>%</span>
+                  </div>
+                </div>
+
+                <div className="phrase-tabs">
+                  {captions.map((caption, index) => (
+                    <button
+                      key={caption.id}
+                      className={
+                        selectedCaption.id === caption.id ? "active" : ""
+                      }
+                      onClick={() => {
+                        setSelectedCaptionId(caption.id);
+                        setSelectedWordIndex(0);
+                        seek(caption.start + 0.01);
+                      }}
+                    >
+                      <small>{String(index + 1).padStart(2, "0")}</small>
+                      <span>{caption.text}</span>
+                    </button>
+                  ))}
+                </div>
+
+                <label className="phrase-copy">
+                  <span>Phrase transcript</span>
+                  <textarea
+                    rows={2}
+                    value={selectedCaption.text}
+                    onChange={(event) => updateCaptionText(event.target.value)}
+                  />
+                  <small>
+                    {compactTime(selectedCaption.start)} —{" "}
+                    {compactTime(selectedCaption.end)}
+                  </small>
+                </label>
+
+                <div className="word-ribbon" aria-label="Aligned words">
+                  {selectedCaption.words.map((word, index) => (
+                    <button
+                      key={word.id}
+                      className={`${selectedWordIndex === index ? "active" : ""} ${
+                        word.confidence < 0.62 ? "review" : ""
+                      }`}
+                      onClick={() => {
+                        setSelectedWordIndex(index);
+                        seek(word.start + 0.01);
+                      }}
+                    >
+                      <span>{word.text}</span>
+                      <i style={{ width: `${word.confidence * 100}%` }} />
+                    </button>
+                  ))}
+                </div>
+
+                {selectedWord && (
+                  <div className="cut-inspector">
+                    <div>
+                      <span>Selected word</span>
+                      <strong>{selectedWord.text}</strong>
+                    </div>
+                    <div>
+                      <span>Starts</span>
+                      <strong>{compactTime(selectedWord.start)}</strong>
+                    </div>
+                    <div>
+                      <span>Ends</span>
+                      <strong>{compactTime(selectedWord.end)}</strong>
+                    </div>
+                    <div>
+                      <span>Source</span>
+                      <strong>
+                        {selectedWord.source === "manual"
+                          ? "manual"
+                          : `${Math.round(selectedWord.confidence * 100)}%`}
+                      </strong>
+                    </div>
+                    {selectedWordIndex < selectedCaption.words.length - 1 && (
+                      <div className="nudge-row">
+                        <button onClick={() => nudgeBoundary(-0.03)}>
+                          − 30ms
+                        </button>
+                        <span>move next cut</span>
+                        <button onClick={() => nudgeBoundary(0.03)}>
+                          + 30ms
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {tab === "look" && (
+              <div className="look-panel">
+                <span className="section-kicker">ASS STYLE</span>
+                <h2>Style the burn, not a screenshot.</h2>
+                <p>
+                  This preview becomes an ASS style and ffmpeg renders the same
+                  font, outline, position, word wipe, and line motion.
+                </p>
+
+                <div className="preset-stack">
+                  {stylePresets.map((preset) => (
+                    <button
+                      key={preset.name}
+                      onClick={() =>
+                        setCaptionStyle((value) => ({
+                          ...value,
+                          ...preset.values,
+                        }))
+                      }
+                    >
+                      <i
+                        style={{
+                          color: preset.values.textColor,
+                          background: rgba(
+                            preset.values.backgroundColor ?? "#101010",
+                            preset.values.backgroundOpacity ?? 70,
+                          ),
+                          boxShadow: `inset 0 -3px ${
+                            preset.values.highlightColor
+                          }`,
+                        }}
+                      >
+                        WORD
+                      </i>
+                      <span>
+                        <strong>{preset.name}</strong>
+                        <small>{preset.note}</small>
+                      </span>
+                      <b>→</b>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="style-grid">
+                  <label>
+                    Script font
                     <select
+                      aria-label="Script font"
                       value={captionStyle.fontFamily}
                       onChange={(event) =>
                         setCaptionStyle((value) => ({
@@ -1031,112 +883,144 @@ export default function Home() {
                       <option>Noto Sans Devanagari</option>
                     </select>
                   </label>
-                  <div className="two-settings">
-                    <label>
-                      Size
+                  <label>
+                    Line motion
+                    <select
+                      aria-label="Line motion"
+                      value={captionStyle.animation}
+                      onChange={(event) =>
+                        setCaptionStyle((value) => ({
+                          ...value,
+                          animation: event.target
+                            .value as CaptionStyle["animation"],
+                        }))
+                      }
+                    >
+                      <option value="pop">Pop in</option>
+                      <option value="fade">Fade</option>
+                      <option value="slide">Slide up</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="color-row">
+                  {(
+                    [
+                      ["Text", "textColor"],
+                      ["Active", "highlightColor"],
+                      ["Box", "backgroundColor"],
+                    ] as const
+                  ).map(([label, key]) => (
+                    <label key={key}>
                       <input
-                        type="number"
-                        min="24"
-                        max="84"
-                        value={captionStyle.fontSize}
+                        type="color"
+                        value={captionStyle[key]}
                         onChange={(event) =>
                           setCaptionStyle((value) => ({
                             ...value,
-                            fontSize: Number(event.target.value),
+                            [key]: event.target.value,
+                          }))
+                        }
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </div>
+
+                <div className="slider-stack">
+                  {[
+                    ["Size", "fontSize", 28, 84, "px"],
+                    ["Position", "position", 56, 90, "%"],
+                    [
+                      "Background",
+                      "backgroundOpacity",
+                      0,
+                      100,
+                      "%",
+                    ],
+                    ["Outline", "outlineWidth", 0, 8, "px"],
+                  ].map(([label, key, min, max, suffix]) => (
+                    <label key={String(key)}>
+                      <span>
+                        {label}
+                        <b>
+                          {captionStyle[key as keyof CaptionStyle]}
+                          {suffix}
+                        </b>
+                      </span>
+                      <input
+                        type="range"
+                        min={Number(min)}
+                        max={Number(max)}
+                        value={Number(
+                          captionStyle[key as keyof CaptionStyle],
+                        )}
+                        onChange={(event) =>
+                          setCaptionStyle((value) => ({
+                            ...value,
+                            [key]: Number(event.target.value),
                           }))
                         }
                       />
                     </label>
-                    <label>
-                      Weight
-                      <select
-                        value={captionStyle.weight}
-                        onChange={(event) =>
-                          setCaptionStyle((value) => ({
-                            ...value,
-                            weight: event.target.value as CaptionStyle["weight"],
-                          }))
-                        }
-                      >
-                        <option value="600">600</option>
-                        <option value="700">700</option>
-                        <option value="800">800</option>
-                      </select>
-                    </label>
-                  </div>
-                </section>
-
-                <section>
-                  <strong className="section-label">Colors</strong>
-                  <div className="color-settings">
-                    {[
-                      ["Text", "textColor"],
-                      ["Active word", "highlightColor"],
-                      ["Background", "backgroundColor"],
-                    ].map(([label, key]) => (
-                      <label key={key}>
-                        {label}
-                        <span>
-                          <input
-                            type="color"
-                            value={captionStyle[key as keyof CaptionStyle] as string}
-                            onChange={(event) =>
-                              setCaptionStyle((value) => ({
-                                ...value,
-                                [key]: event.target.value,
-                              }))
-                            }
-                          />
-                          {captionStyle[key as keyof CaptionStyle]}
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </section>
-
-                <section>
-                  <label className="range-setting">
-                    <span>
-                      Position <b>{captionStyle.position}%</b>
-                    </span>
-                    <input
-                      type="range"
-                      min="58"
-                      max="88"
-                      value={captionStyle.position}
-                      onChange={(event) =>
-                        setCaptionStyle((value) => ({
-                          ...value,
-                          position: Number(event.target.value),
-                        }))
-                      }
-                    />
-                  </label>
-                  <label className="range-setting">
-                    <span>
-                      Background <b>{captionStyle.backgroundOpacity}%</b>
-                    </span>
-                    <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      value={captionStyle.backgroundOpacity}
-                      onChange={(event) =>
-                        setCaptionStyle((value) => ({
-                          ...value,
-                          backgroundOpacity: Number(event.target.value),
-                        }))
-                      }
-                    />
-                  </label>
-                </section>
+                  ))}
+                </div>
               </div>
             )}
-          </div>
 
-          <div className="sidebar-footer">
+            {tab === "export" && (
+              <div className="export-panel">
+                <span className="section-kicker">FINAL BURN</span>
+                <h2>ASS in. Captioned MP4 out.</h2>
+                <p>
+                  No plain SRT compromise. The render keeps the chosen script
+                  font, active-word color, outline, position, and line motion.
+                </p>
+
+                <div className="export-receipt">
+                  <div>
+                    <span>Format</span>
+                    <strong>Advanced SubStation Alpha</strong>
+                  </div>
+                  <div>
+                    <span>Word timing</span>
+                    <strong>
+                      {alignment.totalWords
+                        ? `${alignment.totalWords} aligned words`
+                        : "Waiting for transcript"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Karaoke</span>
+                    <strong>ASS \kf sweep</strong>
+                  </div>
+                  <div>
+                    <span>Line motion</span>
+                    <strong>{captionStyle.animation}</strong>
+                  </div>
+                  <div>
+                    <span>Render</span>
+                    <strong>ffmpeg · H.264</strong>
+                  </div>
+                </div>
+
+                {job?.status === "complete" && (
+                  <div className="download-pair">
+                    <button onClick={() => downloadResult("video")}>
+                      Download video
+                    </button>
+                    <button onClick={() => downloadResult("ass")}>
+                      Download .ASS
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
+          <div className="action-dock">
             {job && (
-              <div className="job-state">
+              <div className="progress-copy">
                 <span>{job.message}</span>
                 <i>
                   <b style={{ width: `${job.progress}%` }} />
@@ -1144,280 +1028,35 @@ export default function Home() {
               </div>
             )}
             <button
-              className="primary-job-button"
+              className="primary-action"
               onClick={primaryAction}
-              disabled={
-                isSubmitting ||
-                Boolean(
-                  job &&
-                    ["queued", "extracting", "transcribing", "rendering"].includes(
-                      job.status,
-                    ),
-                )
-              }
+              disabled={processing}
             >
               <span>{primaryLabel}</span>
-              <b>→</b>
+              <b>↗</b>
             </button>
           </div>
-        </aside>
-
-        <section className="workbench">
-          <div className="canvas-toolbar">
-            <div className="canvas-controls">
-              <button
-                className={previewRatio === "16:9" ? "active" : ""}
-                onClick={() => setPreviewRatio("16:9")}
-              >
-                16:9
-              </button>
-              <button
-                className={previewRatio === "9:16" ? "active" : ""}
-                onClick={() => setPreviewRatio("9:16")}
-              >
-                9:16
-              </button>
-            </div>
-            <div className="alignment-badge">
-              <span>●</span>
-              Phrase anchored · word aligned
-            </div>
-            <button
-              className="add-media-button"
-              onClick={() => videoInputRef.current?.click()}
-            >
-              + Add media
-            </button>
-          </div>
-
-          <div className="canvas-space">
-            <div
-              className={`video-artboard ${
-                previewRatio === "9:16" ? "portrait" : ""
-              }`}
-              style={previewStyle}
-            >
-              {videoUrl ? (
-                <video
-                  ref={videoRef}
-                  src={videoUrl}
-                  onLoadedMetadata={(event) => {
-                    if (Number.isFinite(event.currentTarget.duration)) {
-                      setDuration(event.currentTarget.duration);
-                    }
-                  }}
-                  onTimeUpdate={(event) =>
-                    setCurrentTime(event.currentTarget.currentTime)
-                  }
-                  onPlay={() => setPlaying(true)}
-                  onPause={() => setPlaying(false)}
-                  playsInline
-                />
-              ) : (
-                <div className="river-scene">
-                  <div className="scene-sun" />
-                  <div className="scene-mountain back" />
-                  <div className="scene-mountain front" />
-                  <div className="scene-river" />
-                  <span>MAJULI · ASSAM</span>
-                </div>
-              )}
-
-              {activeCaption && (
-                <div
-                  className={`karaoke-caption ${captionStyle.karaokeMode}`}
-                  key={`${activeCaption.id}-${captionStyle.karaokeMode}`}
-                >
-                  {activeCaption.words.map((word) => (
-                    <span
-                      key={word.id}
-                      className={
-                        activeWord?.id === word.id ? "active-word" : ""
-                      }
-                    >
-                      {word.text}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="transport">
-            <button onClick={() => seek(Math.max(0, currentTime - 1 / 30))}>
-              |◀
-            </button>
-            <button className="transport-play" onClick={togglePlayback}>
-              {playing ? "Ⅱ" : "▶"}
-            </button>
-            <button
-              onClick={() => seek(Math.min(duration, currentTime + 1 / 30))}
-            >
-              ▶|
-            </button>
-            <span>
-              {formatShortTime(currentTime)} / {formatShortTime(duration)}
-            </span>
-            <div className="transport-spacer" />
-            <button onClick={() => setToast("Preview volume uses video audio.")}>
-              ◖
-            </button>
-            <button onClick={() => setToast("Preview expanded to fit canvas.")}>
-              ⛶
-            </button>
-          </div>
-
-          <div className="timeline">
-            <div className="timeline-toolbar">
-              <div>
-                <button onClick={addCaption}>+ Add subtitle</button>
-                <button
-                  onClick={() =>
-                    setToast("Select a subtitle block before splitting.")
-                  }
-                >
-                  ✂ Split
-                </button>
-              </div>
-              <div className="zoom-control">
-                <span>−</span>
-                <input
-                  type="range"
-                  min="70"
-                  max="160"
-                  value={zoom}
-                  onChange={(event) => setZoom(Number(event.target.value))}
-                />
-                <span>+</span>
-                <b>{zoom}%</b>
-              </div>
-            </div>
-
-            <div
-              className="timeline-scroll"
-              style={{ "--timeline-zoom": zoom / 100 } as CSSProperties}
-            >
-              <div
-                className="timeline-content"
-                onClick={(event) => {
-                  const bounds = event.currentTarget.getBoundingClientRect();
-                  seek(((event.clientX - bounds.left) / bounds.width) * duration);
-                }}
-              >
-                <div className="timeline-ruler">
-                  {[0, 5, 10, 15, 20, 25].map((time) => (
-                    <span
-                      key={time}
-                      style={{ left: `${(time / duration) * 100}%` }}
-                    >
-                      {formatShortTime(time)}
-                    </span>
-                  ))}
-                </div>
-
-                <div className="subtitle-track">
-                  <label>CC</label>
-                  {captions.map((caption) => (
-                    <button
-                      key={caption.id}
-                      className={
-                        selectedCaptionId === caption.id ? "selected" : ""
-                      }
-                      style={{
-                        left: `${(caption.start / duration) * 100}%`,
-                        width: `${Math.max(
-                          2.5,
-                          ((caption.end - caption.start) / duration) * 100,
-                        )}%`,
-                      }}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setSelectedCaptionId(caption.id);
-                        seek(caption.start + 0.01);
-                      }}
-                    >
-                      {caption.words.map((word) => (
-                        <i
-                          key={word.id}
-                          className={
-                            activeWord?.id === word.id ? "active-word" : ""
-                          }
-                          style={{
-                            left: `${
-                              ((word.start - caption.start) /
-                                (caption.end - caption.start)) *
-                              100
-                            }%`,
-                            width: `${
-                              ((word.end - word.start) /
-                                (caption.end - caption.start)) *
-                              100
-                            }%`,
-                          }}
-                        />
-                      ))}
-                      <span>{caption.text}</span>
-                    </button>
-                  ))}
-                </div>
-
-                <div className="video-track">
-                  <label>▣</label>
-                  <div className="video-strip">
-                    {Array.from({ length: 12 }).map((_, index) => (
-                      <i key={index} style={{ "--frame": index } as CSSProperties} />
-                    ))}
-                    <span>{fileName}</span>
-                  </div>
-                </div>
-
-                <div className="audio-track">
-                  <label>◒</label>
-                  <div className="waveform">
-                    {waveform.map((height, index) => (
-                      <i
-                        key={`${height}-${index}`}
-                        style={{ height: `${height}%` }}
-                      />
-                    ))}
-                  </div>
-                </div>
-
-                <div
-                  className="timeline-playhead"
-                  style={{ left: `${progress}%` }}
-                >
-                  <i />
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-      </div>
+        </>
+      )}
 
       <input
         ref={videoInputRef}
         type="file"
-        accept="video/*"
+        accept="video/*,.mkv"
         hidden
         onChange={(event) => {
           const nextFile = event.target.files?.[0];
           if (nextFile) acceptVideo(nextFile);
+          event.target.value = "";
         }}
-      />
-      <input
-        ref={srtInputRef}
-        type="file"
-        accept=".srt,.vtt,text/plain"
-        hidden
-        onChange={importSrt}
       />
 
       {toast && (
-        <div className="toast" role="status">
-          <span>●</span>
-          {toast}
-          <button onClick={() => setToast("")}>×</button>
+        <div className="studio-toast" role="status">
+          <span>{toast}</span>
+          <button onClick={() => setToast("")} aria-label="Dismiss message">
+            ×
+          </button>
         </div>
       )}
     </main>
