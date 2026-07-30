@@ -827,14 +827,14 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
     fontFamily: supportedFonts.has(rawStyle?.fontFamily)
       ? rawStyle.fontFamily
       : fallbackFont,
-    fontSize: clamp(rawStyle?.fontSize, 24, 84, 48),
+    fontSize: clamp(rawStyle?.fontSize, 24, 84, 72),
     textColor: safeHex(rawStyle?.textColor, "#fff9ee"),
     backgroundColor: safeHex(rawStyle?.backgroundColor, "#171a27"),
     backgroundOpacity: clamp(rawStyle?.backgroundOpacity, 0, 100, 78),
     highlightColor: safeHex(rawStyle?.highlightColor, "#ffde59"),
     outlineColor: safeHex(rawStyle?.outlineColor, "#171a27"),
     outlineWidth: clamp(rawStyle?.outlineWidth, 0, 8, 2),
-    position: clamp(rawStyle?.position, 52, 92, 83),
+    position: clamp(rawStyle?.position, 52, 92, 74),
     animation: ["pop", "fade", "slide"].includes(rawStyle?.animation)
       ? rawStyle.animation
       : "pop",

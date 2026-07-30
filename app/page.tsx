@@ -81,14 +81,14 @@ const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
 
 const defaultStyle: CaptionStyle = {
   fontFamily: "Noto Sans Bengali",
-  fontSize: 54,
+  fontSize: 78,
   textColor: "#FFFFFF",
   highlightColor: "#D7FF38",
   backgroundColor: "#09090B",
   backgroundOpacity: 76,
   outlineColor: "#09090B",
   outlineWidth: 2,
-  position: 80,
+  position: 74,
   weight: "800",
   animation: "pop",
   wordsPerCard: 4,
