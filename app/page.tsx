@@ -75,6 +75,8 @@ type JobResponse = {
 type StudioTab = "captions" | "style" | "export";
 type EngineState = "offline" | "waking" | "online";
 
+const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
+
 const defaultStyle: CaptionStyle = {
   fontFamily: "Noto Sans Bengali",
   fontSize: 54,
@@ -289,9 +291,10 @@ export default function Home() {
     process.env.NEXT_PUBLIC_RENDER_API_URL?.replace(/\/$/, "") ?? "";
   const apiBase =
     configuredApi ||
-    (hydrated &&
-    ["localhost", "127.0.0.1"].includes(window.location.hostname)
-      ? "http://localhost:8787"
+    (hydrated
+      ? ["localhost", "127.0.0.1"].includes(window.location.hostname)
+        ? "http://localhost:8787"
+        : hostedRenderApi
       : "");
   const isProcessing = Boolean(
     uploading || (job && processingStatuses.includes(job.status)),
