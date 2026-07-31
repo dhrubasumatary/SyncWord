@@ -1013,11 +1013,18 @@ async function transcribe(job) {
     job.captions = aligned.captions;
     job.captions = stitchShortCaptionPhrases(job.captions);
     job.alignment = aligned.summary;
+    const estimatedWords = Math.max(
+      0,
+      Number(aligned.summary.totalWords ?? 0) -
+        Number(aligned.summary.waveformAlignedWords ?? 0),
+    );
     updateJob(
       job,
       "ready",
       82,
-      `${aligned.summary.totalWords} words aligned · ${aligned.summary.needsReview} need review`,
+      estimatedWords
+        ? `${estimatedWords} words need timing review before export`
+        : `${aligned.summary.totalWords} words aligned · ${aligned.summary.needsReview} need review`,
     );
   } catch (error) {
     if (isCancelled(job)) return;
@@ -1312,9 +1319,6 @@ async function renderVideo(job, captions, style) {
 
 async function processJob(job) {
   await transcribe(job);
-  if (job.status === "ready") {
-    await renderVideo(job, job.captions, job.style ?? {});
-  }
 }
 
 async function downloadRemoteSource(job) {

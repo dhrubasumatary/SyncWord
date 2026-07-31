@@ -20,7 +20,10 @@ import modal
 
 
 MODEL_CARD = "MMS_FA"
-REVISION = "mms-fa-verbatim-surface-v5"
+REVISION = "mms-fa-continuous-utterance-v12"
+MAX_CAPTION_WINDOW_SECONDS = 30.0
+ALIGNMENT_PADDING_SECONDS = 2.4
+MAX_CONTINUOUS_GROUP_SECONDS = 55.0
 MODEL_CACHE_PATH = Path("/root/.cache/torch")
 MODEL_CACHE = modal.Volume.from_name(
     "syncword-mms-fa-cache",
@@ -509,14 +512,218 @@ def _fallback_words(
     return words
 
 
-def _align_caption(
+def _find_low_energy_split(
+    waveform: Any,
+    sample_rate: int,
+    start: float,
+    end: float,
+) -> float:
+    import numpy as np
+
+    duration = end - start
+    center = (start + end) / 2
+    edge_guard = min(8.0, max(3.0, duration * 0.22))
+    search_start = start + edge_guard
+    search_end = end - edge_guard
+    if search_end <= search_start:
+        return center
+
+    half_window = max(1, int(round(0.12 * sample_rate)))
+    step = max(1, int(round(0.04 * sample_rate)))
+    first_sample = max(half_window, int(round(search_start * sample_rate)))
+    last_sample = min(
+        len(waveform) - half_window,
+        int(round(search_end * sample_rate)),
+    )
+    if last_sample <= first_sample:
+        return center
+
+    candidates: list[tuple[float, float]] = []
+    for sample in range(first_sample, last_sample + 1, step):
+        window = waveform[sample - half_window : sample + half_window]
+        energy = float(np.sqrt(np.mean(np.square(window)) + 1e-12))
+        candidates.append((sample / sample_rate, energy))
+    if not candidates:
+        return center
+
+    median_energy = float(
+        np.median([energy for _, energy in candidates])
+    ) + 1e-8
+    search_radius = max(0.001, (search_end - search_start) / 2)
+    split_time, _ = min(
+        candidates,
+        key=lambda candidate: (
+            candidate[1] / median_energy
+            + 0.22 * abs(candidate[0] - center) / search_radius
+        ),
+    )
+    return split_time
+
+
+def _word_split_index(
+    display_words: list[str],
+    target_ratio: float,
+) -> int:
+    weights = [
+        max(
+            1.0,
+            len(
+                "".join(
+                    character
+                    for character in word
+                    if _is_acoustic_character(character)
+                )
+            )
+            ** 0.72,
+        )
+        for word in display_words
+    ]
+    total_weight = sum(weights) or float(len(display_words))
+    running_weight = 0.0
+    candidates: list[tuple[float, int]] = []
+    for index in range(1, len(display_words)):
+        running_weight += weights[index - 1]
+        ratio_error = abs(running_weight / total_weight - target_ratio)
+        punctuation_bonus = (
+            0.08
+            if display_words[index - 1].rstrip().endswith(
+                (".", "!", "?", "।", "॥", "…", ",", ";", ":")
+            )
+            else 0.0
+        )
+        candidates.append((ratio_error - punctuation_bonus, index))
+    return min(candidates)[1]
+
+
+def _split_long_caption(
+    waveform: Any,
+    sample_rate: int,
+    caption: dict[str, Any],
+    split_index: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], float, int] | None:
+    start = max(0.0, float(caption["start"]))
+    end = min(len(waveform) / sample_rate, float(caption["end"]))
+    display_words = [
+        word
+        for word in str(caption.get("text", "")).strip().split()
+        if word
+    ]
+    if (
+        end - start <= MAX_CAPTION_WINDOW_SECONDS
+        or len(display_words) < 4
+    ):
+        return None
+
+    split_time = _find_low_energy_split(
+        waveform,
+        sample_rate,
+        start,
+        end,
+    )
+    target_ratio = max(
+        0.1,
+        min(0.9, (split_time - start) / max(0.001, end - start)),
+    )
+    resolved_split_index = (
+        split_index
+        if split_index is not None
+        else _word_split_index(display_words, target_ratio)
+    )
+    resolved_split_index = max(
+        1,
+        min(len(display_words) - 1, resolved_split_index),
+    )
+    caption_id = str(caption.get("id", "caption"))
+    left = {
+        **caption,
+        "id": f"{caption_id}-window-a",
+        "start": start,
+        "end": split_time,
+        "text": " ".join(display_words[:resolved_split_index]),
+        "_alignment_padding_after": 0.24,
+    }
+    right = {
+        **caption,
+        "id": f"{caption_id}-window-b",
+        "start": split_time,
+        "end": end,
+        "text": " ".join(display_words[resolved_split_index:]),
+        "_alignment_padding_before": 0.24,
+    }
+    return left, right, split_time, resolved_split_index
+
+
+def _trim_recovery_word_end(
+    waveform: Any,
+    sample_rate: int,
+    word_start: float,
+    proposed_end: float,
+    text: str,
+) -> float:
+    import numpy as np
+
+    acoustic_characters = sum(
+        1 for character in text if _is_acoustic_character(character)
+    )
+    maximum_duration = min(
+        1.4,
+        max(0.58, 0.34 + acoustic_characters * 0.12),
+    )
+    capped_end = min(proposed_end, word_start + maximum_duration)
+    if capped_end - word_start <= 0.22:
+        return capped_end
+
+    frame_samples = max(1, int(round(0.06 * sample_rate)))
+    step_samples = max(1, int(round(0.02 * sample_rate)))
+    first_sample = max(0, int(round(word_start * sample_rate)))
+    last_sample = min(
+        len(waveform) - frame_samples,
+        int(round(capped_end * sample_rate)),
+    )
+    if last_sample <= first_sample:
+        return capped_end
+
+    energies: list[tuple[float, float]] = []
+    for sample in range(first_sample, last_sample + 1, step_samples):
+        frame = waveform[sample : sample + frame_samples]
+        energy = float(np.sqrt(np.mean(np.square(frame)) + 1e-12))
+        energies.append((sample / sample_rate, energy))
+    if len(energies) < 4:
+        return capped_end
+
+    peak_index = max(
+        range(len(energies)),
+        key=lambda index: energies[index][1],
+    )
+    peak_energy = energies[peak_index][1]
+    noise_floor = float(
+        np.percentile([energy for _, energy in energies], 20)
+    )
+    silence_threshold = max(
+        noise_floor * 1.45,
+        peak_energy * 0.2,
+    )
+    minimum_end = word_start + 0.22
+    for index in range(peak_index + 1, len(energies) - 2):
+        if energies[index][0] < minimum_end:
+            continue
+        if all(
+            energies[candidate][1] <= silence_threshold
+            for candidate in range(index, index + 3)
+        ):
+            return min(
+                capped_end,
+                max(word_start + 0.12, energies[index][0] + 0.06),
+            )
+    return capped_end
+
+
+def _align_caption_window(
     runtime: tuple[Any, Any, Any, Any],
     waveform: Any,
     sample_rate: int,
     caption: dict[str, Any],
-    *,
-    padding_seconds: float = 0.9,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], int]:
     import numpy as np
     import torch
 
@@ -524,23 +731,38 @@ def _align_caption(
         str(caption.get("text", "")),
     )
     if not display_words:
-        return [], False
+        return [], 0
 
-    phrase_start = max(0.0, float(caption["start"]) - padding_seconds)
+    padding_before = float(
+        caption.get(
+            "_alignment_padding_before",
+            ALIGNMENT_PADDING_SECONDS,
+        )
+    )
+    padding_after = float(
+        caption.get(
+            "_alignment_padding_after",
+            ALIGNMENT_PADDING_SECONDS,
+        )
+    )
+    phrase_start = max(
+        0.0,
+        float(caption["start"]) - padding_before,
+    )
     phrase_end = min(
         len(waveform) / sample_rate,
-        float(caption["end"]) + padding_seconds,
+        float(caption["end"]) + padding_after,
     )
     if phrase_end <= phrase_start:
-        return _fallback_words(caption, display_words), False
+        return _fallback_words(caption, display_words), 0
     if phrase_end - phrase_start > 39.5:
-        return _fallback_words(caption, display_words), False
+        return _fallback_words(caption, display_words), 0
 
     start_sample = max(0, int(round(phrase_start * sample_rate)))
     end_sample = min(len(waveform), int(round(phrase_end * sample_rate)))
     segment = np.ascontiguousarray(waveform[start_sample:end_sample])
     if segment.size < 320:
-        return _fallback_words(caption, display_words), False
+        return _fallback_words(caption, display_words), 0
 
     model, tokenizer, aligner, romanizer = runtime
     language_code = _uroman_language(
@@ -572,12 +794,12 @@ def _align_caption(
             normalized_words,
         )
     except (RuntimeError, ValueError):
-        return _fallback_words(caption, display_words), False
+        return _fallback_words(caption, display_words), 0
 
     if len(token_spans) != len(display_words) or any(
         not spans for spans in token_spans
     ):
-        return _fallback_words(caption, display_words), False
+        return _fallback_words(caption, display_words), 0
 
     output_frames = int(emission.shape[1])
     seconds_per_frame = (len(segment) / sample_rate) / output_frames
@@ -636,6 +858,14 @@ def _align_caption(
             )
             else "mms-fa"
         )
+        if source == "mms-fa-star":
+            word_end = _trim_recovery_word_end(
+                waveform,
+                sample_rate,
+                word_start,
+                word_end,
+                text,
+            )
         words.append(
             {
                 "id": f"{caption.get('id', 'caption')}-word-{index + 1}",
@@ -646,7 +876,281 @@ def _align_caption(
                 "source": source,
             }
         )
-    return words, True
+    return words, len(words)
+
+
+def _align_caption(
+    runtime: tuple[Any, Any, Any, Any],
+    waveform: Any,
+    sample_rate: int,
+    caption: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    split = _split_long_caption(
+        waveform,
+        sample_rate,
+        caption,
+    )
+    if split is None:
+        return _align_caption_window(
+            runtime,
+            waveform,
+            sample_rate,
+            caption,
+        )
+
+    left, right, split_time, split_index = split
+    display_word_count = len(
+        str(caption.get("text", "")).strip().split()
+    )
+    tried_indexes: set[int] = set()
+    best: tuple[
+        float,
+        list[dict[str, Any]],
+        int,
+    ] | None = None
+    for _ in range(8):
+        if split_index in tried_indexes:
+            break
+        tried_indexes.add(split_index)
+        candidate_split = _split_long_caption(
+            waveform,
+            sample_rate,
+            caption,
+            split_index,
+        )
+        if candidate_split is None:
+            break
+        left, right, split_time, split_index = candidate_split
+        left_words, left_aligned_count = _align_caption(
+            runtime,
+            waveform,
+            sample_rate,
+            left,
+        )
+        right_words, right_aligned_count = _align_caption(
+            runtime,
+            waveform,
+            sample_rate,
+            right,
+        )
+        words = [*left_words, *right_words]
+        aligned_word_count = (
+            left_aligned_count + right_aligned_count
+        )
+        if not left_words or not right_words:
+            break
+
+        left_overrun = max(
+            0.0,
+            float(left_words[-1]["start"]) - split_time,
+        )
+        right_underrun = max(
+            0.0,
+            split_time - float(right_words[0]["end"]),
+        )
+        boundary_overlap = max(
+            0.0,
+            float(left_words[-1]["end"])
+            - float(right_words[0]["start"]),
+        )
+        average_confidence = sum(
+            float(word["confidence"]) for word in words
+        ) / max(1, len(words))
+        score = (
+            aligned_word_count * 10.0
+            + average_confidence
+            - left_overrun * 8.0
+            - right_underrun * 8.0
+            - boundary_overlap * 5.0
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "alignment_window_candidate",
+                    "captionId": caption.get("id"),
+                    "splitTime": round(split_time, 3),
+                    "splitIndex": split_index,
+                    "leftOverrun": round(left_overrun, 3),
+                    "rightUnderrun": round(right_underrun, 3),
+                    "boundaryOverlap": round(boundary_overlap, 3),
+                    "alignedWords": aligned_word_count,
+                    "score": round(score, 3),
+                },
+                ensure_ascii=True,
+            )
+        )
+        if best is None or score > best[0]:
+            best = (score, words, aligned_word_count)
+
+        if (
+            left_overrun <= 0.12
+            and right_underrun <= 0.12
+            and boundary_overlap <= 0.08
+        ):
+            break
+        if left_overrun > right_underrun and split_index > 1:
+            word_shift = max(
+                1,
+                min(5, math.ceil(left_overrun / 0.45)),
+            )
+            split_index = max(1, split_index - word_shift)
+            continue
+        if (
+            right_underrun >= left_overrun
+            and split_index < display_word_count - 1
+        ):
+            word_shift = max(
+                1,
+                min(5, math.ceil(right_underrun / 0.45)),
+            )
+            split_index = min(
+                display_word_count - 1,
+                split_index + word_shift,
+            )
+            continue
+        break
+
+    if best is None:
+        display_words = [
+            word
+            for word in str(caption.get("text", "")).split()
+            if word
+        ]
+        return _fallback_words(caption, display_words), 0
+
+    _, words, aligned_word_count = best
+    caption_id = str(caption.get("id", "caption"))
+    for index, word in enumerate(words):
+        word["id"] = f"{caption_id}-word-{index + 1}"
+        if index:
+            previous = words[index - 1]
+            if float(word["start"]) < float(previous["end"]):
+                word["start"] = round(
+                    float(previous["end"]),
+                    3,
+                )
+                word["end"] = round(
+                    max(
+                        float(word["start"]) + 0.04,
+                        float(word["end"]),
+                    ),
+                    3,
+                )
+                word["confidence"] = 0.0
+                word["source"] = "speech-window-review"
+    return words, aligned_word_count
+
+
+def _caption_display_words(caption: dict[str, Any]) -> list[str]:
+    return [
+        word
+        for word in str(caption.get("text", "")).strip().split()
+        if word
+    ]
+
+
+def _continuous_caption_groups(
+    captions: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+
+    for caption in captions:
+        if not _caption_display_words(caption):
+            continue
+        if not current:
+            current = [caption]
+            continue
+
+        first = current[0]
+        previous = current[-1]
+        combined_duration = (
+            float(caption["end"]) - float(first["start"])
+        )
+        gap = float(caption["start"]) - float(previous["end"])
+        same_language = _uroman_language(
+            first,
+            str(first.get("text", "")),
+        ) == _uroman_language(
+            caption,
+            str(caption.get("text", "")),
+        )
+        if (
+            same_language
+            and gap <= 2.0
+            and combined_duration <= MAX_CONTINUOUS_GROUP_SECONDS
+        ):
+            current.append(caption)
+            continue
+
+        groups.append(current)
+        current = [caption]
+
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _alignment_group_caption(
+    members: list[dict[str, Any]],
+    group_index: int,
+    group_count: int,
+) -> dict[str, Any]:
+    first = members[0]
+    last = members[-1]
+    merged = {
+        **first,
+        "id": f"continuous-utterance-{group_index + 1}",
+        "start": float(first["start"]),
+        "end": float(last["end"]),
+        "text": " ".join(
+            str(member.get("text", "")).strip()
+            for member in members
+            if str(member.get("text", "")).strip()
+        ),
+    }
+    if group_index > 0:
+        merged["_alignment_padding_before"] = 0.24
+    if group_index + 1 < group_count:
+        merged["_alignment_padding_after"] = 0.24
+    return merged
+
+
+def _restore_caption_members(
+    members: list[dict[str, Any]],
+    words: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    restored: list[dict[str, Any]] = []
+    offset = 0
+    for member in members:
+        word_count = len(_caption_display_words(member))
+        member_words = [
+            {
+                **word,
+                "id": f"{member.get('id', 'caption')}-word-{index + 1}",
+            }
+            for index, word in enumerate(
+                words[offset : offset + word_count]
+            )
+        ]
+        offset += word_count
+        restored.append(
+            {
+                **member,
+                "start": (
+                    float(member_words[0]["start"])
+                    if member_words
+                    else float(member["start"])
+                ),
+                "end": (
+                    float(member_words[-1]["end"])
+                    if member_words
+                    else float(member["end"])
+                ),
+                "words": member_words,
+            }
+        )
+    return restored
 
 
 def align_captions(
@@ -675,22 +1179,35 @@ def align_captions(
         language_counts[language_key] = (
             language_counts.get(language_key, 0) + 1
         )
-        words, used_ctc = _align_caption(
+
+    groups = _continuous_caption_groups(captions)
+    for group_index, members in enumerate(groups):
+        alignment_caption = _alignment_group_caption(
+            members,
+            group_index,
+            len(groups),
+        )
+        words, _ = _align_caption(
             runtime,
             waveform,
             sample_rate,
-            caption,
+            alignment_caption,
         )
         total_words += len(words)
-        if used_ctc:
-            ctc_words += len(words)
+        ctc_words += sum(
+            1
+            for word in words
+            if word["source"] == "mms-fa"
+        )
         confidence_sum += sum(float(word["confidence"]) for word in words)
         recovered_words += sum(
             1
             for word in words
             if word["source"] == "mms-fa-star"
         )
-        aligned_captions.append({**caption, "words": words})
+        aligned_captions.extend(
+            _restore_caption_members(members, words)
+        )
 
     needs_review = sum(
         1
@@ -698,7 +1215,12 @@ def align_captions(
         for word in caption["words"]
         if (
             float(word["confidence"]) < 0.35
-            or word["source"] == "mms-fa-star"
+            or word["source"]
+            in {
+                "mms-fa-star",
+                "speech-window-review",
+                "grapheme-prior",
+            }
         )
     )
     surface_words_replaced = (
@@ -720,6 +1242,8 @@ def align_captions(
         ),
         "needsReview": needs_review,
         "stableWords": max(0, total_words - needs_review),
+        "estimatedWords": max(0, total_words - ctc_words),
+        "alignmentComplete": ctc_words == total_words,
         "recoveredWords": recovered_words,
         "surfaceWordsReplaced": surface_words_replaced,
         "languages": language_counts,

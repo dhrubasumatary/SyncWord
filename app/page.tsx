@@ -53,6 +53,8 @@ type AlignmentSummary = {
   averageConfidence: number;
   needsReview: number;
   stableWords?: number;
+  estimatedWords?: number;
+  alignmentComplete?: boolean;
   recoveredWords?: number;
   surfaceWordsReplaced?: number;
 };
@@ -634,7 +636,7 @@ export default function Home() {
         if (!response.ok) throw new Error(data.error ?? "Upload failed.");
       }
       setJob(data);
-      setToast("Upload complete. Captioning and final render started.");
+      setToast("Upload complete. Building the synchronized preview first.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Upload failed.");
     } finally {

@@ -79,6 +79,11 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /runSarvamTranscript\(\s*job,\s*"verbatim"/);
   assert.match(renderServer, /displayCaptions/);
   assert.match(renderServer, /transcript_gap_recovery_failed/);
+  assert.match(renderServer, /words need timing review before export/);
+  assert.doesNotMatch(
+    renderServer,
+    /if \(job\.status === "ready"\) \{\s*await renderVideo/,
+  );
   assert.match(
     renderServer,
     /transcriptToCaptions\(transcript, job\.language\)/,
@@ -102,6 +107,10 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(modalAligner, /_suspicious_word_boundaries/);
   assert.match(modalAligner, /_apply_display_surfaces/);
   assert.match(modalAligner, /surfaceWordsReplaced/);
+  assert.match(modalAligner, /_split_long_caption/);
+  assert.match(modalAligner, /_continuous_caption_groups/);
+  assert.match(modalAligner, /_trim_recovery_word_end/);
+  assert.match(modalAligner, /alignmentComplete/);
   assert.doesNotMatch(
     modalAligner,
     /alignment_words\.extend\(\(normalized_word, "\*"\)\)/,
