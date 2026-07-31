@@ -20,7 +20,7 @@ import modal
 
 
 MODEL_CARD = "MMS_FA"
-REVISION = "mms-fa-stars-v2"
+REVISION = "mms-fa-verbatim-surface-v5"
 MODEL_CACHE_PATH = Path("/root/.cache/torch")
 MODEL_CACHE = modal.Volume.from_name(
     "syncword-mms-fa-cache",
@@ -42,6 +42,13 @@ image = (
 
 app = modal.App("syncword-aligner")
 _alignment_runtime: tuple[Any, Any, Any, Any] | None = None
+UROMAN_LANGUAGE_CODES = {
+    "as": "asm",
+    "asm": "asm",
+    "as-in": "asm",
+    "brx": "brx",
+    "brx-in": "brx",
+}
 
 
 def _get_alignment_runtime() -> tuple[Any, Any, Any, Any]:
@@ -69,6 +76,244 @@ def _get_alignment_runtime() -> tuple[Any, Any, Any, Any]:
 def _is_acoustic_character(character: str) -> bool:
     category = unicodedata.category(character)
     return category[0] in {"L", "M", "N"}
+
+
+def _uroman_language(caption: dict[str, Any], text: str) -> str | None:
+    configured = UROMAN_LANGUAGE_CODES.get(
+        str(caption.get("language", "")).strip().lower()
+    )
+    if configured:
+        return configured
+    if any("\u0980" <= character <= "\u09ff" for character in text):
+        return "asm"
+    if any("\u0900" <= character <= "\u097f" for character in text):
+        return "brx"
+    return None
+
+
+def _normalize_alignment_word(
+    word: str,
+    romanizer: Any,
+    language_code: str | None,
+) -> str:
+    kwargs = {"lcode": language_code} if language_code else {}
+    romanized = romanizer.romanize_string(word, **kwargs)
+    romanized = unicodedata.normalize("NFKD", romanized)
+    return "".join(
+        character.lower()
+        for character in romanized
+        if character.isascii()
+        and (character.isalpha() or character == "'")
+    )
+
+
+def _align_word_spans(
+    emission: Any,
+    tokenizer: Any,
+    aligner: Any,
+    normalized_words: list[str],
+    wildcard_before: set[int] | None = None,
+) -> list[Any]:
+    alignment_words: list[str] = []
+    display_span_indexes: list[int] = []
+    recovery_boundaries = wildcard_before or set()
+    for index, normalized_word in enumerate(normalized_words):
+        if index in recovery_boundaries:
+            alignment_words.append("*")
+        display_span_indexes.append(len(alignment_words))
+        alignment_words.append(normalized_word)
+
+    all_token_spans = aligner(
+        emission,
+        tokenizer(alignment_words),
+    )
+    return [
+        all_token_spans[index]
+        for index in display_span_indexes
+    ]
+
+
+def _suspicious_word_boundaries(
+    normalized_words: list[str],
+    token_spans: list[Any],
+    seconds_per_frame: float,
+) -> set[int]:
+    boundaries: set[int] = set()
+    for index, (normalized_word, spans) in enumerate(
+        zip(normalized_words, token_spans)
+    ):
+        character_count = max(
+            1,
+            len(normalized_word.replace("*", "")),
+        )
+        duration = (
+            float(spans[-1].end) - float(spans[0].start)
+        ) * seconds_per_frame
+        maximum_duration = max(
+            1.2,
+            character_count * 0.18 + 0.45,
+        )
+        if duration > maximum_duration:
+            boundaries.add(index)
+    return boundaries
+
+
+def _edit_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+
+    previous = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_character in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1]
+                    + (left_character != right_character),
+                )
+            )
+        previous = current
+    distance = previous[-1]
+    return max(0.0, 1.0 - distance / max(len(left), len(right)))
+
+
+def _surface_words(
+    captions: list[dict[str, Any]],
+    romanizer: Any,
+) -> list[tuple[dict[str, Any], str]]:
+    output: list[tuple[dict[str, Any], str]] = []
+    for caption in captions:
+        language_code = _uroman_language(
+            caption,
+            str(caption.get("text", "")),
+        )
+        if isinstance(caption.get("words"), list):
+            words = caption["words"]
+        else:
+            words = [
+                {"text": word}
+                for word in str(caption.get("text", "")).split()
+                if word
+            ]
+        for word in words:
+            text = str(word.get("text", "")).strip()
+            if not text:
+                continue
+            normalized = _normalize_alignment_word(
+                text,
+                romanizer,
+                language_code,
+            )
+            if normalized:
+                output.append((word, normalized))
+    return output
+
+
+def _apply_display_surfaces(
+    aligned_captions: list[dict[str, Any]],
+    display_captions: list[dict[str, Any]],
+    romanizer: Any,
+) -> int:
+    acoustic_words = _surface_words(aligned_captions, romanizer)
+    display_words = _surface_words(display_captions, romanizer)
+    acoustic_count = len(acoustic_words)
+    display_count = len(display_words)
+    if not acoustic_count or not display_count:
+        return 0
+
+    acoustic_gap = -0.35
+    display_gap = -0.55
+    scores = [
+        [0.0] * (display_count + 1)
+        for _ in range(acoustic_count + 1)
+    ]
+    choices = [
+        [""] * (display_count + 1)
+        for _ in range(acoustic_count + 1)
+    ]
+    for acoustic_index in range(1, acoustic_count + 1):
+        scores[acoustic_index][0] = acoustic_index * acoustic_gap
+        choices[acoustic_index][0] = "acoustic"
+    for display_index in range(1, display_count + 1):
+        scores[0][display_index] = display_index * display_gap
+        choices[0][display_index] = "display"
+
+    for acoustic_index in range(1, acoustic_count + 1):
+        acoustic_normalized = acoustic_words[acoustic_index - 1][1]
+        for display_index in range(1, display_count + 1):
+            display_normalized = display_words[display_index - 1][1]
+            similarity = _edit_similarity(
+                acoustic_normalized,
+                display_normalized,
+            )
+            candidates = (
+                (
+                    scores[acoustic_index - 1][display_index - 1]
+                    + similarity * 2.4
+                    - 0.8,
+                    "match",
+                ),
+                (
+                    scores[acoustic_index - 1][display_index]
+                    + acoustic_gap,
+                    "acoustic",
+                ),
+                (
+                    scores[acoustic_index][display_index - 1]
+                    + display_gap,
+                    "display",
+                ),
+            )
+            best_score, best_choice = max(
+                candidates,
+                key=lambda candidate: candidate[0],
+            )
+            scores[acoustic_index][display_index] = best_score
+            choices[acoustic_index][display_index] = best_choice
+
+    replacements = 0
+    acoustic_index = acoustic_count
+    display_index = display_count
+    while acoustic_index or display_index:
+        choice = choices[acoustic_index][display_index]
+        if choice == "match":
+            acoustic_word, acoustic_normalized = acoustic_words[
+                acoustic_index - 1
+            ]
+            display_word, display_normalized = display_words[
+                display_index - 1
+            ]
+            if (
+                _edit_similarity(
+                    acoustic_normalized,
+                    display_normalized,
+                )
+                >= 0.52
+            ):
+                display_text = str(display_word["text"]).strip()
+                if display_text and acoustic_word["text"] != display_text:
+                    acoustic_word["text"] = display_text
+                    replacements += 1
+            acoustic_index -= 1
+            display_index -= 1
+        elif choice == "acoustic":
+            acoustic_index -= 1
+        elif choice == "display":
+            display_index -= 1
+        else:
+            break
+
+    for caption in aligned_captions:
+        words = caption.get("words")
+        if isinstance(words, list) and words:
+            caption["text"] = " ".join(
+                str(word["text"]) for word in words
+            )
+    return replacements
 
 
 def _alignment_text(text: str) -> tuple[str, list[str], list[int | None]]:
@@ -270,7 +515,7 @@ def _align_caption(
     sample_rate: int,
     caption: dict[str, Any],
     *,
-    padding_seconds: float = 0.35,
+    padding_seconds: float = 0.9,
 ) -> tuple[list[dict[str, Any]], bool]:
     import numpy as np
     import torch
@@ -298,38 +543,36 @@ def _align_caption(
         return _fallback_words(caption, display_words), False
 
     model, tokenizer, aligner, romanizer = runtime
-    normalized_words: list[str] = []
-    for display_word in display_words:
-        romanized = romanizer.romanize_string(display_word, lcode="brx")
-        romanized = unicodedata.normalize("NFKD", romanized)
-        romanized = "".join(
-            character.lower()
-            for character in romanized
-            if character.isascii()
-            and (character.isalpha() or character == "'")
+    language_code = _uroman_language(
+        caption,
+        " ".join(display_words),
+    )
+    normalized_words = [
+        _normalize_alignment_word(
+            display_word,
+            romanizer,
+            language_code,
         )
-        normalized_words.append(romanized or "*")
+        or "*"
+        for display_word in display_words
+    ]
 
     with torch.inference_mode():
         emission, _ = model(
             torch.from_numpy(segment)
             .unsqueeze(0)
-                .to(device="cuda", dtype=torch.float32),
+            .to(device="cuda", dtype=torch.float32),
         )
 
-    alignment_words = ["*"]
-    display_span_indexes: list[int] = []
-    for normalized_word in normalized_words:
-        display_span_indexes.append(len(alignment_words))
-        alignment_words.extend((normalized_word, "*"))
     try:
-        all_token_spans = aligner(emission[0], tokenizer(alignment_words))
+        token_spans = _align_word_spans(
+            emission[0],
+            tokenizer,
+            aligner,
+            normalized_words,
+        )
     except (RuntimeError, ValueError):
         return _fallback_words(caption, display_words), False
-    token_spans = [
-        all_token_spans[index]
-        for index in display_span_indexes
-    ]
 
     if len(token_spans) != len(display_words) or any(
         not spans for spans in token_spans
@@ -338,6 +581,27 @@ def _align_caption(
 
     output_frames = int(emission.shape[1])
     seconds_per_frame = (len(segment) / sample_rate) / output_frames
+    recovery_boundaries = _suspicious_word_boundaries(
+        normalized_words,
+        token_spans,
+        seconds_per_frame,
+    )
+    if recovery_boundaries:
+        try:
+            recovered_spans = _align_word_spans(
+                emission[0],
+                tokenizer,
+                aligner,
+                normalized_words,
+                recovery_boundaries,
+            )
+            if len(recovered_spans) == len(display_words) and all(
+                recovered_spans
+            ):
+                token_spans = recovered_spans
+        except (RuntimeError, ValueError):
+            recovery_boundaries.clear()
+
     onsets = [
         phrase_start + float(spans[0].start) * seconds_per_frame
         for spans in token_spans
@@ -366,7 +630,10 @@ def _align_caption(
         ) / max(1, span_length)
         source = (
             "mms-fa-star"
-            if normalized_words[index] == "*"
+            if (
+                normalized_words[index] == "*"
+                or index in recovery_boundaries
+            )
             else "mms-fa"
         )
         words.append(
@@ -385,6 +652,7 @@ def _align_caption(
 def align_captions(
     wav_path: Path,
     captions: list[dict[str, Any]],
+    display_captions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     waveform, sample_rate = _load_pcm16_wav(wav_path)
     if sample_rate != 16_000:
@@ -395,8 +663,18 @@ def align_captions(
     ctc_words = 0
     total_words = 0
     confidence_sum = 0.0
+    language_counts: dict[str, int] = {}
+    recovered_words = 0
 
     for caption in captions:
+        language_code = _uroman_language(
+            caption,
+            str(caption.get("text", "")),
+        )
+        language_key = language_code or "und"
+        language_counts[language_key] = (
+            language_counts.get(language_key, 0) + 1
+        )
         words, used_ctc = _align_caption(
             runtime,
             waveform,
@@ -407,25 +685,58 @@ def align_captions(
         if used_ctc:
             ctc_words += len(words)
         confidence_sum += sum(float(word["confidence"]) for word in words)
+        recovered_words += sum(
+            1
+            for word in words
+            if word["source"] == "mms-fa-star"
+        )
         aligned_captions.append({**caption, "words": words})
 
+    needs_review = sum(
+        1
+        for caption in aligned_captions
+        for word in caption["words"]
+        if (
+            float(word["confidence"]) < 0.35
+            or word["source"] == "mms-fa-star"
+        )
+    )
+    surface_words_replaced = (
+        _apply_display_surfaces(
+            aligned_captions,
+            display_captions,
+            runtime[3],
+        )
+        if display_captions
+        else 0
+    )
+    summary = {
+        "method": REVISION,
+        "totalWords": total_words,
+        "waveformAlignedWords": ctc_words,
+        "averageConfidence": round(
+            confidence_sum / total_words if total_words else 0.0,
+            3,
+        ),
+        "needsReview": needs_review,
+        "stableWords": max(0, total_words - needs_review),
+        "recoveredWords": recovered_words,
+        "surfaceWordsReplaced": surface_words_replaced,
+        "languages": language_counts,
+    }
+    print(
+        json.dumps(
+            {
+                "event": "alignment_complete",
+                "revision": REVISION,
+                **summary,
+            },
+            ensure_ascii=True,
+        )
+    )
     return {
         "captions": aligned_captions,
-        "alignment": {
-            "method": "mms-fa-stars-v2",
-            "totalWords": total_words,
-            "waveformAlignedWords": ctc_words,
-            "averageConfidence": round(
-                confidence_sum / total_words if total_words else 0.0,
-                3,
-            ),
-            "needsReview": sum(
-                1
-                for caption in aligned_captions
-                for word in caption["words"]
-                if float(word["confidence"]) < 0.35
-            ),
-        },
+        "alignment": summary,
     }
 
 
@@ -457,6 +768,7 @@ def alignment_api() -> Any:
     async def align(
         audio: UploadFile = File(...),
         captions: str = Form(...),
+        display_captions: str | None = Form(None),
     ) -> dict[str, Any]:
         try:
             parsed_captions = json.loads(captions)
@@ -466,6 +778,23 @@ def alignment_api() -> Any:
             raise HTTPException(400, "captions must be a non-empty array")
         if len(parsed_captions) > 500:
             raise HTTPException(413, "caption limit exceeded")
+        parsed_display_captions = None
+        if display_captions:
+            try:
+                parsed_display_captions = json.loads(display_captions)
+            except json.JSONDecodeError as error:
+                raise HTTPException(
+                    400,
+                    "display_captions must be valid JSON",
+                ) from error
+            if (
+                not isinstance(parsed_display_captions, list)
+                or len(parsed_display_captions) > 500
+            ):
+                raise HTTPException(
+                    400,
+                    "display_captions must be an array",
+                )
 
         with tempfile.TemporaryDirectory(prefix="syncword-align-") as directory:
             audio_path = Path(directory) / "audio.wav"
@@ -477,7 +806,11 @@ def alignment_api() -> Any:
                         raise HTTPException(413, "audio limit exceeded")
                     destination.write(chunk)
             try:
-                return align_captions(audio_path, parsed_captions)
+                return align_captions(
+                    audio_path,
+                    parsed_captions,
+                    parsed_display_captions,
+                )
             except ValueError as error:
                 raise HTTPException(422, str(error)) from error
 

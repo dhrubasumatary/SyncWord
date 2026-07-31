@@ -23,6 +23,10 @@ import {
   groupWordsForReels,
   stitchShortCaptionPhrases,
 } from "./caption-groups.mjs";
+import {
+  languageTag,
+  resolveTranscriptLanguage,
+} from "./transcript-language.mjs";
 import { alignTranscriptWords } from "./word-aligner.mjs";
 
 const app = express();
@@ -558,7 +562,11 @@ async function uploadAudio(job, jobId, fileName, audioPath, storageType) {
   }
 }
 
-async function waitForSarvamJob(job, sarvamJobId) {
+async function waitForSarvamJob(
+  job,
+  sarvamJobId,
+  progressFloor = 31,
+) {
   for (let attempt = 0; attempt < 360; attempt += 1) {
     throwIfCancelled(job);
     const status = await sarvamJson(
@@ -570,7 +578,10 @@ async function waitForSarvamJob(job, sarvamJobId) {
     updateJob(
       job,
       "transcribing",
-      Math.min(76, 31 + Math.floor(attempt / 3)),
+      Math.min(
+        76,
+        Math.max(progressFloor, 31 + Math.floor(attempt / 3)),
+      ),
       state === "running"
         ? "Saaras is aligning phrases"
         : "Waiting for Saaras Batch",
@@ -587,13 +598,13 @@ async function waitForSarvamJob(job, sarvamJobId) {
   throw new Error("Sarvam Batch did not finish within 30 minutes.");
 }
 
-function languageTag(languageCode) {
-  if (languageCode === "as-IN") return "as";
-  if (languageCode === "brx-IN") return "brx";
-  return "mix";
-}
-
-function transcriptToCaptions(transcript) {
+function transcriptToCaptions(transcript, requestedLanguage = "unknown") {
+  const captionLanguage = languageTag(
+    resolveTranscriptLanguage(
+      transcript.language_code,
+      requestedLanguage,
+    ),
+  );
   const timestamps =
     transcript.timestamps ??
     transcript.diarized_transcript?.timestamps ??
@@ -626,7 +637,7 @@ function transcriptToCaptions(transcript) {
         start: Number(starts[index]),
         end: Number(ends[index]),
         text: String(text).trim(),
-        language: languageTag(transcript.language_code),
+        language: captionLanguage,
       }))
       .filter(
         (caption) =>
@@ -648,7 +659,7 @@ function transcriptToCaptions(transcript) {
         start: Number(entry.start_time_seconds ?? entry.start),
         end: Number(entry.end_time_seconds ?? entry.end),
         text: String(entry.transcript ?? entry.text ?? "").trim(),
-        language: languageTag(transcript.language_code),
+        language: captionLanguage,
       }))
       .filter(
         (caption) =>
@@ -710,12 +721,18 @@ function modalAlignerEndpoint() {
     : `${configured}/v1/align`;
 }
 
-async function alignTranscriptWithModal(job) {
+async function alignTranscriptWithModal(
+  job,
+  {
+    captions: rawCaptions = job.captions,
+    displayCaptions = null,
+  } = {},
+) {
   const endpoint = modalAlignerEndpoint();
   if (!endpoint) return null;
 
   const audio = await readFile(path.join(job.directory, "audio.wav"));
-  const captions = job.captions.map(({ words: _words, ...caption }) => {
+  const captions = rawCaptions.map(({ words: _words, ...caption }) => {
     void _words;
     return caption;
   });
@@ -726,6 +743,17 @@ async function alignTranscriptWithModal(job) {
     `${job.id}.wav`,
   );
   payload.append("captions", JSON.stringify(captions));
+  if (Array.isArray(displayCaptions) && displayCaptions.length) {
+    payload.append(
+      "display_captions",
+      JSON.stringify(
+        displayCaptions.map(({ words: _words, ...caption }) => {
+          void _words;
+          return caption;
+        }),
+      ),
+    );
+  }
 
   updateJob(
     job,
@@ -771,6 +799,60 @@ async function alignTranscriptWithModal(job) {
   };
 }
 
+async function runSarvamTranscript(job, mode, progressFloor = 24) {
+  updateJob(
+    job,
+    "transcribing",
+    progressFloor,
+    `Creating Saaras ${mode} transcript`,
+  );
+  const audioFileName = `${job.id}-${mode}.wav`;
+  const init = await sarvamJson(
+    "/speech-to-text/job/v1",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_parameters: {
+          model: "saaras:v3",
+          mode,
+          language_code: job.language,
+          with_timestamps: true,
+          with_diarization: false,
+        },
+      }),
+    },
+    job,
+  );
+
+  job.sarvamJobId = init.job_id;
+  job.sarvamJobIds = [...(job.sarvamJobIds ?? []), init.job_id];
+  await uploadAudio(
+    job,
+    init.job_id,
+    audioFileName,
+    path.join(job.directory, "audio.wav"),
+    init.storage_container_type,
+  );
+  await sarvamJson(
+    `/speech-to-text/job/v1/${encodeURIComponent(init.job_id)}/start`,
+    { method: "POST", body: "{}" },
+    job,
+  );
+
+  updateJob(
+    job,
+    "transcribing",
+    Math.max(32, progressFloor),
+    "Saaras is aligning phrases",
+  );
+  const status = await waitForSarvamJob(
+    job,
+    init.job_id,
+    Math.max(31, progressFloor),
+  );
+  return downloadTranscript(job, init.job_id, status);
+}
+
 async function transcribe(job) {
   try {
     ensureJobRuntime(job);
@@ -800,44 +882,15 @@ async function transcribe(job) {
     );
     throwIfCancelled(job);
 
-    updateJob(job, "transcribing", 24, "Creating Saaras v3 Batch job");
-    const audioFileName = `${job.id}.wav`;
-    const init = await sarvamJson(
-      "/speech-to-text/job/v1",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          job_parameters: {
-            model: "saaras:v3",
-            mode: job.mode ?? "codemix",
-            language_code: job.language,
-            with_timestamps: true,
-            with_diarization: false,
-          },
-        }),
-      },
+    const transcript = await runSarvamTranscript(
       job,
+      job.mode ?? "codemix",
     );
-
-    job.sarvamJobId = init.job_id;
-    await uploadAudio(
-      job,
-      init.job_id,
-      audioFileName,
-      path.join(job.directory, "audio.wav"),
-      init.storage_container_type,
+    job.languageCode = resolveTranscriptLanguage(
+      transcript.language_code,
+      job.language,
     );
-    await sarvamJson(
-      `/speech-to-text/job/v1/${encodeURIComponent(init.job_id)}/start`,
-      { method: "POST", body: "{}" },
-      job,
-    );
-
-    updateJob(job, "transcribing", 32, "Saaras is aligning phrases");
-    const status = await waitForSarvamJob(job, init.job_id);
-    const transcript = await downloadTranscript(job, init.job_id, status);
-    job.languageCode = transcript.language_code ?? job.language;
-    job.captions = transcriptToCaptions(transcript);
+    job.captions = transcriptToCaptions(transcript, job.language);
     job.transcriptPath = path.join(job.directory, "transcript.json");
     await writeFile(
       job.transcriptPath,
@@ -847,6 +900,67 @@ async function transcribe(job) {
     let aligned;
     try {
       aligned = await alignTranscriptWithModal(job);
+      if (
+        job.mode === "codemix" &&
+        Number(aligned?.summary?.recoveredWords) > 0
+      ) {
+        try {
+          const displayCaptions = job.captions;
+          updateJob(
+            job,
+            "transcribing",
+            68,
+            "Closing a transcript gap with exact speech",
+          );
+          const verbatimTranscript = await runSarvamTranscript(
+            job,
+            "verbatim",
+            68,
+          );
+          const verbatimCaptions = transcriptToCaptions(
+            verbatimTranscript,
+            job.language,
+          );
+          const recoveredAlignment = await alignTranscriptWithModal(job, {
+            captions: verbatimCaptions,
+            displayCaptions,
+          });
+          aligned = recoveredAlignment;
+          job.languageCode = resolveTranscriptLanguage(
+            verbatimTranscript.language_code,
+            job.language,
+          );
+          await writeFile(
+            job.transcriptPath,
+            JSON.stringify(
+              {
+                display: transcript,
+                acoustic: verbatimTranscript,
+              },
+              null,
+              2,
+            ),
+            "utf8",
+          );
+        } catch (recoveryError) {
+          console.error(
+            JSON.stringify({
+              event: "transcript_gap_recovery_failed",
+              jobId: job.id,
+              message:
+                recoveryError instanceof Error
+                  ? recoveryError.message
+                  : "Unknown recovery error",
+            }),
+          );
+          updateJob(
+            job,
+            "transcribing",
+            76,
+            "Using the primary word alignment",
+          );
+        }
+      }
     } catch (error) {
       const requiresGpu =
         String(process.env.MODAL_ALIGNMENT_REQUIRED ?? "true").toLowerCase() !==

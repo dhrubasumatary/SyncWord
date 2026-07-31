@@ -52,6 +52,9 @@ type AlignmentSummary = {
   waveformAlignedWords: number;
   averageConfidence: number;
   needsReview: number;
+  stableWords?: number;
+  recoveredWords?: number;
+  surfaceWordsReplaced?: number;
 };
 
 type JobStatus =
@@ -1154,10 +1157,14 @@ export default function Home() {
                       <small>WORD SYNC</small>
                       <strong>
                         {alignment?.totalWords ?? 0} words ·{" "}
-                        {Math.round(
-                          (alignment?.averageConfidence ?? 0) * 100,
-                        )}
-                        % confidence
+                        {alignment?.stableWords ??
+                          Math.max(
+                            0,
+                            (alignment?.totalWords ?? 0) -
+                              (alignment?.needsReview ?? 0),
+                          )}
+                        {" "}
+                        stable
                       </strong>
                     </div>
                     <span>
@@ -1203,7 +1210,7 @@ export default function Home() {
                       <button
                         key={word.id}
                         className={`${index === selectedWordIndex ? "active" : ""} ${
-                          word.confidence < 0.62 ? "review" : ""
+                          word.confidence < 0.35 ? "review" : ""
                         }`}
                         onClick={() => {
                           setSelectedWordIndex(index);
