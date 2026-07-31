@@ -20,10 +20,10 @@ import modal
 
 
 MODEL_CARD = "MMS_FA"
-REVISION = "mms-fa-continuous-utterance-v12"
-MAX_CAPTION_WINDOW_SECONDS = 30.0
-ALIGNMENT_PADDING_SECONDS = 2.4
-MAX_CONTINUOUS_GROUP_SECONDS = 55.0
+REVISION = "mms-fa-speech-windows-v13"
+MAX_CAPTION_WINDOW_SECONDS = 13.0
+ALIGNMENT_PADDING_SECONDS = 1.2
+MAX_CONTINUOUS_GROUP_SECONDS = 13.0
 MODEL_CACHE_PATH = Path("/root/.cache/torch")
 MODEL_CACHE = modal.Volume.from_name(
     "syncword-mms-fa-cache",
@@ -1075,8 +1075,20 @@ def _continuous_caption_groups(
             caption,
             str(caption.get("text", "")),
         )
+        first_segment = str(
+            first.get("_source_segment_id", "")
+        ).strip()
+        next_segment = str(
+            caption.get("_source_segment_id", "")
+        ).strip()
+        same_source_segment = (
+            not first_segment
+            or not next_segment
+            or first_segment == next_segment
+        )
         if (
             same_language
+            and same_source_segment
             and gap <= 2.0
             and combined_duration <= MAX_CONTINUOUS_GROUP_SECONDS
         ):

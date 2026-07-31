@@ -96,7 +96,13 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /with_timestamps: true/);
   assert.match(renderServer, /alignTranscriptWithModal/);
   assert.match(renderServer, /summary: result\.alignment/);
-  assert.match(renderServer, /runSarvamTranscript\(\s*job,\s*"verbatim"/);
+  assert.match(
+    renderServer,
+    /runPreferredSarvamTranscript\(\s*job,\s*"verbatim"/,
+  );
+  assert.match(renderServer, /silencedetect=noise=-35dB:d=0\.22/);
+  assert.match(renderServer, /\/speech-to-text/);
+  assert.match(renderServer, /Automatic timing could not lock onto this voice/);
   assert.match(renderServer, /displayCaptions/);
   assert.match(renderServer, /transcript_gap_recovery_failed/);
   assert.match(renderServer, /chooseBetterAlignment/);
@@ -136,6 +142,8 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(modalAligner, /surfaceWordsReplaced/);
   assert.match(modalAligner, /_split_long_caption/);
   assert.match(modalAligner, /_continuous_caption_groups/);
+  assert.match(modalAligner, /mms-fa-speech-windows-v13/);
+  assert.match(modalAligner, /same_source_segment/);
   assert.match(modalAligner, /_trim_recovery_word_end/);
   assert.match(modalAligner, /alignmentComplete/);
   assert.doesNotMatch(

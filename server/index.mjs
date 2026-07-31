@@ -34,6 +34,11 @@ import {
   canHighlightGroup,
   chooseBetterAlignment,
 } from "../shared/caption-quality.mjs";
+import {
+  combineSegmentTranscripts,
+  parseSilenceIntervals,
+  planSpeechSegments,
+} from "./speech-segments.mjs";
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
@@ -444,6 +449,42 @@ function runCapture(command, args, options = {}) {
   });
 }
 
+function runCaptureStreams(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const { job, ...spawnOptions } = options;
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      ...spawnOptions,
+    });
+    trackChild(job, child);
+    let output = "";
+    let errorOutput = "";
+    child.stdout.on("data", (chunk) => {
+      output = `${output}${chunk.toString()}`.slice(-24_000);
+    });
+    child.stderr.on("data", (chunk) => {
+      errorOutput = `${errorOutput}${chunk.toString()}`.slice(-24_000);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (job && isCancelled(job)) {
+        reject(cancelledError());
+        return;
+      }
+      if (code === 0) {
+        resolve({ stdout: output, stderr: errorOutput });
+      } else {
+        reject(
+          new Error(
+            `${command} exited with code ${code}. ${errorOutput}`.trim(),
+          ),
+        );
+      }
+    });
+  });
+}
+
 async function probeVideo(job) {
   const output = await runCapture(
     process.env.FFPROBE_PATH ?? "ffprobe",
@@ -632,6 +673,7 @@ function transcriptToCaptions(transcript, requestedLanguage = "unknown") {
     timestamps?.end_times ??
     timestamps?.ends ??
     [];
+  const sourceSegmentIds = timestamps?.source_segment_ids ?? [];
 
   if (
     Array.isArray(chunks) &&
@@ -646,6 +688,13 @@ function transcriptToCaptions(transcript, requestedLanguage = "unknown") {
         end: Number(ends[index]),
         text: String(text).trim(),
         language: captionLanguage,
+        ...(sourceSegmentIds[index]
+          ? {
+              _source_segment_id: String(sourceSegmentIds[index]),
+              _alignment_padding_before: 0.45,
+              _alignment_padding_after: 0.45,
+            }
+          : {}),
       }))
       .filter(
         (caption) =>
@@ -681,6 +730,276 @@ function transcriptToCaptions(transcript, requestedLanguage = "unknown") {
   throw new Error(
     "Sarvam returned a transcript without usable chunk timestamps.",
   );
+}
+
+async function prepareSpeechSegments(job) {
+  if (Array.isArray(job.speechSegments) && job.speechSegments.length) {
+    return job.speechSegments;
+  }
+
+  const duration = Number(job.video?.duration);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error("The video duration is unavailable for speech timing.");
+  }
+  const detected = await runCaptureStreams(
+    process.env.FFMPEG_PATH ?? "ffmpeg",
+    [
+      "-hide_banner",
+      "-nostats",
+      "-i",
+      "audio.wav",
+      "-af",
+      "silencedetect=noise=-35dB:d=0.22",
+      "-f",
+      "null",
+      "-",
+    ],
+    { cwd: job.directory, job },
+  );
+  const silences = parseSilenceIntervals(detected.stderr, duration);
+  const plan = planSpeechSegments(duration, silences);
+
+  for (const [index, segment] of plan.entries()) {
+    const fileName = `speech-segment-${index + 1}.wav`;
+    await run(
+      process.env.FFMPEG_PATH ?? "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        String(segment.start),
+        "-t",
+        String(segment.duration),
+        "-i",
+        "audio.wav",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        fileName,
+      ],
+      { cwd: job.directory, job },
+    );
+    segment.fileName = fileName;
+  }
+
+  job.speechSegments = plan;
+  console.info(
+    JSON.stringify({
+      event: "speech_segments_ready",
+      jobId: job.id,
+      durationSeconds: duration,
+      silenceCount: silences.length,
+      segmentCount: plan.length,
+      segments: plan.map(({ start, end, duration: segmentDuration }) => ({
+        start,
+        end,
+        duration: segmentDuration,
+      })),
+    }),
+  );
+  void persistJob(job);
+  return plan;
+}
+
+async function sarvamRestTranscript(job, segment, mode) {
+  const apiKey = process.env.SARVAM_API_KEY;
+  if (!apiKey && sarvamBaseUrl === "https://api.sarvam.ai") {
+    throw new Error(
+      "SARVAM_API_KEY is not configured on the render service.",
+    );
+  }
+
+  const audio = await readFile(path.join(job.directory, segment.fileName));
+  const payload = new FormData();
+  payload.append(
+    "file",
+    new Blob([audio], { type: "audio/wav" }),
+    segment.fileName,
+  );
+  payload.append("model", "saaras:v3");
+  payload.append("mode", mode);
+  payload.append("language_code", job.language);
+  payload.append("with_timestamps", "true");
+
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    throwIfCancelled(job);
+    const response = await fetch(`${sarvamBaseUrl}/speech-to-text`, {
+      method: "POST",
+      headers: {
+        ...(apiKey ? { "api-subscription-key": apiKey } : {}),
+      },
+      body: payload,
+      signal: ensureJobRuntime(job).abortController.signal,
+    });
+    throwIfCancelled(job);
+    const text = await response.text();
+    let result;
+    try {
+      result = text ? JSON.parse(text) : {};
+    } catch {
+      result = { detail: text };
+    }
+    if (response.ok) return result;
+
+    const reason =
+      result?.detail ??
+      result?.message ??
+      result?.error_message ??
+      `Sarvam REST returned ${response.status}`;
+    lastError = new Error(
+      typeof reason === "string" ? reason : JSON.stringify(reason),
+    );
+    if (
+      ![429, 500, 502, 503, 504].includes(response.status) ||
+      attempt === 2
+    ) {
+      throw lastError;
+    }
+    await sleep(700 * 2 ** attempt);
+  }
+  throw lastError ?? new Error("Sarvam REST transcription failed.");
+}
+
+async function runSegmentedSarvamTranscript(
+  job,
+  mode,
+  progressFloor = 24,
+) {
+  updateJob(
+    job,
+    "transcribing",
+    progressFloor,
+    mode === "verbatim"
+      ? "Double-checking difficult speech"
+      : "Listening section by section",
+  );
+  const segments = await prepareSpeechSegments(job);
+  const results = new Array(segments.length);
+  const concurrency = Math.max(
+    1,
+    Math.min(3, Number(process.env.SARVAM_SEGMENT_CONCURRENCY ?? 2)),
+  );
+  let nextIndex = 0;
+  let completed = 0;
+
+  async function worker() {
+    while (nextIndex < segments.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const segment = segments[index];
+      const response = await sarvamRestTranscript(job, segment, mode);
+      let captions = [];
+      if (String(response?.transcript ?? "").trim()) {
+        try {
+          captions = transcriptToCaptions(response, job.language);
+        } catch {
+          captions = [
+            {
+              id: `${segment.id}-phrase`,
+              start: 0,
+              end: segment.duration,
+              text: String(response.transcript).trim(),
+              language: languageTag(
+                resolveTranscriptLanguage(
+                  response.language_code,
+                  job.language,
+                ),
+              ),
+            },
+          ];
+        }
+      }
+      results[index] = {
+        segment,
+        languageCode: resolveTranscriptLanguage(
+          response.language_code,
+          job.language,
+        ),
+        captions,
+        response,
+      };
+      completed += 1;
+      updateJob(
+        job,
+        "transcribing",
+        Math.min(
+          67,
+          Math.max(
+            progressFloor,
+            progressFloor +
+              Math.floor((completed / Math.max(1, segments.length)) * 35),
+          ),
+        ),
+        mode === "verbatim"
+          ? "Double-checking difficult speech"
+          : "Building accurate speech windows",
+      );
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, segments.length) },
+      () => worker(),
+    ),
+  );
+  const combined = combineSegmentTranscripts(results, job.language);
+  if (!combined.timestamps.words.length) {
+    throw new Error("No spoken captions were found in this video.");
+  }
+  console.info(
+    JSON.stringify({
+      event: "segmented_transcript_ready",
+      jobId: job.id,
+      mode,
+      segmentCount: segments.length,
+      phraseCount: combined.timestamps.words.length,
+      transcriptCharacters: combined.transcript.length,
+    }),
+  );
+  return combined;
+}
+
+async function runPreferredSarvamTranscript(
+  job,
+  mode,
+  progressFloor = 24,
+) {
+  const segmentedEnabled =
+    String(process.env.SARVAM_SEGMENTED_STT ?? "true").toLowerCase() !==
+    "false";
+  if (segmentedEnabled) {
+    try {
+      job.sarvamTransport = "rest-segmented";
+      return await runSegmentedSarvamTranscript(job, mode, progressFloor);
+    } catch (error) {
+      if (isCancelled(job)) throw error;
+      console.error(
+        JSON.stringify({
+          event: "segmented_transcript_failed",
+          jobId: job.id,
+          mode,
+          message:
+            error instanceof Error ? error.message : "Unknown REST error",
+        }),
+      );
+      updateJob(
+        job,
+        "transcribing",
+        progressFloor,
+        "Retrying the speech safely",
+      );
+    }
+  }
+  job.sarvamTransport = "batch";
+  return runSarvamTranscript(job, mode, progressFloor);
 }
 
 async function downloadTranscript(job, sarvamJobId, status) {
@@ -892,7 +1211,7 @@ async function transcribe(job) {
     );
     throwIfCancelled(job);
 
-    const transcript = await runSarvamTranscript(
+    const transcript = await runPreferredSarvamTranscript(
       job,
       job.mode ?? "codemix",
     );
@@ -929,7 +1248,7 @@ async function transcribe(job) {
             68,
             "Double-checking difficult speech",
           );
-          const verbatimTranscript = await runSarvamTranscript(
+          const verbatimTranscript = await runPreferredSarvamTranscript(
             job,
             "verbatim",
             68,
@@ -1059,9 +1378,22 @@ async function transcribe(job) {
       highlightSafeWords: timingQuality.safeWords,
       phraseTimedWords: timingQuality.phraseTimedWords,
       qualityScore: timingQuality.score,
+      transcriptTransport: job.sarvamTransport,
       transcriptRecoveryAttempted,
       transcriptRecoverySelected,
     };
+    if (
+      timingQuality.totalWords >= 4 &&
+      (
+        timingQuality.score < 0.2 ||
+        timingQuality.safeRatio < 0.25 ||
+        timingQuality.averageConfidence < 0.2
+      )
+    ) {
+      throw new Error(
+        "Automatic timing could not lock onto this voice. No inaccurate caption track was created; try a cleaner clip or a different language choice.",
+      );
+    }
     console.info(
       JSON.stringify({
         event: "caption_job_ready",
@@ -1077,6 +1409,7 @@ async function transcribe(job) {
         averageConfidence: Number(
           aligned?.summary?.averageConfidence ?? 0,
         ),
+        transcriptTransport: job.sarvamTransport,
         transcriptRecoveryAttempted,
         transcriptRecoverySelected,
       }),

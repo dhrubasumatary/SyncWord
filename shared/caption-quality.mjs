@@ -118,6 +118,8 @@ export function alignmentQualityReport(alignment) {
     phraseTimedWords: Math.max(0, totalWords - safeWords),
     severeWords,
     safeRatio: Number(safeRatio.toFixed(3)),
+    severeRatio: Number(severeRatio.toFixed(3)),
+    averageConfidence: Number(averageConfidence.toFixed(3)),
     score: Number(score.toFixed(3)),
     recoveryRecommended:
       totalWords > 0 &&
