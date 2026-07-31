@@ -10,6 +10,7 @@ COPY server/package.json server/package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY server ./server
+COPY shared ./shared
 
 ENV PORT=8787
 ENV CAPTION_FONTS_DIR=/usr/share/fonts/truetype/noto

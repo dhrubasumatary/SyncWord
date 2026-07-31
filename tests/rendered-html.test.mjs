@@ -56,11 +56,13 @@ test("server-renders the SyncWord editor", async () => {
 });
 
 test("removes the disposable starter and wires product metadata", async () => {
-  const [page, layout, packageJson, renderServer] = await Promise.all([
+  const [page, layout, packageJson, renderServer, renderDockerfile] =
+    await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../server/index.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../server/Dockerfile", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /SyncWord/);
@@ -97,6 +99,7 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /phraseTimedWords/);
   assert.match(renderServer, /canHighlightGroup/);
   assert.match(renderServer, /perceptual-gate-v1/);
+  assert.match(renderDockerfile, /COPY shared \.\/shared/);
   assert.doesNotMatch(
     renderServer,
     /if \(job\.status === "ready"\) \{\s*await renderVideo/,
