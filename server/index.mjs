@@ -28,6 +28,12 @@ import {
   resolveTranscriptLanguage,
 } from "./transcript-language.mjs";
 import { alignTranscriptWords } from "./word-aligner.mjs";
+import {
+  alignmentQualityReport,
+  annotateTimingSafety,
+  canHighlightGroup,
+  chooseBetterAlignment,
+} from "../shared/caption-quality.mjs";
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
@@ -583,8 +589,8 @@ async function waitForSarvamJob(
         Math.max(progressFloor, 31 + Math.floor(attempt / 3)),
       ),
       state === "running"
-        ? "Saaras is aligning phrases"
-        : "Waiting for Saaras Batch",
+        ? "Finding the spoken phrases"
+        : "Creating captions from the speech",
     );
 
     if (["completed", "partiallycompleted"].includes(state)) return status;
@@ -759,7 +765,7 @@ async function alignTranscriptWithModal(
     job,
     "transcribing",
     76,
-    "Locking every word to GPU acoustic frames",
+    "Syncing captions to the voice",
   );
   const response = await fetch(endpoint, {
     method: "POST",
@@ -804,7 +810,9 @@ async function runSarvamTranscript(job, mode, progressFloor = 24) {
     job,
     "transcribing",
     progressFloor,
-    `Creating Saaras ${mode} transcript`,
+    mode === "verbatim"
+      ? "Double-checking difficult speech"
+      : "Creating captions from the speech",
   );
   const audioFileName = `${job.id}-${mode}.wav`;
   const init = await sarvamJson(
@@ -843,7 +851,7 @@ async function runSarvamTranscript(job, mode, progressFloor = 24) {
     job,
     "transcribing",
     Math.max(32, progressFloor),
-    "Saaras is aligning phrases",
+    "Finding the spoken phrases",
   );
   const status = await waitForSarvamJob(
     job,
@@ -898,19 +906,26 @@ async function transcribe(job) {
       "utf8",
     );
     let aligned;
+    let transcriptRecoveryAttempted = false;
+    let transcriptRecoverySelected = false;
     try {
       aligned = await alignTranscriptWithModal(job);
+      const primaryQuality = alignmentQualityReport(aligned);
       if (
         job.mode === "codemix" &&
-        Number(aligned?.summary?.recoveredWords) > 0
+        (
+          Number(aligned?.summary?.recoveredWords) > 0 ||
+          primaryQuality.recoveryRecommended
+        )
       ) {
+        transcriptRecoveryAttempted = true;
         try {
           const displayCaptions = job.captions;
           updateJob(
             job,
             "transcribing",
             68,
-            "Closing a transcript gap with exact speech",
+            "Double-checking difficult speech",
           );
           const verbatimTranscript = await runSarvamTranscript(
             job,
@@ -925,17 +940,37 @@ async function transcribe(job) {
             captions: verbatimCaptions,
             displayCaptions,
           });
-          aligned = recoveredAlignment;
-          job.languageCode = resolveTranscriptLanguage(
-            verbatimTranscript.language_code,
-            job.language,
+          const recoveryQuality =
+            alignmentQualityReport(recoveredAlignment);
+          const selection = chooseBetterAlignment(
+            aligned,
+            recoveredAlignment,
           );
+          aligned = selection.alignment;
+          transcriptRecoverySelected = selection.selected === "recovery";
+          if (transcriptRecoverySelected) {
+            job.languageCode = resolveTranscriptLanguage(
+              verbatimTranscript.language_code,
+              job.language,
+            );
+          }
+          const displayQualitySummary = { ...primaryQuality };
+          const acousticQualitySummary = { ...recoveryQuality };
+          delete displayQualitySummary.captions;
+          delete acousticQualitySummary.captions;
           await writeFile(
             job.transcriptPath,
             JSON.stringify(
               {
                 display: transcript,
                 acoustic: verbatimTranscript,
+                selected: transcriptRecoverySelected
+                  ? "acoustic"
+                  : "display",
+                quality: {
+                  display: displayQualitySummary,
+                  acoustic: acousticQualitySummary,
+                },
               },
               null,
               2,
@@ -957,7 +992,7 @@ async function transcribe(job) {
             job,
             "transcribing",
             76,
-            "Using the primary word alignment",
+            "Using the clearest caption timing",
           );
         }
       }
@@ -980,7 +1015,7 @@ async function transcribe(job) {
         job,
         "transcribing",
         76,
-        "Using local acoustic alignment",
+        "Finishing caption timing",
       );
       await run(
         process.env.FFMPEG_PATH ?? "ffmpeg",
@@ -1010,21 +1045,26 @@ async function transcribe(job) {
         { sampleRate: 16_000, frameMs: 20 },
       );
     }
-    job.captions = aligned.captions;
+    job.captions = annotateTimingSafety(aligned.captions);
     job.captions = stitchShortCaptionPhrases(job.captions);
-    job.alignment = aligned.summary;
-    const estimatedWords = Math.max(
-      0,
-      Number(aligned.summary.totalWords ?? 0) -
-        Number(aligned.summary.waveformAlignedWords ?? 0),
-    );
+    const timingQuality = alignmentQualityReport({
+      ...aligned,
+      captions: job.captions,
+    });
+    job.captions = timingQuality.captions;
+    job.alignment = {
+      ...aligned.summary,
+      highlightSafeWords: timingQuality.safeWords,
+      phraseTimedWords: timingQuality.phraseTimedWords,
+      qualityScore: timingQuality.score,
+      transcriptRecoveryAttempted,
+      transcriptRecoverySelected,
+    };
     updateJob(
       job,
       "ready",
       82,
-      estimatedWords
-        ? `${estimatedWords} words need timing review before export`
-        : `${aligned.summary.totalWords} words aligned · ${aligned.summary.needsReview} need review`,
+      "Captions ready to edit",
     );
   } catch (error) {
     if (isCancelled(job)) return;
@@ -1165,7 +1205,15 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
               ],
             ];
       return groups.flatMap((words) => {
-        if (!Array.isArray(caption.words) || !caption.words.length) {
+        if (
+          !Array.isArray(caption.words) ||
+          !caption.words.length ||
+          !canHighlightGroup(words)
+        ) {
+          const phraseText = words
+            .map((word) => String(word.text ?? "").trim())
+            .filter(Boolean)
+            .join(" ");
           return `Dialogue: 0,${assTime(words[0].start)},${assTime(
             words.at(-1).end,
           )},Default,,0,0,0,,${animationTag(
@@ -1173,7 +1221,7 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
             style.position,
             playResX,
             playResY,
-          )}${escapeAssText(words[0].text, style.uppercaseEnglish)}`;
+          )}${escapeAssText(phraseText, style.uppercaseEnglish)}`;
         }
 
         return words.map((activeWord, activeIndex) => {
@@ -1234,7 +1282,7 @@ async function renderVideo(job, captions, style) {
   try {
     ensureJobRuntime(job);
     throwIfCancelled(job);
-    updateJob(job, "rendering", 82, "Writing styled ASS captions");
+    updateJob(job, "rendering", 82, "Preparing your caption style");
     job.captions = captions;
     job.style = style;
     job.assPath = path.join(job.directory, "captions.ass");
@@ -1253,7 +1301,7 @@ async function renderVideo(job, captions, style) {
       : "";
     job.outputPath = path.join(job.directory, "captioned.mp4");
 
-    updateJob(job, "rendering", 88, "Burning captions with ffmpeg");
+    updateJob(job, "rendering", 88, "Adding captions to your video");
     await run(
       process.env.FFMPEG_PATH ?? "ffmpeg",
       [
@@ -1367,6 +1415,7 @@ app.get("/health", (_request, response) => {
   response.json({
     ok: true,
     service: "syncword-render",
+    captionQualityRevision: "perceptual-gate-v1",
     sarvamConfigured: Boolean(process.env.SARVAM_API_KEY),
     modalAlignerConfigured: Boolean(modalAlignerEndpoint()),
     ffmpeg: process.env.FFMPEG_PATH ?? "ffmpeg",

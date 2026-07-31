@@ -44,10 +44,10 @@ test("server-renders the SyncWord editor", async () => {
   assert.match(html, /Fix\. Export\./);
   assert.match(html, /Upload your reel/);
   assert.match(html, /3 min \/ 90 MB/);
-  assert.match(html, /GPU CTC alignment/);
-  assert.match(html, /No mock transcript/);
-  assert.match(html, /No render while you edit/);
-  assert.match(html, /ASS/);
+  assert.match(html, /We create captions from the speech/);
+  assert.match(html, /Tap any sentence or word/);
+  assert.match(html, /original video stays untouched/);
+  assert.match(html, /Export when the preview looks right/);
   assert.doesNotMatch(
     html,
     /মোৰ ভাষা|आंनि राव|brahmaputra-stories|MAJULI/i,
@@ -65,8 +65,6 @@ test("removes the disposable starter and wires product metadata", async () => {
 
   assert.match(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
-  assert.match(page, /Advanced SubStation Alpha/);
-  assert.match(page, /Whole-word ASS hits/);
   assert.match(page, /Exact speech/);
   assert.match(page, /Loop this word/);
   assert.match(page, /Caption text/);
@@ -74,7 +72,8 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(page, /Word start/);
   assert.match(page, /Phrase 100 ms/);
   assert.match(page, /Done with this word/);
-  assert.match(page, /Preview looks right — render anyway/);
+  assert.match(page, /Preview looks right — render/);
+  assert.match(page, /reliable words animate · uncertain lines stay steady/);
   assert.doesNotMatch(
     page,
     /initialCaptions|demoDuration|importSrt|Download SRT|distributeWords/,
@@ -94,7 +93,10 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /runSarvamTranscript\(\s*job,\s*"verbatim"/);
   assert.match(renderServer, /displayCaptions/);
   assert.match(renderServer, /transcript_gap_recovery_failed/);
-  assert.match(renderServer, /words need timing review before export/);
+  assert.match(renderServer, /chooseBetterAlignment/);
+  assert.match(renderServer, /phraseTimedWords/);
+  assert.match(renderServer, /canHighlightGroup/);
+  assert.match(renderServer, /perceptual-gate-v1/);
   assert.doesNotMatch(
     renderServer,
     /if \(job\.status === "ready"\) \{\s*await renderVideo/,

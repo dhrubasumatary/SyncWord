@@ -7,6 +7,10 @@ import {
   useSyncExternalStore,
   type CSSProperties,
 } from "react";
+import {
+  canHighlightGroup,
+  canHighlightWord,
+} from "../shared/caption-quality.mjs";
 
 type WordTiming = {
   id: string;
@@ -14,6 +18,8 @@ type WordTiming = {
   start: number;
   end: number;
   confidence: number;
+  highlightSafe?: boolean;
+  highlightReason?: string;
   source:
     | "mms-fa"
     | "mms-fa-star"
@@ -58,6 +64,11 @@ type AlignmentSummary = {
   alignmentComplete?: boolean;
   recoveredWords?: number;
   surfaceWordsReplaced?: number;
+  highlightSafeWords?: number;
+  phraseTimedWords?: number;
+  qualityScore?: number;
+  transcriptRecoveryAttempted?: boolean;
+  transcriptRecoverySelected?: boolean;
 };
 
 type JobStatus =
@@ -341,19 +352,12 @@ function isAlignedCaption(value: unknown): value is Caption {
 }
 
 function isReviewCandidate(word: WordTiming) {
-  return (
-    word.confidence < 0.35 ||
-    !["mms-fa", "manual"].includes(word.source)
-  );
+  return word.highlightReason === "invalid_boundary";
 }
 
 function confidenceLabel(word: WordTiming) {
-  if (word.source === "manual") return "Adjusted";
-  if (word.source === "mms-fa-star") return "Recovered";
-  if (word.source === "speech-window-review") return "Boundary";
-  if (word.source === "grapheme-prior") return "Estimated";
-  if (word.confidence < 0.35) return "Check";
-  return "Aligned";
+  if (word.source === "manual") return "Your timing";
+  return canHighlightWord(word) ? "Word animation" : "Phrase timing";
 }
 
 export default function Home() {
@@ -470,11 +474,14 @@ export default function Home() {
           currentTime < group[group.length - 1].end,
       ) ?? []
     : [];
-  const activeWord = activeWordGroup.find((word, index) => {
-    const displayEnd =
-      activeWordGroup[index + 1]?.start ?? word.end;
-    return currentTime >= word.start && currentTime < displayEnd;
-  });
+  const activeGroupUsesWordSync = canHighlightGroup(activeWordGroup);
+  const activeWord = activeGroupUsesWordSync
+    ? activeWordGroup.find((word, index) => {
+        const displayEnd =
+          activeWordGroup[index + 1]?.start ?? word.end;
+        return currentTime >= word.start && currentTime < displayEnd;
+      })
+    : undefined;
   const selectedGlobalIndex = selectedItem?.globalIndex ?? -1;
   const previousGlobalWord =
     selectedGlobalIndex > 0 ? flatWords[selectedGlobalIndex - 1]?.word : null;
@@ -604,10 +611,10 @@ export default function Home() {
         }
         if (next.status === "ready") {
           setTab("review");
-          setToast("Sync preview ready. Review the flagged words.");
+          setToast("Captions ready. Play through and edit anything.");
         } else if (next.status === "complete") {
           setTab("export");
-          setToast("Final ASS-burned MP4 is ready.");
+          setToast("Your final video is ready to download.");
         } else if (["failed", "cancelled"].includes(next.status)) {
           setToast(next.message ?? "Processing failed.");
         }
@@ -715,7 +722,7 @@ export default function Home() {
         if (!response.ok) throw new Error(data.error ?? "Upload failed.");
       }
       setJob(data);
-      setToast("Upload complete. Building the sync preview—no render yet.");
+      setToast("Upload complete. Creating editable captions.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Upload failed.");
     } finally {
@@ -851,7 +858,7 @@ export default function Home() {
       selectReviewItem(next, true);
     } else {
       setLoopRange(null);
-      setToast("Sync check complete. Choose a caption style.");
+      setToast("Captions ready. Choose a style.");
       setTab("style");
     }
   };
@@ -869,10 +876,10 @@ export default function Home() {
     setLoopRange(null);
     if (next) {
       selectReviewItem(next, true);
-      setToast("Approved. Playing the next flagged word.");
+      setToast("Saved. Playing the next caption.");
     } else {
       videoRef.current?.pause();
-      setToast("Every flagged word is handled. Style when you are ready.");
+      setToast("Captions are ready. Choose a style when you are happy.");
     }
   };
 
@@ -1114,11 +1121,7 @@ export default function Home() {
     }
     if (unresolvedItems.length && !allowUnresolved) {
       setTab("export");
-      setToast(
-        `${unresolvedItems.length} flagged word${
-          unresolvedItems.length === 1 ? "" : "s"
-        } still need a decision.`,
-      );
+      setToast("One caption needs a quick playback check.");
       return;
     }
     setUploading(true);
@@ -1148,7 +1151,7 @@ export default function Home() {
       });
       setHasChanges(false);
       setTab("export");
-      setToast("Final render started. Your reviewed timing is locked.");
+      setToast("Final render started. You can download it when it finishes.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Render failed.");
     } finally {
@@ -1224,14 +1227,12 @@ export default function Home() {
     }
     if (tab === "review") {
       return unresolvedItems.length
-        ? `Review ${unresolvedItems.length} flagged word${
-            unresolvedItems.length === 1 ? "" : "s"
-          }`
+        ? "Open captions"
         : "Continue to style";
     }
     if (tab === "style") return "Continue to export";
     if (job.status === "ready" && unresolvedItems.length) {
-      return `Review ${unresolvedItems.length} words before render`;
+      return "Open captions";
     }
     if (job.status === "ready") return "Render final video";
     if (job.status === "complete" && hasChanges) return "Update final video";
@@ -1382,28 +1383,28 @@ export default function Home() {
             <li>
               <b>01</b>
               <div>
-                <strong>Hear</strong>
-                <span>Saaras v3 builds the real code-mixed transcript</span>
+                <strong>Add</strong>
+                <span>We create captions from the speech in your reel</span>
               </div>
             </li>
             <li>
               <b>02</b>
               <div>
-                <strong>Verify</strong>
-                <span>GPU CTC alignment flags only uncertain word timing</span>
+                <strong>Fix</strong>
+                <span>Tap any sentence or word and change it</span>
               </div>
             </li>
             <li>
               <b>03</b>
               <div>
-                <strong>Export</strong>
-                <span>ASS styling burns once after you approve the preview</span>
+                <strong>Post</strong>
+                <span>Export when the preview looks right to you</span>
               </div>
             </li>
           </ol>
 
           <p className="truth-line">
-            No mock transcript. No render while you edit. No surprise timing.
+            Your original video stays untouched until you export.
           </p>
         </section>
       ) : (
@@ -1465,7 +1466,9 @@ export default function Home() {
 
               {!showingFinal && activeWordGroup.length > 0 && (
                 <div
-                  className={`live-caption ${captionStyle.animation}`}
+                  className={`live-caption ${captionStyle.animation} ${
+                    activeGroupUsesWordSync ? "word-sync" : "phrase-sync"
+                  }`}
                   aria-live="off"
                 >
                   {activeWordGroup.map((word) => (
@@ -1492,8 +1495,8 @@ export default function Home() {
                   <strong>{job?.message ?? "Uploading your reel"}</strong>
                   <small>
                     {job?.status === "rendering"
-                      ? "Your timing is locked. We are burning the final ASS captions now."
-                      : "We are building an editable sync preview. FFmpeg has not started."}
+                      ? "Creating the downloadable video now."
+                      : "The editor will open automatically when the captions are ready."}
                   </small>
                   <button
                     className="cancel-processing"
@@ -1604,8 +1607,8 @@ export default function Home() {
                       : "Building your editable preview."}
                   </h2>
                   <p>
-                    Saaras creates the phrases. Multilingual GPU acoustic frames
-                    place every word. Rendering waits for you.
+                    Listening to the reel and preparing captions you can change
+                    before anything is exported.
                   </p>
                   {job && (
                     <div className="waiting-progress">
@@ -1622,13 +1625,9 @@ export default function Home() {
                 <div className="review-panel">
                   <div className="review-heading">
                     <div>
-                      <small>AUTO CAPTIONS</small>
-                      <h2>
-                        Edit what people will read.
-                      </h2>
-                      <p>
-                        Tap a caption, fix the text, then play it back.
-                      </p>
+                      <small>CAPTIONS</small>
+                      <h2>Edit while the video plays.</h2>
+                      <p>Tap a line or word to change it.</p>
                     </div>
                     <div
                       className="review-score"
@@ -1642,10 +1641,10 @@ export default function Home() {
                   </div>
 
                   {unresolvedItems.length > 0 ? (
-                    <div className="issue-queue" aria-label="Words to review">
+                    <div className="issue-queue" aria-label="Captions to check">
                       <div className="section-label">
-                      <span>Check suggested</span>
-                        <small>{unresolvedItems.length} words</small>
+                        <span>Playback check</span>
+                        <small>{unresolvedItems.length}</small>
                       </div>
                       <div>
                         {unresolvedItems.map((item) => (
@@ -1662,10 +1661,7 @@ export default function Home() {
                             }
                           >
                             <span>{item.word.text}</span>
-                            <small>
-                              {Math.round(item.word.confidence * 100)}% ·{" "}
-                              {preciseTime(item.word.start)}
-                            </small>
+                            <small>{preciseTime(item.word.start)}</small>
                           </button>
                         ))}
                       </div>
@@ -1674,10 +1670,10 @@ export default function Home() {
                     <div className="all-clear-card">
                       <i>✓</i>
                       <div>
-                        <strong>Sync check complete</strong>
+                        <strong>Captions ready</strong>
                         <span>
-                          Your original video is still untouched. Styling is
-                          instant.
+                          Play through them and change anything that sounds
+                          wrong.
                         </span>
                       </div>
                       <button onClick={() => setTab("style")}>Style captions</button>
@@ -1763,7 +1759,9 @@ export default function Home() {
                           {preciseTime(selectedWord.start)}–{preciseTime(selectedWord.end)}
                         </small>
                       </span>
-                      <b>{Math.round(selectedWord.confidence * 100)}%</b>
+                      <b>
+                        {canHighlightWord(selectedWord) ? "WORD" : "LINE"}
+                      </b>
                     </button>
 
                     <details
@@ -1959,16 +1957,15 @@ export default function Home() {
                   </div>
 
                   <div className="alignment-truth">
-                    <span>Alignment report</span>
+                    <span>Caption playback</span>
                     <div>
                       <strong>
-                        {alignment?.waveformAlignedWords ?? flatWords.length}/
-                        {alignment?.totalWords ?? flatWords.length} acoustic
+                        {alignment?.highlightSafeWords ?? flatWords.length} words
+                        animate individually
                       </strong>
                       <small>
-                        {alignment?.estimatedWords
-                          ? `${alignment.estimatedWords} estimated timing`
-                          : "no silent timing fallback"}
+                        Other lines stay steady instead of showing a drifting
+                        highlight.
                       </small>
                     </div>
                   </div>
@@ -2102,8 +2099,8 @@ export default function Home() {
                     <div>
                       <strong>Original video stays untouched</strong>
                       <span>
-                        The player uses a synchronized HTML overlay. Advanced
-                        SubStation Alpha is generated only when you export.
+                        Every style change appears instantly. The downloadable
+                        video is created only when you export.
                       </span>
                     </div>
                   </div>
@@ -2144,9 +2141,7 @@ export default function Home() {
                           : job?.status === "rendering"
                             ? "Burning the approved cut."
                             : unresolvedItems.length
-                              ? `${unresolvedItems.length} timing decision${
-                                  unresolvedItems.length === 1 ? "" : "s"
-                                } left.`
+                              ? "Give one caption a quick playback check."
                               : "Ready for one clean render."}
                       </h2>
                       <p>
@@ -2154,9 +2149,7 @@ export default function Home() {
                           ? "The player is now showing the real burned-in MP4."
                           : job?.status === "rendering"
                             ? job.message
-                            : unresolvedItems.length
-                              ? "Review the flagged words for the safest result, or export anyway if the preview already feels right."
-                              : "Your transcript, timing, and style are locked. FFmpeg starts only after you confirm."}
+                            : "Your captions and style are ready. The downloadable video starts only after you confirm."}
                       </p>
                     </div>
                   </div>
@@ -2165,25 +2158,23 @@ export default function Home() {
                     <div className="pass">
                       <i>✓</i>
                       <span>
-                        <strong>Transcript ready</strong>
-                        <small>{flatWords.length} words in native script</small>
+                        <strong>Caption text ready</strong>
+                        <small>{flatWords.length} words you can edit</small>
                       </span>
                     </div>
                     <div className={unresolvedItems.length ? "warn" : "pass"}>
                       <i>{unresolvedItems.length ? "!" : "✓"}</i>
                       <span>
-                        <strong>Timing review</strong>
+                        <strong>Caption timing</strong>
                         <small>
-                          {unresolvedItems.length
-                            ? `${unresolvedItems.length} unchecked`
-                            : "all issues handled"}
+                          reliable words animate · uncertain lines stay steady
                         </small>
                       </span>
                     </div>
                     <div className="pass">
                       <i>✓</i>
                       <span>
-                        <strong>ASS style ready</strong>
+                        <strong>Style ready</strong>
                         <small>{captionStyle.animation} · {captionStyle.wordsPerCard} words/card</small>
                       </span>
                     </div>
@@ -2192,15 +2183,15 @@ export default function Home() {
                   <div className="export-spec">
                     <div>
                       <span>Video</span>
-                      <strong>H.264 · AAC · fast start</strong>
+                      <strong>Ready for social apps</strong>
                     </div>
                     <div>
                       <span>Captions</span>
-                      <strong>Advanced SubStation Alpha</strong>
+                      <strong>Burned into the video</strong>
                     </div>
                     <div>
                       <span>Word effect</span>
-                      <strong>Whole-word ASS hits</strong>
+                      <strong>Automatic where reliable</strong>
                     </div>
                     <div>
                       <span>Compatibility</span>
@@ -2215,7 +2206,7 @@ export default function Home() {
                           className="secondary"
                           onClick={goToNextIssue}
                         >
-                          Review {unresolvedItems.length} flagged words
+                          Open caption
                         </button>
                       )}
                       <button
@@ -2225,7 +2216,7 @@ export default function Home() {
                         }
                       >
                         {unresolvedItems.length
-                          ? "Preview looks right — render anyway"
+                          ? "Preview looks right — render"
                           : "Start final render"}
                         <span>→</span>
                       </button>
@@ -2253,7 +2244,7 @@ export default function Home() {
                         <span>↓</span>
                       </button>
                       <button onClick={() => downloadResult("ass")}>
-                        Download source .ASS
+                        Download caption file
                       </button>
                     </div>
                   )}

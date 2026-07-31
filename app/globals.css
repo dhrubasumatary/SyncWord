@@ -654,7 +654,7 @@ button:disabled {
 }
 
 .mobile-review-meter {
-  display: grid;
+  display: none;
   grid-template-columns: minmax(80px, 1fr) auto;
   align-items: center;
   gap: 12px;
