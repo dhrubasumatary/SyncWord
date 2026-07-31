@@ -1056,10 +1056,8 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
         }
 
         return words.map((activeWord, activeIndex) => {
-          const eventEnd = Math.min(
-            words[activeIndex + 1]?.start ?? activeWord.end,
-            activeWord.end,
-          );
+          const eventEnd =
+            words[activeIndex + 1]?.start ?? activeWord.end;
           const text = words
             .map((word, index) => {
               const wordText = escapeAssText(

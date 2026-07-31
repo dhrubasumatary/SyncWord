@@ -37,6 +37,47 @@ test("keeps punctuation as a preferred phrase boundary", () => {
   assert.deepEqual(groups.map((group) => group.length), [4, 4]);
 });
 
+test("starts a fresh card after an audible pause", () => {
+  const source = [
+    { id: "i", text: "I", start: 0, end: 0.18 },
+    { id: "love", text: "love", start: 0.19, end: 0.46 },
+    { id: "you", text: "you", start: 0.47, end: 0.66 },
+    {
+      id: "chatgpt",
+      text: "ChatGPT",
+      start: 0.68,
+      end: 1.08,
+    },
+    {
+      id: "woohoo",
+      text: "woohoo",
+      start: 2.04,
+      end: 2.55,
+    },
+  ];
+
+  const groups = groupWordsForReels(source, 4);
+  assert.deepEqual(
+    groups.map((group) => group.map((word) => word.text)),
+    [["I", "love", "you", "ChatGPT"], ["woohoo"]],
+  );
+});
+
+test("does not split a card across natural articulation gaps", () => {
+  const source = [
+    { id: "one", text: "one", start: 0, end: 0.2 },
+    { id: "two", text: "two", start: 0.48, end: 0.7 },
+    { id: "three", text: "three", start: 0.84, end: 1.1 },
+  ];
+
+  assert.deepEqual(
+    groupWordsForReels(source, 4).map((group) =>
+      group.map((word) => word.text),
+    ),
+    [["one", "two", "three"]],
+  );
+});
+
 test("stitches a one-word Sarvam edge chunk to its nearby phrase", () => {
   const stitched = stitchShortCaptionPhrases([
     {

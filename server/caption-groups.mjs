@@ -148,14 +148,40 @@ function groupPenalty(words, start, end, preferredMaximum) {
   return penalty;
 }
 
+// A visual card should represent one continuous burst of speech. MMS alignment
+// pads word ends slightly, so 520 ms here corresponds to a clearly audible
+// pause without splitting normal articulation gaps.
+const CARD_BREAK_GAP_SECONDS = 0.52;
+
+function splitSpeechBursts(words) {
+  const bursts = [];
+  let burst = [];
+
+  for (const word of words) {
+    const previous = burst.at(-1);
+    const gap =
+      Number(word?.start) - Number(previous?.end);
+    if (
+      previous &&
+      Number.isFinite(gap) &&
+      gap > CARD_BREAK_GAP_SECONDS
+    ) {
+      bursts.push(burst);
+      burst = [];
+    }
+    burst.push(word);
+  }
+
+  if (burst.length) bursts.push(burst);
+  return bursts;
+}
+
 /**
  * Dynamic programming keeps cards balanced around linguistic punctuation.
  * Unlike a greedy max-word split, a five-word phrase becomes 2+3 or 3+2,
  * never 4+1.
  */
-export function groupWordsForReels(words, rawMaximum = 4) {
-  const source = Array.isArray(words) ? words.filter(Boolean) : [];
-  if (!source.length) return [];
+function groupSpeechBurst(source, rawMaximum) {
   if (source.length <= 2) return [source];
 
   const preferredMaximum = Math.round(clamp(Number(rawMaximum) || 4, 2, 7));
@@ -186,4 +212,13 @@ export function groupWordsForReels(words, rawMaximum = 4) {
     end = start;
   }
   return groups;
+}
+
+export function groupWordsForReels(words, rawMaximum = 4) {
+  const source = Array.isArray(words) ? words.filter(Boolean) : [];
+  if (!source.length) return [];
+
+  return splitSpeechBursts(source).flatMap((burst) =>
+    groupSpeechBurst(burst, rawMaximum),
+  );
 }

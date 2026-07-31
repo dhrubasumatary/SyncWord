@@ -242,10 +242,10 @@ async function pingRenderEngine(apiBase: string) {
   }
 }
 
-function groupWordsForReels(words: WordTiming[], maxWords: number) {
-  if (!words.length) return [];
-  if (words.length <= 2) return [words];
+const cardBreakGapSeconds = 0.52;
 
+function groupSpeechBurst(words: WordTiming[], maxWords: number) {
+  if (words.length <= 2) return [words];
   const preferredMaximum = Math.max(2, Math.min(7, Math.round(maxWords)));
   const hardMaximum = Math.min(words.length, preferredMaximum + 1);
   const best = new Array(words.length + 1).fill(Number.POSITIVE_INFINITY);
@@ -301,6 +301,29 @@ function groupWordsForReels(words: WordTiming[], maxWords: number) {
     end = start;
   }
   return groups;
+}
+
+function groupWordsForReels(words: WordTiming[], maxWords: number) {
+  if (!words.length) return [];
+
+  const bursts: WordTiming[][] = [];
+  let burst: WordTiming[] = [];
+  for (const word of words) {
+    const previous = burst.at(-1);
+    if (
+      previous &&
+      word.start - previous.end > cardBreakGapSeconds
+    ) {
+      bursts.push(burst);
+      burst = [];
+    }
+    burst.push(word);
+  }
+  if (burst.length) bursts.push(burst);
+
+  return bursts.flatMap((speechBurst) =>
+    groupSpeechBurst(speechBurst, maxWords),
+  );
 }
 
 function isAlignedCaption(value: unknown): value is Caption {
@@ -394,9 +417,6 @@ export default function Home() {
         currentTime >= caption.start && currentTime < caption.end,
     ) ?? selectedCaption;
   const activeWords = activeCaption?.words ?? [];
-  const activeWord = activeWords.find(
-    (word) => currentTime >= word.start && currentTime < word.end,
-  );
   const activeGroups = groupWordsForReels(
     activeWords,
     captionStyle.wordsPerCard,
@@ -406,8 +426,13 @@ export default function Home() {
         (group) =>
           currentTime >= group[0].start &&
           currentTime < group[group.length - 1].end,
-      ) ?? activeGroups[0]
+      ) ?? []
     : [];
+  const activeWord = activeWordGroup.find((word, index) => {
+    const displayEnd =
+      activeWordGroup[index + 1]?.start ?? word.end;
+    return currentTime >= word.start && currentTime < displayEnd;
+  });
   const alignment = job?.alignment;
 
   const previewStyle = {
@@ -1005,7 +1030,7 @@ export default function Home() {
                 playsInline
               />
 
-              {!showingFinal && activeCaption && (
+              {!showingFinal && activeWordGroup.length > 0 && (
                 <div className="live-caption">
                   {activeWordGroup.map((word) => (
                     <span
