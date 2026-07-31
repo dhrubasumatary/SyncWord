@@ -83,6 +83,7 @@ type JobStatus =
 
 type JobResponse = {
   id: string;
+  captionQualityRevision?: string;
   status: JobStatus;
   progress: number;
   message?: string;
@@ -111,6 +112,8 @@ type ReviewItem = {
 type LoopRange = { start: number; end: number } | null;
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
+const appRevision = "syncword-web-2026-07-31-v21";
+const expectedCaptionQualityRevision = "perceptual-gate-v1";
 
 const defaultStyle: CaptionStyle = {
   fontFamily: "Noto Sans Bengali",
@@ -227,7 +230,7 @@ function clientDelay(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-async function pingRenderEngine(apiBase: string) {
+async function getRenderHealth(apiBase: string) {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 10_000);
   try {
@@ -235,11 +238,13 @@ async function pingRenderEngine(apiBase: string) {
       cache: "no-store",
       signal: controller.signal,
     });
-    if (!response.ok) return false;
-    const payload = (await response.json()) as { ok?: boolean };
-    return payload.ok === true;
+    if (!response.ok) return null;
+    return (await response.json()) as {
+      ok?: boolean;
+      captionQualityRevision?: string;
+    };
   } catch {
-    return false;
+    return null;
   } finally {
     window.clearTimeout(timeout);
   }
@@ -382,6 +387,7 @@ export default function Home() {
   const [engineState, setEngineState] =
     useState<EngineState>("offline");
   const [hasChanges, setHasChanges] = useState(false);
+  const [updateRequired, setUpdateRequired] = useState(false);
   const [toast, setToast] = useState("");
   const [captionDrafts, setCaptionDrafts] = useState<
     Record<string, string>
@@ -523,6 +529,40 @@ export default function Home() {
 
   useEffect(() => {
     let active = true;
+    const checkRevision = async () => {
+      try {
+        const response = await fetch(
+          `/revision.json?check=${Date.now()}`,
+          { cache: "no-store" },
+        );
+        if (!response.ok) return;
+        const payload = (await response.json()) as { revision?: string };
+        if (
+          active &&
+          payload.revision &&
+          payload.revision !== appRevision
+        ) {
+          setUpdateRequired(true);
+        }
+      } catch {
+        // A temporary version-check failure should never block editing.
+      }
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") void checkRevision();
+    };
+    void checkRevision();
+    const interval = window.setInterval(checkRevision, 45_000);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
     if (!apiBase) {
       return () => {
         active = false;
@@ -531,7 +571,19 @@ export default function Home() {
     void (async () => {
       if (active) setEngineState("waking");
       for (let attempt = 0; attempt < 18 && active; attempt += 1) {
-        if (await pingRenderEngine(apiBase)) {
+        const health = await getRenderHealth(apiBase);
+        if (health?.ok) {
+          if (
+            health.captionQualityRevision &&
+            health.captionQualityRevision !==
+              expectedCaptionQualityRevision
+          ) {
+            if (active) {
+              setUpdateRequired(true);
+              setEngineState("offline");
+            }
+            return;
+          }
           if (active) setEngineState("online");
           return;
         }
@@ -577,6 +629,15 @@ export default function Home() {
         if (!response.ok) return;
         setEngineState("online");
         const next = (await response.json()) as JobResponse;
+        if (
+          next.captionQualityRevision &&
+          next.captionQualityRevision !==
+            expectedCaptionQualityRevision
+        ) {
+          setUpdateRequired(true);
+          setToast("SyncWord was updated. Reload before continuing.");
+          return;
+        }
         setJob((current) => ({
           ...next,
           capabilityToken: current?.capabilityToken,
@@ -632,6 +693,10 @@ export default function Home() {
   ]);
 
   const uploadVideo = async (nextFile: File) => {
+    if (updateRequired) {
+      setToast("Reload SyncWord before uploading another video.");
+      return;
+    }
     if (!apiBase) {
       setToast("The processing engine is not connected yet.");
       return;
@@ -642,7 +707,12 @@ export default function Home() {
       setToast("Waking the hobby engine. First use can take a minute.");
       let engineReady = false;
       for (let attempt = 0; attempt < 18; attempt += 1) {
-        if (await pingRenderEngine(apiBase)) {
+        const health = await getRenderHealth(apiBase);
+        if (
+          health?.ok &&
+          health.captionQualityRevision ===
+            expectedCaptionQualityRevision
+        ) {
           engineReady = true;
           setEngineState("online");
           break;
@@ -721,6 +791,13 @@ export default function Home() {
         data = (await response.json()) as JobResponse & { error?: string };
         if (!response.ok) throw new Error(data.error ?? "Upload failed.");
       }
+      if (
+        data.captionQualityRevision &&
+        data.captionQualityRevision !== expectedCaptionQualityRevision
+      ) {
+        setUpdateRequired(true);
+        throw new Error("SyncWord was updated. Reload and upload again.");
+      }
       setJob(data);
       setToast("Upload complete. Creating editable captions.");
     } catch (error) {
@@ -786,6 +863,10 @@ export default function Home() {
   };
 
   const acceptVideo = async (nextFile: File) => {
+    if (updateRequired) {
+      setToast("Reload SyncWord before uploading another video.");
+      return;
+    }
     const looksLikeVideo =
       nextFile.type.startsWith("video/") ||
       /\.(mp4|mov|webm|mkv|m4v)$/i.test(nextFile.name);
@@ -1291,6 +1372,28 @@ export default function Home() {
           </div>
         </div>
       </header>
+
+      {updateRequired && (
+        <section className="app-update" role="alertdialog" aria-modal="true">
+          <div>
+            <span>UPDATE READY</span>
+            <h2>Reload before making captions.</h2>
+            <p>
+              An older editor can show the wrong word timing with the current
+              caption engine. Reload to keep them in sync.
+            </p>
+            {file && (
+              <small>
+                This temporary preview will reset. Your original video is
+                untouched.
+              </small>
+            )}
+            <button onClick={() => window.location.reload()}>
+              Reload SyncWord
+            </button>
+          </div>
+        </section>
+      )}
 
       {!file ? (
         <section className="launch">

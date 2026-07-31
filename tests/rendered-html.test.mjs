@@ -76,6 +76,10 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(page, /Done with this word/);
   assert.match(page, /Preview looks right — render/);
   assert.match(page, /reliable words animate · uncertain lines stay steady/);
+  assert.match(page, /revision\.json\?check=/);
+  assert.match(page, /Reload before making captions/);
+  assert.match(page, /expectedCaptionQualityRevision/);
+  assert.match(page, /Reload SyncWord before uploading another video/);
   assert.doesNotMatch(
     page,
     /initialCaptions|demoDuration|importSrt|Download SRT|distributeWords/,
@@ -99,6 +103,9 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /phraseTimedWords/);
   assert.match(renderServer, /canHighlightGroup/);
   assert.match(renderServer, /perceptual-gate-v1/);
+  assert.match(renderServer, /caption_job_queued/);
+  assert.match(renderServer, /caption_job_ready/);
+  assert.match(renderServer, /phraseTimedWords: timingQuality\.phraseTimedWords/);
   assert.match(renderDockerfile, /COPY shared \.\/shared/);
   assert.doesNotMatch(
     renderServer,

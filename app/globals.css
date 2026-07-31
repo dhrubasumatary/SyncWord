@@ -63,6 +63,63 @@ button:disabled {
   padding-bottom: env(safe-area-inset-bottom);
 }
 
+.app-update {
+  position: fixed;
+  z-index: 200;
+  inset: 0;
+  display: grid;
+  padding: 22px;
+  place-items: center;
+  color: #f7f8f2;
+  background: rgba(7, 8, 6, 0.9);
+  backdrop-filter: blur(18px);
+}
+
+.app-update > div {
+  display: grid;
+  width: min(100%, 410px);
+  gap: 13px;
+  padding: 26px;
+  background: #171916;
+  border: 1px solid #363a32;
+  border-radius: 24px;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.45);
+}
+
+.app-update span {
+  color: var(--lime);
+  font: 750 10px/1 var(--font-geist-mono), monospace;
+  letter-spacing: 0.16em;
+}
+
+.app-update h2,
+.app-update p {
+  margin: 0;
+}
+
+.app-update h2 {
+  font-size: clamp(25px, 7vw, 34px);
+  line-height: 1;
+  letter-spacing: -0.05em;
+}
+
+.app-update p,
+.app-update small {
+  color: #b9bdb3;
+  line-height: 1.5;
+}
+
+.app-update button {
+  min-height: 52px;
+  margin-top: 4px;
+  color: var(--lime-ink);
+  font-weight: 850;
+  background: var(--lime);
+  border: 0;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
 .app-header {
   position: sticky;
   z-index: 50;

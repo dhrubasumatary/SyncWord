@@ -37,6 +37,7 @@ import {
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
+const captionQualityRevision = "perceptual-gate-v1";
 const runtimeRoot = path.resolve(
   process.env.RUNTIME_DIR ?? path.join(process.cwd(), ".runtime"),
 );
@@ -107,6 +108,7 @@ function publicJob(job) {
     : [];
   return {
     id: job.id,
+    captionQualityRevision,
     status: job.status,
     progress: job.progress,
     message: job.message,
@@ -1060,6 +1062,25 @@ async function transcribe(job) {
       transcriptRecoveryAttempted,
       transcriptRecoverySelected,
     };
+    console.info(
+      JSON.stringify({
+        event: "caption_job_ready",
+        jobId: job.id,
+        language: job.language,
+        mode: job.mode,
+        durationSeconds: Number(job.video?.duration ?? 0),
+        phraseCount: job.captions.length,
+        totalWords: timingQuality.totalWords,
+        highlightSafeWords: timingQuality.safeWords,
+        phraseTimedWords: timingQuality.phraseTimedWords,
+        qualityScore: timingQuality.score,
+        averageConfidence: Number(
+          aligned?.summary?.averageConfidence ?? 0,
+        ),
+        transcriptRecoveryAttempted,
+        transcriptRecoverySelected,
+      }),
+    );
     updateJob(
       job,
       "ready",
@@ -1068,6 +1089,16 @@ async function transcribe(job) {
     );
   } catch (error) {
     if (isCancelled(job)) return;
+    console.error(
+      JSON.stringify({
+        event: "caption_job_failed",
+        jobId: job.id,
+        status: job.status,
+        progress: job.progress,
+        message:
+          error instanceof Error ? error.message : "Transcription failed.",
+      }),
+    );
     updateJob(
       job,
       "failed",
@@ -1415,7 +1446,7 @@ app.get("/health", (_request, response) => {
   response.json({
     ok: true,
     service: "syncword-render",
-    captionQualityRevision: "perceptual-gate-v1",
+    captionQualityRevision,
     sarvamConfigured: Boolean(process.env.SARVAM_API_KEY),
     modalAlignerConfigured: Boolean(modalAlignerEndpoint()),
     ffmpeg: process.env.FFMPEG_PATH ?? "ffmpeg",
@@ -1506,6 +1537,16 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
   };
   ensureJobRuntime(job);
   jobs.set(id, job);
+  console.info(
+    JSON.stringify({
+      event: "caption_job_queued",
+      jobId: id,
+      language,
+      mode,
+      bytes: request.file.size,
+      extension: sourceExtension,
+    }),
+  );
   await persistJob(job);
   response.status(202).json(publicJob(job));
   enqueue(job, () => processJob(job));
@@ -1624,6 +1665,16 @@ app.post("/v2/jobs", async (request, response) => {
   });
   ensureJobRuntime(job);
   jobs.set(id, job);
+  console.info(
+    JSON.stringify({
+      event: "caption_job_queued",
+      jobId: id,
+      language,
+      mode,
+      contentType: job.contentType,
+      source: "durable-upload",
+    }),
+  );
   await persistJob(job);
   void syncRemoteJob(job);
   response.status(202).json(publicJob(job));
