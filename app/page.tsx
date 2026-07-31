@@ -379,6 +379,9 @@ export default function Home() {
     useState<EngineState>("offline");
   const [hasChanges, setHasChanges] = useState(false);
   const [toast, setToast] = useState("");
+  const [captionDrafts, setCaptionDrafts] = useState<
+    Record<string, string>
+  >({});
   const hydrated = useSyncExternalStore(
     subscribeHydration,
     clientSnapshot,
@@ -419,6 +422,9 @@ export default function Home() {
   const playbackUrl = finalVideoUrl || videoUrl;
   const selectedCaption =
     captions.find((caption) => caption.id === selectedCaptionId) ?? captions[0];
+  const captionDraft = selectedCaption
+    ? (captionDrafts[selectedCaption.id] ?? selectedCaption.text)
+    : "";
   const selectedWords = selectedCaption?.words ?? [];
   const selectedWord = selectedWords[selectedWordIndex];
   let globalWordIndex = 0;
@@ -758,6 +764,7 @@ export default function Home() {
     setSelectedCaptionId("");
     setSelectedWordIndex(0);
     setApprovedWordIds([]);
+    setCaptionDrafts({});
     setLoopRange(null);
     setJob(null);
     setHasChanges(false);
@@ -795,6 +802,7 @@ export default function Home() {
     setSelectedCaptionId("");
     setSelectedWordIndex(0);
     setApprovedWordIds([]);
+    setCaptionDrafts({});
     setLoopRange(null);
     setJob(null);
     setHasChanges(false);
@@ -908,6 +916,86 @@ export default function Home() {
       return words;
     });
     markWordsHandled([selectedWord.id]);
+  };
+
+  const commitCaptionDraft = () => {
+    if (!selectedCaption) return;
+    const normalized = captionDraft.trim().replace(/\s+/gu, " ");
+    if (!normalized) {
+      setCaptionDrafts((current) => ({
+        ...current,
+        [selectedCaption.id]: selectedCaption.text,
+      }));
+      setToast("A caption cannot be empty.");
+      return;
+    }
+    if (normalized === selectedCaption.text) {
+      setCaptionDrafts((current) => {
+        const next = { ...current };
+        delete next[selectedCaption.id];
+        return next;
+      });
+      return;
+    }
+
+    const tokens = normalized.split(" ");
+    const sameWordCount = tokens.length === selectedCaption.words.length;
+    const captionDuration = Math.max(
+      0.12,
+      selectedCaption.end - selectedCaption.start,
+    );
+    const weights = tokens.map((token) =>
+      Math.max(1, Array.from(token.replace(/[^\p{L}\p{N}]/gu, "")).length),
+    );
+    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+    let cursor = selectedCaption.start;
+    const editStamp = Date.now().toString(36);
+
+    updateCaptionWords(selectedCaption.id, (words) =>
+      tokens.map((token, index) => {
+        if (sameWordCount) {
+          return {
+            ...words[index],
+            text: token,
+            confidence: 1,
+            source: "manual",
+          };
+        }
+        const start = cursor;
+        const share = (weights[index] / totalWeight) * captionDuration;
+        cursor =
+          index === tokens.length - 1
+            ? selectedCaption.end
+            : Math.min(selectedCaption.end, cursor + share);
+        return {
+          id: `${selectedCaption.id}-edit-${editStamp}-${index}`,
+          text: token,
+          start: Number(start.toFixed(4)),
+          end: Number(cursor.toFixed(4)),
+          confidence: 0.2,
+          source: "grapheme-prior",
+        };
+      }),
+    );
+    setCaptionDrafts((current) => {
+      const next = { ...current };
+      delete next[selectedCaption.id];
+      return next;
+    });
+    setSelectedWordIndex((current) =>
+      Math.min(current, Math.max(0, tokens.length - 1)),
+    );
+    if (sameWordCount) {
+      markWordsHandled(selectedCaption.words.map((word) => word.id));
+      setToast("Caption text updated. Word timing stayed intact.");
+    } else {
+      setApprovedWordIds((current) =>
+        current.filter(
+          (id) => !selectedCaption.words.some((word) => word.id === id),
+        ),
+      );
+      setToast("Caption updated. Check the new word boundaries before export.");
+    }
   };
 
   const adjustSelectedEdge = (
@@ -1171,28 +1259,50 @@ export default function Home() {
           </i>
           <strong>SyncWord</strong>
         </button>
-        <div className={`engine-state ${engineState}`}>
-          <span />
-          {engineState === "online"
-            ? "sync engine ready"
-            : engineState === "waking"
-              ? "waking engine"
-              : "engine offline"}
+        <div className="header-actions">
+          {file && (
+            <button
+              className="header-export"
+              onClick={() => setTab("export")}
+              disabled={!captions.length}
+            >
+              Export
+            </button>
+          )}
+          <div
+            className={`engine-state ${engineState}`}
+            title={
+              engineState === "online"
+                ? "Caption engine ready"
+                : engineState === "waking"
+                  ? "Caption engine waking"
+                  : "Caption engine offline"
+            }
+            aria-label={
+              engineState === "online"
+                ? "Caption engine ready"
+                : engineState === "waking"
+                  ? "Caption engine waking"
+                  : "Caption engine offline"
+            }
+          >
+            <span />
+          </div>
         </div>
       </header>
 
       {!file ? (
         <section className="launch">
           <div className="launch-copy">
-            <span className="eyebrow">ASSAMESE + BODO CREATOR CAPTIONS</span>
+            <span className="eyebrow">AUTO CAPTIONS FOR ASSAMESE + BODO</span>
             <h1>
-              Your words.
+              Add captions.
               <br />
-              <em>On beat.</em>
+              <em>Fix. Export.</em>
             </h1>
             <p>
-              Sync first. Fix only what needs attention. Render once when every
-              word feels right.
+              Pick a reel. Edit the captions while it plays. Export only when
+              it looks right.
             </p>
           </div>
 
@@ -1462,9 +1572,9 @@ export default function Home() {
             >
               {(
                 [
-                  ["review", "1", "Review"],
-                  ["style", "2", "Style"],
-                  ["export", "3", "Export"],
+                  ["review", "CC", "Captions"],
+                  ["style", "Aa", "Style"],
+                  ["export", "↑", "Export"],
                 ] as const
               ).map(([value, number, label]) => (
                 <button
@@ -1512,17 +1622,12 @@ export default function Home() {
                 <div className="review-panel">
                   <div className="review-heading">
                     <div>
-                      <small>SYNC CHECK</small>
+                      <small>AUTO CAPTIONS</small>
                       <h2>
-                        {unresolvedItems.length
-                          ? `${unresolvedItems.length} word${
-                              unresolvedItems.length === 1 ? "" : "s"
-                            } need your ear.`
-                          : "Every word is handled."}
+                        Edit what people will read.
                       </h2>
                       <p>
-                        Listen only where confidence is low. Leave the rest
-                        untouched.
+                        Tap a caption, fix the text, then play it back.
                       </p>
                     </div>
                     <div
@@ -1539,8 +1644,8 @@ export default function Home() {
                   {unresolvedItems.length > 0 ? (
                     <div className="issue-queue" aria-label="Words to review">
                       <div className="section-label">
-                        <span>Needs attention</span>
-                        <small>tap to hear</small>
+                      <span>Check suggested</span>
+                        <small>{unresolvedItems.length} words</small>
                       </div>
                       <div>
                         {unresolvedItems.map((item) => (
@@ -1598,6 +1703,42 @@ export default function Home() {
                       </small>
                     </div>
 
+                    <div className="caption-edit-field">
+                      <label htmlFor="caption-text">
+                        Caption text
+                      </label>
+                      <textarea
+                        id="caption-text"
+                        rows={2}
+                        value={captionDraft}
+                        onChange={(event) =>
+                          setCaptionDrafts((current) => ({
+                            ...current,
+                            [selectedCaption.id]: event.target.value,
+                          }))
+                        }
+                        onBlur={commitCaptionDraft}
+                        onKeyDown={(event) => {
+                          if (
+                            event.key === "Enter" &&
+                            (event.metaKey || event.ctrlKey)
+                          ) {
+                            event.preventDefault();
+                            commitCaptionDraft();
+                            event.currentTarget.blur();
+                          }
+                        }}
+                        aria-describedby="caption-edit-help"
+                      />
+                      <div>
+                        <small id="caption-edit-help">
+                          Change the sentence here. Tap a word below for exact
+                          timing.
+                        </small>
+                        <button onClick={commitCaptionDraft}>Save</button>
+                      </div>
+                    </div>
+
                     <label className="word-text-field">
                       <span>Selected word</span>
                       <input
@@ -1625,103 +1766,120 @@ export default function Home() {
                       <b>{Math.round(selectedWord.confidence * 100)}%</b>
                     </button>
 
-                    <div className="timing-strip">
-                      <div className="timing-ruler">
-                        {timingNeighborhood.map((item) => {
-                          const wordDuration = Math.max(
-                            0.08,
-                            item.word.end - item.word.start,
-                          );
-                          return (
-                            <button
-                              key={item.word.id}
-                              className={
-                                item.word.id === selectedWord.id
-                                  ? "selected"
-                                  : ""
-                              }
-                              style={{ flexGrow: wordDuration }}
-                              onClick={() => selectReviewItem(item)}
-                            >
-                              <span>{item.word.text}</span>
-                              <small>{preciseTime(item.word.start)}</small>
-                            </button>
-                          );
-                        })}
-                      </div>
-                      <div className="playhead" aria-hidden="true">
-                        <span />
-                      </div>
-                    </div>
+                    <details
+                      className="timing-tools"
+                      key={selectedWord.id}
+                      open={
+                        isReviewCandidate(selectedWord) &&
+                        !approvedWordIdSet.has(selectedWord.id)
+                      }
+                    >
+                      <summary>
+                        <span>Fine-tune timing</span>
+                        <small>
+                          {preciseTime(selectedWord.start)}–
+                          {preciseTime(selectedWord.end)}
+                        </small>
+                      </summary>
 
-                    <div className="precision-controls">
-                      <div className="control-row">
-                        <div>
-                          <span>Word start</span>
-                          <strong>{selectedWord.start.toFixed(3)}s</strong>
+                      <div className="timing-strip">
+                        <div className="timing-ruler">
+                          {timingNeighborhood.map((item) => {
+                            const wordDuration = Math.max(
+                              0.08,
+                              item.word.end - item.word.start,
+                            );
+                            return (
+                              <button
+                                key={item.word.id}
+                                className={
+                                  item.word.id === selectedWord.id
+                                    ? "selected"
+                                    : ""
+                                }
+                                style={{ flexGrow: wordDuration }}
+                                onClick={() => selectReviewItem(item)}
+                              >
+                                <span>{item.word.text}</span>
+                                <small>{preciseTime(item.word.start)}</small>
+                              </button>
+                            );
+                          })}
                         </div>
-                        <button
-                          onClick={() => adjustSelectedEdge("start", -0.03)}
-                          aria-label="Move word start 30 milliseconds earlier"
-                        >
-                          −30
-                        </button>
-                        <button
-                          onClick={() => adjustSelectedEdge("start", 0.03)}
-                          aria-label="Move word start 30 milliseconds later"
-                        >
-                          +30
-                        </button>
-                      </div>
-                      <div className="control-row">
-                        <div>
-                          <span>Word end</span>
-                          <strong>{selectedWord.end.toFixed(3)}s</strong>
+                        <div className="playhead" aria-hidden="true">
+                          <span />
                         </div>
-                        <button
-                          onClick={() => adjustSelectedEdge("end", -0.03)}
-                          aria-label="Move word end 30 milliseconds earlier"
-                        >
-                          −30
-                        </button>
-                        <button
-                          onClick={() => adjustSelectedEdge("end", 0.03)}
-                          aria-label="Move word end 30 milliseconds later"
-                        >
-                          +30
-                        </button>
                       </div>
-                    </div>
 
-                    <div className="shift-actions">
-                      <button onClick={() => shiftSelectedWord(-0.03)}>
-                        <span>←</span>
-                        Word 30 ms
-                      </button>
-                      <button onClick={() => shiftSelectedWord(0.03)}>
-                        Word 30 ms
-                        <span>→</span>
-                      </button>
-                      <button onClick={() => shiftSelectedPhrase(-0.1)}>
-                        <span>←</span>
-                        Phrase 100 ms
-                      </button>
-                      <button onClick={() => shiftSelectedPhrase(0.1)}>
-                        Phrase 100 ms
-                        <span>→</span>
-                      </button>
-                    </div>
+                      <div className="precision-controls">
+                        <div className="control-row">
+                          <div>
+                            <span>Word start</span>
+                            <strong>{selectedWord.start.toFixed(3)}s</strong>
+                          </div>
+                          <button
+                            onClick={() => adjustSelectedEdge("start", -0.03)}
+                            aria-label="Move word start 30 milliseconds earlier"
+                          >
+                            −30
+                          </button>
+                          <button
+                            onClick={() => adjustSelectedEdge("start", 0.03)}
+                            aria-label="Move word start 30 milliseconds later"
+                          >
+                            +30
+                          </button>
+                        </div>
+                        <div className="control-row">
+                          <div>
+                            <span>Word end</span>
+                            <strong>{selectedWord.end.toFixed(3)}s</strong>
+                          </div>
+                          <button
+                            onClick={() => adjustSelectedEdge("end", -0.03)}
+                            aria-label="Move word end 30 milliseconds earlier"
+                          >
+                            −30
+                          </button>
+                          <button
+                            onClick={() => adjustSelectedEdge("end", 0.03)}
+                            aria-label="Move word end 30 milliseconds later"
+                          >
+                            +30
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="shift-actions">
+                        <button onClick={() => shiftSelectedWord(-0.03)}>
+                          <span>←</span>
+                          Word 30 ms
+                        </button>
+                        <button onClick={() => shiftSelectedWord(0.03)}>
+                          Word 30 ms
+                          <span>→</span>
+                        </button>
+                        <button onClick={() => shiftSelectedPhrase(-0.1)}>
+                          <span>←</span>
+                          Phrase 100 ms
+                        </button>
+                        <button onClick={() => shiftSelectedPhrase(0.1)}>
+                          Phrase 100 ms
+                          <span>→</span>
+                        </button>
+                      </div>
+                    </details>
 
                     <button
                       className="approve-button"
                       onClick={approveSelectedAndContinue}
                     >
                       <span>
-                        <strong>Looks right</strong>
+                        <strong>Done with this word</strong>
                         <small>
                           {unresolvedItems.length > 1
-                            ? "approve & play next issue"
-                            : "finish sync review"}
+                            ? "save & play next suggestion"
+                            : "finish caption check"}
                         </small>
                       </span>
                       <b>✓</b>
@@ -1730,8 +1888,8 @@ export default function Home() {
 
                   <div className="transcript-section">
                     <div className="section-label">
-                      <span>Full phrase</span>
-                      <small>tap any word</small>
+                      <span>Caption track</span>
+                      <small>tap any caption</small>
                     </div>
                     <div className="phrase-tabs">
                       {captions.map((caption, index) => (
@@ -1746,7 +1904,16 @@ export default function Home() {
                             seek(caption.words[0]?.start ?? caption.start);
                           }}
                         >
-                          {String(index + 1).padStart(2, "0")}
+                          <small>
+                            {compactTime(caption.start)} ·{" "}
+                            {String(index + 1).padStart(2, "0")}
+                          </small>
+                          <span>{caption.text}</span>
+                          {caption.words.some(
+                            (word) =>
+                              isReviewCandidate(word) &&
+                              !approvedWordIdSet.has(word.id),
+                          ) && <i>!</i>}
                         </button>
                       ))}
                     </div>

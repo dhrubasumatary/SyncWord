@@ -38,10 +38,10 @@ test("server-renders the SyncWord editor", async () => {
   const html = await response.text();
   assert.match(
     html,
-    /<title>SyncWord — Sync first\. Render once\.<\/title>/i,
+    /<title>SyncWord — Edit captions\. Then export\.<\/title>/i,
   );
-  assert.match(html, /Your words\./);
-  assert.match(html, /On beat\./);
+  assert.match(html, /Add captions\./);
+  assert.match(html, /Fix\. Export\./);
   assert.match(html, /Upload your reel/);
   assert.match(html, /3 min \/ 90 MB/);
   assert.match(html, /GPU CTC alignment/);
@@ -69,9 +69,11 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(page, /Whole-word ASS hits/);
   assert.match(page, /Exact speech/);
   assert.match(page, /Loop this word/);
+  assert.match(page, /Caption text/);
+  assert.match(page, /Fine-tune timing/);
   assert.match(page, /Word start/);
   assert.match(page, /Phrase 100 ms/);
-  assert.match(page, /Looks right/);
+  assert.match(page, /Done with this word/);
   assert.match(page, /Preview looks right — render anyway/);
   assert.doesNotMatch(
     page,
@@ -81,7 +83,7 @@ test("removes the disposable starter and wires product metadata", async () => {
     page,
     /const processingStatuses[\s\S]{0,160}"ready"/,
   );
-  assert.match(layout, /og-correction\.png/);
+  assert.match(layout, /og-editor\.png/);
   assert.match(layout, /x-forwarded-host/);
   assert.match(renderServer, /model: "saaras:v3"/);
   assert.match(renderServer, /model: "saaras:v3",\s*mode,/);
