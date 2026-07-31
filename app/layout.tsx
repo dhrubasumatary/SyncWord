@@ -26,32 +26,32 @@ export async function generateMetadata(): Promise<Metadata> {
 
   return {
     metadataBase: new URL(origin),
-    title: "SyncWord — Make every word hit on time",
+    title: "SyncWord — Sync first. Render once.",
     description:
-      "GPU CTC forced alignment for Assamese and Bodo karaoke captions, with confidence review and ASS-powered rendering.",
+      "Review and correct Assamese and Bodo word timing over the original video, then render styled ASS captions once.",
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",
     },
     openGraph: {
       title: "SyncWord",
-      description: "Make every word hit on time.",
+      description: "Sync first. Render once.",
       type: "website",
       url: origin,
       images: [
         {
-          url: `${origin}/og-mobile.png`,
+          url: `${origin}/og-correction.png`,
           width: 1536,
           height: 1024,
-          alt: "SyncWord mobile word-timing caption workshop",
+          alt: "SyncWord correction-first mobile caption editor",
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
       title: "SyncWord",
-      description: "Make every word hit on time.",
-      images: [`${origin}/og-mobile.png`],
+      description: "Sync first. Render once.",
+      images: [`${origin}/og-correction.png`],
     },
   };
 }

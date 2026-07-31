@@ -17,6 +17,7 @@ type WordTiming = {
   source:
     | "mms-fa"
     | "mms-fa-star"
+    | "speech-window-review"
     | "acoustic-dp"
     | "grapheme-prior"
     | "manual";
@@ -86,9 +87,17 @@ type JobResponse = {
   processUrl?: string;
 };
 
-type StudioTab = "captions" | "style" | "export";
+type StudioTab = "review" | "style" | "export";
 type EngineState = "offline" | "waking" | "online";
 type TranscriptMode = "codemix" | "verbatim" | "transcribe";
+type ReviewItem = {
+  captionId: string;
+  captionIndex: number;
+  wordIndex: number;
+  globalIndex: number;
+  word: WordTiming;
+};
+type LoopRange = { start: number; end: number } | null;
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
 
@@ -96,10 +105,10 @@ const defaultStyle: CaptionStyle = {
   fontFamily: "Noto Sans Bengali",
   fontSize: 78,
   textColor: "#FFFFFF",
-  highlightColor: "#D7FF38",
-  backgroundColor: "#09090B",
+  highlightColor: "#CFFF47",
+  backgroundColor: "#070806",
   backgroundOpacity: 76,
-  outlineColor: "#09090B",
+  outlineColor: "#070806",
   outlineWidth: 2,
   position: 74,
   weight: "800",
@@ -114,44 +123,44 @@ const presets: Array<{
   values: Partial<CaptionStyle>;
 }> = [
   {
-    name: "Viral",
-    note: "lime word hit",
-    sample: "HIT",
+    name: "Signal",
+    note: "clean creator hit",
+    sample: "NOW",
     values: {
       textColor: "#FFFFFF",
-      highlightColor: "#D7FF38",
-      backgroundColor: "#09090B",
+      highlightColor: "#CFFF47",
+      backgroundColor: "#070806",
       backgroundOpacity: 76,
-      outlineColor: "#09090B",
+      outlineColor: "#070806",
       outlineWidth: 2,
       animation: "pop",
       wordsPerCard: 4,
     },
   },
   {
-    name: "Punch",
-    note: "hard outline",
+    name: "Impact",
+    note: "hard social outline",
     sample: "LOUD",
     values: {
       textColor: "#FFFFFF",
-      highlightColor: "#FF4D67",
-      backgroundColor: "#09090B",
+      highlightColor: "#FF6D5D",
+      backgroundColor: "#070806",
       backgroundOpacity: 0,
-      outlineColor: "#09090B",
+      outlineColor: "#070806",
       outlineWidth: 6,
       animation: "pop",
       wordsPerCard: 3,
     },
   },
   {
-    name: "Glow",
-    note: "electric blue",
-    sample: "NOW",
+    name: "Electric",
+    note: "cool blue motion",
+    sample: "PLAY",
     values: {
       textColor: "#FFFFFF",
-      highlightColor: "#58A6FF",
-      backgroundColor: "#121A2A",
-      backgroundOpacity: 54,
+      highlightColor: "#70A7FF",
+      backgroundColor: "#11192B",
+      backgroundOpacity: 58,
       outlineColor: "#070B12",
       outlineWidth: 4,
       animation: "slide",
@@ -164,18 +173,25 @@ const processingStatuses: JobStatus[] = [
   "queued",
   "extracting",
   "transcribing",
-  "ready",
   "rendering",
 ];
 const subscribeHydration = () => () => {};
 const clientSnapshot = () => true;
 const serverSnapshot = () => false;
 
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
 function compactTime(seconds: number) {
   const safe = Math.max(0, Number(seconds) || 0);
   const minutes = Math.floor(safe / 60);
   const wholeSeconds = Math.floor(safe % 60);
   return `${minutes}:${wholeSeconds.toString().padStart(2, "0")}`;
+}
+
+function preciseTime(seconds: number) {
+  return `${Math.max(0, seconds).toFixed(2)}s`;
 }
 
 function rgba(hex: string, opacity: number) {
@@ -186,42 +202,13 @@ function rgba(hex: string, opacity: number) {
   }, ${opacity / 100})`;
 }
 
-function wordWeight(word: string) {
-  const length = Array.from(
-    word.replace(/[\p{P}\p{S}]+/gu, "") || word,
-  ).length;
-  return Math.max(1, length ** 0.72);
-}
-
-function distributeWords(text: string, start: number, end: number) {
-  const tokens = text.trim().split(/\s+/u).filter(Boolean);
-  const weights = tokens.map(wordWeight);
-  const total = weights.reduce((sum, weight) => sum + weight, 0);
-  let cursor = start;
-  return tokens.map((token, index): WordTiming => {
-    const wordEnd =
-      index === tokens.length - 1
-        ? end
-        : cursor + ((end - start) * weights[index]) / total;
-    const word = {
-      id: `edited-${index}-${Math.round(start * 1000)}`,
-      text: token,
-      start: Number(cursor.toFixed(3)),
-      end: Number(wordEnd.toFixed(3)),
-      confidence: 0.38,
-      source: "grapheme-prior" as const,
-    };
-    cursor = wordEnd;
-    return word;
-  });
-}
-
 function statusStep(status?: JobStatus) {
   if (!status || status === "queued") return 0;
   if (status === "extracting") return 1;
-  if (status === "transcribing" || status === "ready") return 2;
-  if (status === "rendering") return 3;
-  if (status === "complete") return 4;
+  if (status === "transcribing") return 2;
+  if (status === "ready") return 3;
+  if (status === "rendering") return 4;
+  if (status === "complete") return 5;
   return 0;
 }
 
@@ -353,8 +340,24 @@ function isAlignedCaption(value: unknown): value is Caption {
   );
 }
 
+function isReviewCandidate(word: WordTiming) {
+  return (
+    word.confidence < 0.35 ||
+    !["mms-fa", "manual"].includes(word.source)
+  );
+}
+
+function confidenceLabel(word: WordTiming) {
+  if (word.source === "manual") return "Adjusted";
+  if (word.source === "mms-fa-star") return "Recovered";
+  if (word.source === "speech-window-review") return "Boundary";
+  if (word.source === "grapheme-prior") return "Estimated";
+  if (word.confidence < 0.35) return "Check";
+  return "Aligned";
+}
+
 export default function Home() {
-  const [tab, setTab] = useState<StudioTab>("captions");
+  const [tab, setTab] = useState<StudioTab>("review");
   const [file, setFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
   const [duration, setDuration] = useState(0);
@@ -368,6 +371,8 @@ export default function Home() {
   const [captions, setCaptions] = useState<Caption[]>([]);
   const [selectedCaptionId, setSelectedCaptionId] = useState("");
   const [selectedWordIndex, setSelectedWordIndex] = useState(0);
+  const [approvedWordIds, setApprovedWordIds] = useState<string[]>([]);
+  const [loopRange, setLoopRange] = useState<LoopRange>(null);
   const [job, setJob] = useState<JobResponse | null>(null);
   const [uploading, setUploading] = useState(false);
   const [engineState, setEngineState] =
@@ -416,11 +421,37 @@ export default function Home() {
     captions.find((caption) => caption.id === selectedCaptionId) ?? captions[0];
   const selectedWords = selectedCaption?.words ?? [];
   const selectedWord = selectedWords[selectedWordIndex];
-  const activeCaption =
-    captions.find(
-      (caption) =>
-        currentTime >= caption.start && currentTime < caption.end,
-    ) ?? selectedCaption;
+  let globalWordIndex = 0;
+  const flatWords: ReviewItem[] = captions.flatMap((caption, captionIndex) =>
+    caption.words.map((word, wordIndex) => ({
+      captionId: caption.id,
+      captionIndex,
+      wordIndex,
+      globalIndex: globalWordIndex++,
+      word,
+    })),
+  );
+  const approvedWordIdSet = new Set(approvedWordIds);
+  const selectedItem = flatWords.find(
+    (item) =>
+      item.captionId === selectedCaption?.id &&
+      item.wordIndex === selectedWordIndex,
+  );
+  const flaggedItems = flatWords.filter((item) =>
+    isReviewCandidate(item.word),
+  );
+  const unresolvedItems = flaggedItems.filter(
+    (item) => !approvedWordIdSet.has(item.word.id),
+  );
+  const verifiedWords = Math.max(0, flatWords.length - unresolvedItems.length);
+  const reviewPercent = flatWords.length
+    ? Math.round((verifiedWords / flatWords.length) * 100)
+    : 0;
+  const alignment = job?.alignment;
+  const activeCaption = captions.find(
+    (caption) =>
+      currentTime >= caption.start && currentTime < caption.end,
+  );
   const activeWords = activeCaption?.words ?? [];
   const activeGroups = groupWordsForReels(
     activeWords,
@@ -438,7 +469,20 @@ export default function Home() {
       activeWordGroup[index + 1]?.start ?? word.end;
     return currentTime >= word.start && currentTime < displayEnd;
   });
-  const alignment = job?.alignment;
+  const selectedGlobalIndex = selectedItem?.globalIndex ?? -1;
+  const previousGlobalWord =
+    selectedGlobalIndex > 0 ? flatWords[selectedGlobalIndex - 1]?.word : null;
+  const nextGlobalWord =
+    selectedGlobalIndex >= 0
+      ? flatWords[selectedGlobalIndex + 1]?.word ?? null
+      : null;
+  const timingNeighborhood = selectedItem
+    ? flatWords.slice(
+        Math.max(0, selectedItem.globalIndex - 2),
+        Math.min(flatWords.length, selectedItem.globalIndex + 3),
+      )
+    : [];
+  const isLooping = Boolean(loopRange);
 
   const previewStyle = {
     "--caption-font-size": `${captionStyle.fontSize}px`,
@@ -491,7 +535,7 @@ export default function Home() {
     if (
       !job ||
       (!usingDurableMedia && !apiBase) ||
-      ["complete", "failed", "cancelled"].includes(job.status)
+      ["ready", "complete", "failed", "cancelled"].includes(job.status)
     ) {
       return;
     }
@@ -501,7 +545,9 @@ export default function Home() {
       : `/v1/jobs/${jobId}`;
     const interval = window.setInterval(async () => {
       try {
-        const response = await fetch(`${jobsBase}${pollingRoute}`);
+        const response = await fetch(`${jobsBase}${pollingRoute}`, {
+          cache: "no-store",
+        });
         if (response.status === 404) {
           const failedJob: JobResponse = {
             ...job,
@@ -509,10 +555,10 @@ export default function Home() {
             progress: job.progress,
             message: usingDurableMedia
               ? "This temporary project expired. Upload it again to rebuild."
-              : "The free render engine restarted. Tap Try again to rebuild this reel.",
+              : "The free processing engine restarted. Tap Try again.",
           };
           setJob(failedJob);
-          setToast(failedJob.message ?? "Render restarted.");
+          setToast(failedJob.message ?? "Processing restarted.");
           return;
         }
         if (!response.ok) return;
@@ -528,12 +574,32 @@ export default function Home() {
             ? next.captions
             : [];
         if (nextCaptions.length) {
-          setCaptions(nextCaptions);
-          setSelectedCaptionId(
-            (current) => current || nextCaptions[0].id,
+          setCaptions((current) =>
+            current.length && next.status === "rendering"
+              ? current
+              : nextCaptions,
           );
+          if (!selectedCaptionId) {
+            const firstFlag = nextCaptions
+              .flatMap((caption, captionIndex) =>
+                caption.words.map((word, wordIndex) => ({
+                  caption,
+                  captionIndex,
+                  word,
+                  wordIndex,
+                })),
+              )
+              .find((item) => isReviewCandidate(item.word));
+            setSelectedCaptionId(
+              firstFlag?.caption.id ?? nextCaptions[0].id,
+            );
+            setSelectedWordIndex(firstFlag?.wordIndex ?? 0);
+          }
         }
-        if (next.status === "complete") {
+        if (next.status === "ready") {
+          setTab("review");
+          setToast("Sync preview ready. Review the flagged words.");
+        } else if (next.status === "complete") {
           setTab("export");
           setToast("Final ASS-burned MP4 is ready.");
         } else if (["failed", "cancelled"].includes(next.status)) {
@@ -544,17 +610,23 @@ export default function Home() {
       }
     }, 2000);
     return () => window.clearInterval(interval);
-  }, [apiBase, job, jobsBase, usingDurableMedia]);
+  }, [
+    apiBase,
+    job,
+    jobsBase,
+    selectedCaptionId,
+    usingDurableMedia,
+  ]);
 
   const uploadVideo = async (nextFile: File) => {
     if (!apiBase) {
-      setToast("The render engine is not connected to this deployment yet.");
+      setToast("The processing engine is not connected yet.");
       return;
     }
     setUploading(true);
     try {
       setEngineState("waking");
-      setToast("Waking the hobby render engine. First use can take a minute.");
+      setToast("Waking the hobby engine. First use can take a minute.");
       let engineReady = false;
       for (let attempt = 0; attempt < 18; attempt += 1) {
         if (await pingRenderEngine(apiBase)) {
@@ -566,9 +638,10 @@ export default function Home() {
       }
       if (!engineReady) {
         throw new Error(
-          "The free render engine is still waking. Tap Try again in a moment.",
+          "The free engine is still waking. Try again in a moment.",
         );
       }
+
       let data: JobResponse & { error?: string };
       if (usingDurableMedia) {
         const createResponse = await fetch("/api/media/jobs", {
@@ -593,7 +666,7 @@ export default function Home() {
           throw new Error("Durable upload capability is incomplete.");
         }
         setJob(data);
-        setToast("Saving the video securely before processing.");
+        setToast("Saving your original video securely.");
         const uploadResponse = await fetch(data.uploadUrl, {
           method: "PUT",
           headers: {
@@ -636,7 +709,7 @@ export default function Home() {
         if (!response.ok) throw new Error(data.error ?? "Upload failed.");
       }
       setJob(data);
-      setToast("Upload complete. Building the synchronized preview first.");
+      setToast("Upload complete. Building the sync preview—no render yet.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Upload failed.");
     } finally {
@@ -664,11 +737,13 @@ export default function Home() {
       });
       if (!response.ok && response.status !== 404) {
         const data = (await response.json()) as { error?: string };
-        throw new Error(data.error ?? "Could not cancel the render.");
+        throw new Error(data.error ?? "Could not cancel processing.");
       }
     } catch (error) {
       setToast(
-        error instanceof Error ? error.message : "Could not cancel the render.",
+        error instanceof Error
+          ? error.message
+          : "Could not cancel processing.",
       );
     }
   };
@@ -682,16 +757,18 @@ export default function Home() {
     setCaptions([]);
     setSelectedCaptionId("");
     setSelectedWordIndex(0);
+    setApprovedWordIds([]);
+    setLoopRange(null);
     setJob(null);
     setHasChanges(false);
-    setTab("captions");
+    setTab("review");
   };
 
   const cancelProcessing = () => {
     const jobToCancel = job;
     clearProject();
     void cancelRemoteJob(jobToCancel);
-    setToast("Processing cancelled. Your hobby queue slot is free.");
+    setToast("Processing cancelled. The queue slot is free.");
   };
 
   const acceptVideo = async (nextFile: File) => {
@@ -703,7 +780,7 @@ export default function Home() {
       return;
     }
     if (nextFile.size > 90 * 1024 * 1024) {
-      setToast("Keep the reel under 90 MB for the MVP.");
+      setToast("Keep the reel under 90 MB for this MVP.");
       return;
     }
     const previousJob = job;
@@ -717,13 +794,228 @@ export default function Home() {
     setCaptions([]);
     setSelectedCaptionId("");
     setSelectedWordIndex(0);
+    setApprovedWordIds([]);
+    setLoopRange(null);
     setJob(null);
     setHasChanges(false);
-    setTab("captions");
+    setTab("review");
     void uploadVideo(nextFile);
   };
 
-  const startRender = async () => {
+  const markWordsHandled = (ids: string[]) => {
+    setApprovedWordIds((current) => [
+      ...new Set([...current, ...ids.filter(Boolean)]),
+    ]);
+  };
+
+  const selectReviewItem = (item: ReviewItem, shouldLoop = false) => {
+    setSelectedCaptionId(item.captionId);
+    setSelectedWordIndex(item.wordIndex);
+    setLoopRange(null);
+    const start = Math.max(0, item.word.start - 0.12);
+    setCurrentTime(start);
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.currentTime = start;
+    }
+    if (shouldLoop) {
+      window.setTimeout(() => {
+        const range = {
+          start: Math.max(0, item.word.start - 0.48),
+          end: Math.min(duration, item.word.end + 0.48),
+        };
+        setLoopRange(range);
+        if (videoRef.current) {
+          videoRef.current.currentTime = range.start;
+          void videoRef.current.play();
+        }
+      }, 40);
+    }
+  };
+
+  const goToNextIssue = () => {
+    const next =
+      unresolvedItems.find(
+        (item) => item.globalIndex > (selectedItem?.globalIndex ?? -1),
+      ) ?? unresolvedItems[0];
+    if (next) {
+      setTab("review");
+      selectReviewItem(next, true);
+    } else {
+      setLoopRange(null);
+      setToast("Sync check complete. Choose a caption style.");
+      setTab("style");
+    }
+  };
+
+  const approveSelectedAndContinue = () => {
+    if (!selectedWord) return;
+    markWordsHandled([selectedWord.id]);
+    const remaining = unresolvedItems.filter(
+      (item) => item.word.id !== selectedWord.id,
+    );
+    const next =
+      remaining.find(
+        (item) => item.globalIndex > (selectedItem?.globalIndex ?? -1),
+      ) ?? remaining[0];
+    setLoopRange(null);
+    if (next) {
+      selectReviewItem(next, true);
+      setToast("Approved. Playing the next flagged word.");
+    } else {
+      videoRef.current?.pause();
+      setToast("Every flagged word is handled. Style when you are ready.");
+    }
+  };
+
+  const updateCaptionWords = (
+    captionId: string,
+    transform: (words: WordTiming[]) => WordTiming[],
+  ) => {
+    setCaptions((items) =>
+      items.map((caption) => {
+        if (caption.id !== captionId) return caption;
+        const words = transform(caption.words.map((word) => ({ ...word })));
+        return {
+          ...caption,
+          text: words.map((word) => word.text).join(" "),
+          start: words[0]?.start ?? caption.start,
+          end: words.at(-1)?.end ?? caption.end,
+          words,
+        };
+      }),
+    );
+    setHasChanges(true);
+  };
+
+  const updateSelectedWordText = (text: string) => {
+    if (!selectedCaption || !selectedWord) return;
+    if (!text.trim()) {
+      setToast("A timed word cannot be empty.");
+      return;
+    }
+    if (/\s/u.test(text)) {
+      setToast("Edit one word at a time so its timing stays intact.");
+      return;
+    }
+    updateCaptionWords(selectedCaption.id, (words) => {
+      words[selectedWordIndex] = {
+        ...words[selectedWordIndex],
+        text,
+        confidence: 1,
+        source: "manual",
+      };
+      return words;
+    });
+    markWordsHandled([selectedWord.id]);
+  };
+
+  const adjustSelectedEdge = (
+    edge: "start" | "end",
+    delta: number,
+  ) => {
+    if (!selectedCaption || !selectedWord) return;
+    const minimumStart = previousGlobalWord?.end ?? 0;
+    const maximumEnd = nextGlobalWord?.start ?? Math.max(duration, selectedWord.end);
+    updateCaptionWords(selectedCaption.id, (words) => {
+      const word = words[selectedWordIndex];
+      if (edge === "start") {
+        word.start = Number(
+          clamp(
+            word.start + delta,
+            minimumStart,
+            word.end - 0.08,
+          ).toFixed(3),
+        );
+      } else {
+        word.end = Number(
+          clamp(
+            word.end + delta,
+            word.start + 0.08,
+            maximumEnd,
+          ).toFixed(3),
+        );
+      }
+      word.confidence = 1;
+      word.source = "manual";
+      return words;
+    });
+    markWordsHandled([selectedWord.id]);
+  };
+
+  const shiftSelectedWord = (delta: number) => {
+    if (!selectedCaption || !selectedWord) return;
+    const wordDuration = selectedWord.end - selectedWord.start;
+    const minimumStart = previousGlobalWord?.end ?? 0;
+    const maximumEnd = nextGlobalWord?.start ?? Math.max(duration, selectedWord.end);
+    const nextStart = clamp(
+      selectedWord.start + delta,
+      minimumStart,
+      maximumEnd - wordDuration,
+    );
+    const appliedDelta = nextStart - selectedWord.start;
+    updateCaptionWords(selectedCaption.id, (words) => {
+      const word = words[selectedWordIndex];
+      word.start = Number((word.start + appliedDelta).toFixed(3));
+      word.end = Number((word.end + appliedDelta).toFixed(3));
+      word.confidence = 1;
+      word.source = "manual";
+      return words;
+    });
+    markWordsHandled([selectedWord.id]);
+    setCurrentTime(nextStart);
+    if (videoRef.current) videoRef.current.currentTime = nextStart;
+  };
+
+  const shiftSelectedPhrase = (delta: number) => {
+    if (!selectedCaption?.words.length) return;
+    const captionIndex = captions.findIndex(
+      (caption) => caption.id === selectedCaption.id,
+    );
+    const first = selectedCaption.words[0];
+    const last = selectedCaption.words.at(-1)!;
+    const previousEnd =
+      captions[captionIndex - 1]?.words.at(-1)?.end ?? 0;
+    const nextStart =
+      captions[captionIndex + 1]?.words[0]?.start ??
+      Math.max(duration, last.end);
+    const resolvedDelta = clamp(
+      delta,
+      previousEnd - first.start,
+      nextStart - last.end,
+    );
+    updateCaptionWords(selectedCaption.id, (words) =>
+      words.map((word) => ({
+        ...word,
+        start: Number((word.start + resolvedDelta).toFixed(3)),
+        end: Number((word.end + resolvedDelta).toFixed(3)),
+        confidence: 1,
+        source: "manual",
+      })),
+    );
+    markWordsHandled(selectedCaption.words.map((word) => word.id));
+    const nextTime = Math.max(0, currentTime + resolvedDelta);
+    setCurrentTime(nextTime);
+    if (videoRef.current) videoRef.current.currentTime = nextTime;
+  };
+
+  const toggleWordLoop = () => {
+    if (!selectedWord || !videoRef.current) return;
+    if (loopRange) {
+      setLoopRange(null);
+      videoRef.current.pause();
+      return;
+    }
+    const range = {
+      start: Math.max(0, selectedWord.start - 0.48),
+      end: Math.min(duration, selectedWord.end + 0.48),
+    };
+    setLoopRange(range);
+    videoRef.current.currentTime = range.start;
+    void videoRef.current.play();
+  };
+
+  const startRender = async (allowUnresolved = false) => {
     if (
       !job ||
       !["ready", "complete"].includes(job.status) ||
@@ -732,21 +1024,32 @@ export default function Home() {
     ) {
       return;
     }
+    if (unresolvedItems.length && !allowUnresolved) {
+      setTab("export");
+      setToast(
+        `${unresolvedItems.length} flagged word${
+          unresolvedItems.length === 1 ? "" : "s"
+        } still need a decision.`,
+      );
+      return;
+    }
     setUploading(true);
+    setLoopRange(null);
+    videoRef.current?.pause();
     try {
       const response = await fetch(
         `${jobsBase}${jobRoute(job.id)}/render`,
         {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(usingDurableMedia && job.capabilityToken
-            ? {
-                authorization: `Bearer ${job.capabilityToken}`,
-              }
-            : {}),
-        },
-        body: JSON.stringify({ captions, style: captionStyle }),
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(usingDurableMedia && job.capabilityToken
+              ? {
+                  authorization: `Bearer ${job.capabilityToken}`,
+                }
+              : {}),
+          },
+          body: JSON.stringify({ captions, style: captionStyle }),
         },
       );
       const data = (await response.json()) as JobResponse & { error?: string };
@@ -756,7 +1059,8 @@ export default function Home() {
         capabilityToken: job.capabilityToken,
       });
       setHasChanges(false);
-      setToast("Burning your changes into a new MP4.");
+      setTab("export");
+      setToast("Final render started. Your reviewed timing is locked.");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Render failed.");
     } finally {
@@ -770,7 +1074,9 @@ export default function Home() {
       setToast(`${kind === "video" ? "Video" : "ASS file"} is not ready.`);
       return;
     }
-    window.location.href = `${jobsBase}${resultPath}`;
+    const link = document.createElement("a");
+    link.href = `${jobsBase}${resultPath}`;
+    link.click();
   };
 
   const setStyle = (values: Partial<CaptionStyle>) => {
@@ -778,61 +1084,16 @@ export default function Home() {
     setHasChanges(true);
   };
 
-  const updateCaptionText = (text: string) => {
-    if (!selectedCaption) return;
-    setCaptions((items) =>
-      items.map((caption) =>
-        caption.id === selectedCaption.id
-          ? {
-              ...caption,
-              text,
-              words: distributeWords(text, caption.start, caption.end),
-            }
-          : caption,
-      ),
-    );
-    setSelectedWordIndex(0);
-    setHasChanges(true);
-  };
-
-  const nudgeBoundary = (delta: number) => {
-    if (
-      !selectedCaption ||
-      !selectedWord ||
-      selectedWordIndex >= selectedWords.length - 1
-    ) {
-      return;
-    }
-    setCaptions((items) =>
-      items.map((caption) => {
-        if (caption.id !== selectedCaption.id) return caption;
-        const words = (caption.words ?? []).map((word) => ({ ...word }));
-        const left = words[selectedWordIndex];
-        const right = words[selectedWordIndex + 1];
-        const boundary = Math.max(
-          left.start + 0.08,
-          Math.min(right.end - 0.08, left.end + delta),
-        );
-        left.end = Number(boundary.toFixed(3));
-        right.start = Number(boundary.toFixed(3));
-        left.confidence = 1;
-        right.confidence = 1;
-        left.source = "manual";
-        right.source = "manual";
-        return { ...caption, words };
-      }),
-    );
-    setHasChanges(true);
-  };
-
   const seek = (seconds: number) => {
     const next = Math.max(0, Math.min(duration, seconds));
+    setLoopRange(null);
     setCurrentTime(next);
     if (videoRef.current) videoRef.current.currentTime = next;
   };
 
   const togglePlayback = () => {
     if (!videoRef.current) return;
+    setLoopRange(null);
     if (videoRef.current.paused) void videoRef.current.play();
     else videoRef.current.pause();
   };
@@ -840,8 +1101,23 @@ export default function Home() {
   const primaryAction = () => {
     if (!file) {
       videoInputRef.current?.click();
-    } else if (["failed", "cancelled"].includes(job?.status ?? "") || !job) {
+      return;
+    }
+    if (!job || ["failed", "cancelled"].includes(job.status)) {
       void uploadVideo(file);
+      return;
+    }
+    if (tab === "review") {
+      if (unresolvedItems.length) goToNextIssue();
+      else setTab("style");
+      return;
+    }
+    if (tab === "style") {
+      setTab("export");
+      return;
+    }
+    if (job.status === "ready") {
+      void startRender();
     } else if (job.status === "complete" && hasChanges) {
       void startRender();
     } else if (job.status === "complete") {
@@ -850,33 +1126,57 @@ export default function Home() {
   };
 
   const primaryLabel = (() => {
-    if (uploading) return "Uploading video…";
+    if (uploading) return "Working…";
     if (!file) return "Choose video";
     if (!job || ["failed", "cancelled"].includes(job.status)) {
       return "Try again";
     }
-    if (isProcessing) return `${job.message ?? "Processing"} · ${job.progress}%`;
-    if (hasChanges) return "Update final video";
-    return "Download MP4";
+    if (isProcessing) {
+      return `${job.message ?? "Processing"} · ${job.progress}%`;
+    }
+    if (tab === "review") {
+      return unresolvedItems.length
+        ? `Review ${unresolvedItems.length} flagged word${
+            unresolvedItems.length === 1 ? "" : "s"
+          }`
+        : "Continue to style";
+    }
+    if (tab === "style") return "Continue to export";
+    if (job.status === "ready" && unresolvedItems.length) {
+      return `Review ${unresolvedItems.length} words before render`;
+    }
+    if (job.status === "ready") return "Render final video";
+    if (job.status === "complete" && hasChanges) return "Update final video";
+    return "Download final MP4";
   })();
 
   return (
     <main className={`creator-app ${file ? "has-project" : ""}`}>
       <header className="app-header">
-        <a className="brand" href="#" aria-label="SyncWord home">
+        <button
+          className="brand"
+          onClick={() => {
+            if (file) {
+              const activeJob = job;
+              clearProject();
+              void cancelRemoteJob(activeJob);
+            }
+          }}
+          aria-label="SyncWord home"
+        >
           <i aria-hidden="true">
             <span />
             <span />
             <span />
           </i>
-          <strong>syncword</strong>
-        </a>
+          <strong>SyncWord</strong>
+        </button>
         <div className={`engine-state ${engineState}`}>
           <span />
           {engineState === "online"
-            ? "render online"
+            ? "sync engine ready"
             : engineState === "waking"
-              ? "waking render"
+              ? "waking engine"
               : "engine offline"}
         </div>
       </header>
@@ -884,15 +1184,15 @@ export default function Home() {
       {!file ? (
         <section className="launch">
           <div className="launch-copy">
-            <span className="eyebrow">WORD-ACCURATE REEL CAPTIONS</span>
+            <span className="eyebrow">ASSAMESE + BODO CREATOR CAPTIONS</span>
             <h1>
               Your words.
               <br />
               <em>On beat.</em>
             </h1>
             <p>
-              Upload a reel. Get a finished MP4 with modern, animated,
-              word-by-word captions burned into every frame.
+              Sync first. Fix only what needs attention. Render once when every
+              word feels right.
             </p>
           </div>
 
@@ -945,10 +1245,10 @@ export default function Home() {
               </div>
               <small>
                 {transcriptMode === "verbatim"
-                  ? "Keeps fillers and repetitions. Timing is aligned separately."
+                  ? "Keeps fillers and repetitions for an exact spoken transcript."
                   : transcriptMode === "transcribe"
-                    ? "Normalizes speech into a cleaner native-script transcript."
-                    : "English stays English; Indic speech stays in its native script."}
+                    ? "Cleans up speech while keeping the spoken language."
+                    : "English stays English; regional speech stays in its native script."}
               </small>
             </div>
 
@@ -959,7 +1259,7 @@ export default function Home() {
               onDrop={(event) => {
                 event.preventDefault();
                 const dropped = event.dataTransfer.files[0];
-                if (dropped) acceptVideo(dropped);
+                if (dropped) void acceptVideo(dropped);
               }}
             >
               <i>＋</i>
@@ -971,20 +1271,29 @@ export default function Home() {
           <ol className="promise-row">
             <li>
               <b>01</b>
-              <span>Saaras v3 hears the real phrases</span>
+              <div>
+                <strong>Hear</strong>
+                <span>Saaras v3 builds the real code-mixed transcript</span>
+              </div>
             </li>
             <li>
               <b>02</b>
-              <span>GPU CTC alignment locks every word to speech</span>
+              <div>
+                <strong>Verify</strong>
+                <span>GPU CTC alignment flags only uncertain word timing</span>
+              </div>
             </li>
             <li>
               <b>03</b>
-              <span>ASS + ffmpeg returns a social-ready MP4</span>
+              <div>
+                <strong>Export</strong>
+                <span>ASS styling burns once after you approve the preview</span>
+              </div>
             </li>
           </ol>
 
           <p className="truth-line">
-            No account. No mock transcript. No fake final preview.
+            No mock transcript. No render while you edit. No surprise timing.
           </p>
         </section>
       ) : (
@@ -997,10 +1306,14 @@ export default function Home() {
                   videoInputRef.current?.click();
                 }}
               >
-                {isProcessing ? "Cancel & new video" : "← New video"}
+                {isProcessing ? "Cancel & replace" : "Replace video"}
               </button>
               <span title={file.name}>{file.name}</span>
-              {showingFinal && <b>FINAL</b>}
+              {showingFinal ? (
+                <b className="final-label">FINAL</b>
+              ) : job?.status === "ready" ? (
+                <b className="preview-label">PREVIEW</b>
+              ) : null}
             </div>
 
             <div
@@ -1027,16 +1340,24 @@ export default function Home() {
                     );
                   }
                 }}
-                onTimeUpdate={(event) =>
-                  setCurrentTime(event.currentTarget.currentTime)
-                }
+                onTimeUpdate={(event) => {
+                  const nextTime = event.currentTarget.currentTime;
+                  setCurrentTime(nextTime);
+                  if (loopRange && nextTime >= loopRange.end) {
+                    event.currentTarget.currentTime = loopRange.start;
+                    void event.currentTarget.play();
+                  }
+                }}
                 onPlay={() => setPlaying(true)}
                 onPause={() => setPlaying(false)}
                 playsInline
               />
 
               {!showingFinal && activeWordGroup.length > 0 && (
-                <div className="live-caption">
+                <div
+                  className={`live-caption ${captionStyle.animation}`}
+                  aria-live="off"
+                >
                   {activeWordGroup.map((word) => (
                     <span
                       key={word.id}
@@ -1056,12 +1377,14 @@ export default function Home() {
                       { "--progress": job?.progress ?? 4 } as CSSProperties
                     }
                   >
-                    <span>
-                      {job?.progress ?? 4}%
-                    </span>
+                    <span>{job?.progress ?? 4}%</span>
                   </div>
                   <strong>{job?.message ?? "Uploading your reel"}</strong>
-                  <small>Keep this tab open while we make the final MP4.</small>
+                  <small>
+                    {job?.status === "rendering"
+                      ? "Your timing is locked. We are burning the final ASS captions now."
+                      : "We are building an editable sync preview. FFmpeg has not started."}
+                  </small>
                   <button
                     className="cancel-processing"
                     onClick={cancelProcessing}
@@ -1069,26 +1392,27 @@ export default function Home() {
                     Cancel processing
                   </button>
                   <ol>
-                    {["Upload", "Audio", "Words", "ASS burn"].map(
-                      (label, index) => (
-                        <li
-                          key={label}
-                          className={
-                            index <= statusStep(job?.status) ? "active" : ""
-                          }
-                        >
-                          <i />
-                          <span>{label}</span>
-                        </li>
-                      ),
-                    )}
+                    {(job?.status === "rendering"
+                      ? ["Upload", "Transcript", "Sync", "Review", "Render"]
+                      : ["Upload", "Audio", "Transcript", "Word sync"]
+                    ).map((label, index) => (
+                      <li
+                        key={label}
+                        className={
+                          index <= statusStep(job?.status) ? "active" : ""
+                        }
+                      >
+                        <i />
+                        <span>{label}</span>
+                      </li>
+                    ))}
                   </ol>
                 </div>
               )}
 
               {["failed", "cancelled"].includes(job?.status ?? "") && (
                 <div className="failed-cover">
-                  <b>Render stopped</b>
+                  <b>Processing stopped</b>
                   <span>{job?.message}</span>
                 </div>
               )}
@@ -1114,164 +1438,384 @@ export default function Home() {
               />
               <span>{compactTime(duration)}</span>
             </div>
+
+            {captions.length > 0 && (
+              <div className="mobile-review-meter">
+                <span style={{ width: `${reviewPercent}%` }} />
+                <div>
+                  <strong>{verifiedWords} checked</strong>
+                  <small>
+                    {unresolvedItems.length
+                      ? `${unresolvedItems.length} need attention`
+                      : "sync ready"}
+                  </small>
+                </div>
+              </div>
+            )}
           </section>
 
           <section className="tool-column">
-            <nav className="tool-tabs" aria-label="Caption controls">
+            <nav
+              className="tool-tabs"
+              aria-label="Caption workflow"
+              role="tablist"
+            >
               {(
                 [
-                  ["captions", "Captions"],
-                  ["style", "Style"],
-                  ["export", "Export"],
+                  ["review", "1", "Review"],
+                  ["style", "2", "Style"],
+                  ["export", "3", "Export"],
                 ] as const
-              ).map(([value, label]) => (
+              ).map(([value, number, label]) => (
                 <button
                   key={value}
                   className={tab === value ? "active" : ""}
                   onClick={() => setTab(value)}
+                  disabled={!captions.length && value !== "review"}
+                  role="tab"
+                  aria-selected={tab === value}
                 >
-                  {label}
+                  <i>{number}</i>
+                  <span>{label}</span>
+                  {value === "review" && unresolvedItems.length > 0 && (
+                    <b>{unresolvedItems.length}</b>
+                  )}
                 </button>
               ))}
             </nav>
 
             <div className="tool-body">
-              {tab === "captions" && !captions.length && (
+              {tab === "review" && !captions.length && (
                 <div className="waiting-panel">
                   <span className="panel-icon">⌁</span>
                   <h2>
                     {job?.status === "failed"
-                      ? "That render needs another go."
-                      : "Your captions are being built."}
+                      ? "That sync needs another go."
+                      : "Building your editable preview."}
                   </h2>
                   <p>
-                    Phrase timestamps come from Saaras v3. Word cuts come from
-                    Meta&apos;s multilingual CTC acoustic frames—not guessed
-                    word duration.
+                    Saaras creates the phrases. Multilingual GPU acoustic frames
+                    place every word. Rendering waits for you.
                   </p>
+                  {job && (
+                    <div className="waiting-progress">
+                      <i>
+                        <b style={{ width: `${job.progress}%` }} />
+                      </i>
+                      <span>{job.message}</span>
+                    </div>
+                  )}
                 </div>
               )}
 
-              {tab === "captions" && selectedCaption && (
-                <div className="caption-editor">
-                  <div className="score-row">
+              {tab === "review" && selectedCaption && selectedWord && (
+                <div className="review-panel">
+                  <div className="review-heading">
                     <div>
-                      <small>WORD SYNC</small>
-                      <strong>
-                        {alignment?.totalWords ?? 0} words ·{" "}
-                        {alignment?.stableWords ??
-                          Math.max(
-                            0,
-                            (alignment?.totalWords ?? 0) -
-                              (alignment?.needsReview ?? 0),
-                          )}
-                        {" "}
-                        stable
-                      </strong>
+                      <small>SYNC CHECK</small>
+                      <h2>
+                        {unresolvedItems.length
+                          ? `${unresolvedItems.length} word${
+                              unresolvedItems.length === 1 ? "" : "s"
+                            } need your ear.`
+                          : "Every word is handled."}
+                      </h2>
+                      <p>
+                        Listen only where confidence is low. Leave the rest
+                        untouched.
+                      </p>
                     </div>
-                    <span>
-                      {alignment?.needsReview
-                        ? `${alignment.needsReview} review`
-                        : "clean"}
-                    </span>
-                  </div>
-
-                  <div className="phrase-picker">
-                    {captions.map((caption, index) => (
-                      <button
-                        key={caption.id}
-                        className={
-                          caption.id === selectedCaption.id ? "active" : ""
-                        }
-                        onClick={() => {
-                          setSelectedCaptionId(caption.id);
-                          setSelectedWordIndex(0);
-                          seek(caption.start + 0.01);
-                        }}
-                      >
-                        <small>{String(index + 1).padStart(2, "0")}</small>
-                        <span>{caption.text}</span>
-                      </button>
-                    ))}
-                  </div>
-
-                  <label className="transcript-field">
-                    Phrase text
-                    <textarea
-                      rows={3}
-                      value={selectedCaption.text}
-                      onChange={(event) =>
-                        updateCaptionText(event.target.value)
+                    <div
+                      className="review-score"
+                      style={
+                        { "--review": reviewPercent } as CSSProperties
                       }
-                    />
-                  </label>
-
-                  <span className="field-label">Tap a word to inspect its cut</span>
-                  <div className="word-grid">
-                    {selectedWords.map((word, index) => (
-                      <button
-                        key={word.id}
-                        className={`${index === selectedWordIndex ? "active" : ""} ${
-                          word.confidence < 0.35 ? "review" : ""
-                        }`}
-                        onClick={() => {
-                          setSelectedWordIndex(index);
-                          seek(word.start + 0.01);
-                        }}
-                      >
-                        <span>{word.text}</span>
-                        <i style={{ width: `${word.confidence * 100}%` }} />
-                      </button>
-                    ))}
+                    >
+                      <strong>{reviewPercent}%</strong>
+                      <span>checked</span>
+                    </div>
                   </div>
 
-                  {selectedWord && (
-                    <div className="timing-card">
-                      <div>
-                        <small>Start</small>
-                        <strong>{selectedWord.start.toFixed(3)}s</strong>
+                  {unresolvedItems.length > 0 ? (
+                    <div className="issue-queue" aria-label="Words to review">
+                      <div className="section-label">
+                        <span>Needs attention</span>
+                        <small>tap to hear</small>
                       </div>
                       <div>
-                        <small>End</small>
-                        <strong>{selectedWord.end.toFixed(3)}s</strong>
-                      </div>
-                      <div>
-                        <small>Source</small>
-                        <strong>
-                          {selectedWord.source === "manual"
-                            ? "manual"
-                            : selectedWord.source === "mms-fa"
-                              ? "GPU align"
-                              : selectedWord.source === "mms-fa-star"
-                                ? "GPU recovery"
-                              : "fallback"}
-                        </strong>
-                      </div>
-                      {selectedWordIndex <
-                        selectedWords.length - 1 && (
-                        <div className="nudge-buttons">
-                          <button onClick={() => nudgeBoundary(-0.03)}>
-                            −30 ms
+                        {unresolvedItems.map((item) => (
+                          <button
+                            key={item.word.id}
+                            className={
+                              item.word.id === selectedWord.id ? "active" : ""
+                            }
+                            onClick={() => selectReviewItem(item, true)}
+                            aria-current={
+                              item.word.id === selectedWord.id
+                                ? "true"
+                                : undefined
+                            }
+                          >
+                            <span>{item.word.text}</span>
+                            <small>
+                              {Math.round(item.word.confidence * 100)}% ·{" "}
+                              {preciseTime(item.word.start)}
+                            </small>
                           </button>
-                          <span>next cut</span>
-                          <button onClick={() => nudgeBoundary(0.03)}>
-                            +30 ms
-                          </button>
-                        </div>
-                      )}
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="all-clear-card">
+                      <i>✓</i>
+                      <div>
+                        <strong>Sync check complete</strong>
+                        <span>
+                          Your original video is still untouched. Styling is
+                          instant.
+                        </span>
+                      </div>
+                      <button onClick={() => setTab("style")}>Style captions</button>
                     </div>
                   )}
+
+                  <div className="selected-word-card">
+                    <div className="word-card-topline">
+                      <span
+                        className={
+                          isReviewCandidate(selectedWord) ? "attention" : ""
+                        }
+                      >
+                        {confidenceLabel(selectedWord)}
+                      </span>
+                      <small>
+                        Phrase{" "}
+                        {String(
+                          captions.findIndex(
+                            (caption) => caption.id === selectedCaption.id,
+                          ) + 1,
+                        ).padStart(2, "0")}
+                      </small>
+                    </div>
+
+                    <label className="word-text-field">
+                      <span>Selected word</span>
+                      <input
+                        value={selectedWord.text}
+                        onChange={(event) =>
+                          updateSelectedWordText(event.target.value)
+                        }
+                        aria-label="Selected word text"
+                      />
+                    </label>
+
+                    <button
+                      className={`listen-button ${isLooping ? "active" : ""}`}
+                      onClick={toggleWordLoop}
+                    >
+                      <i>{isLooping ? "■" : "▶"}</i>
+                      <span>
+                        <strong>
+                          {isLooping ? "Stop listening" : "Loop this word"}
+                        </strong>
+                        <small>
+                          {preciseTime(selectedWord.start)}–{preciseTime(selectedWord.end)}
+                        </small>
+                      </span>
+                      <b>{Math.round(selectedWord.confidence * 100)}%</b>
+                    </button>
+
+                    <div className="timing-strip">
+                      <div className="timing-ruler">
+                        {timingNeighborhood.map((item) => {
+                          const wordDuration = Math.max(
+                            0.08,
+                            item.word.end - item.word.start,
+                          );
+                          return (
+                            <button
+                              key={item.word.id}
+                              className={
+                                item.word.id === selectedWord.id
+                                  ? "selected"
+                                  : ""
+                              }
+                              style={{ flexGrow: wordDuration }}
+                              onClick={() => selectReviewItem(item)}
+                            >
+                              <span>{item.word.text}</span>
+                              <small>{preciseTime(item.word.start)}</small>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="playhead" aria-hidden="true">
+                        <span />
+                      </div>
+                    </div>
+
+                    <div className="precision-controls">
+                      <div className="control-row">
+                        <div>
+                          <span>Word start</span>
+                          <strong>{selectedWord.start.toFixed(3)}s</strong>
+                        </div>
+                        <button
+                          onClick={() => adjustSelectedEdge("start", -0.03)}
+                          aria-label="Move word start 30 milliseconds earlier"
+                        >
+                          −30
+                        </button>
+                        <button
+                          onClick={() => adjustSelectedEdge("start", 0.03)}
+                          aria-label="Move word start 30 milliseconds later"
+                        >
+                          +30
+                        </button>
+                      </div>
+                      <div className="control-row">
+                        <div>
+                          <span>Word end</span>
+                          <strong>{selectedWord.end.toFixed(3)}s</strong>
+                        </div>
+                        <button
+                          onClick={() => adjustSelectedEdge("end", -0.03)}
+                          aria-label="Move word end 30 milliseconds earlier"
+                        >
+                          −30
+                        </button>
+                        <button
+                          onClick={() => adjustSelectedEdge("end", 0.03)}
+                          aria-label="Move word end 30 milliseconds later"
+                        >
+                          +30
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="shift-actions">
+                      <button onClick={() => shiftSelectedWord(-0.03)}>
+                        <span>←</span>
+                        Word 30 ms
+                      </button>
+                      <button onClick={() => shiftSelectedWord(0.03)}>
+                        Word 30 ms
+                        <span>→</span>
+                      </button>
+                      <button onClick={() => shiftSelectedPhrase(-0.1)}>
+                        <span>←</span>
+                        Phrase 100 ms
+                      </button>
+                      <button onClick={() => shiftSelectedPhrase(0.1)}>
+                        Phrase 100 ms
+                        <span>→</span>
+                      </button>
+                    </div>
+
+                    <button
+                      className="approve-button"
+                      onClick={approveSelectedAndContinue}
+                    >
+                      <span>
+                        <strong>Looks right</strong>
+                        <small>
+                          {unresolvedItems.length > 1
+                            ? "approve & play next issue"
+                            : "finish sync review"}
+                        </small>
+                      </span>
+                      <b>✓</b>
+                    </button>
+                  </div>
+
+                  <div className="transcript-section">
+                    <div className="section-label">
+                      <span>Full phrase</span>
+                      <small>tap any word</small>
+                    </div>
+                    <div className="phrase-tabs">
+                      {captions.map((caption, index) => (
+                        <button
+                          key={caption.id}
+                          className={
+                            caption.id === selectedCaption.id ? "active" : ""
+                          }
+                          onClick={() => {
+                            setSelectedCaptionId(caption.id);
+                            setSelectedWordIndex(0);
+                            seek(caption.words[0]?.start ?? caption.start);
+                          }}
+                        >
+                          {String(index + 1).padStart(2, "0")}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="word-grid">
+                      {selectedWords.map((word, index) => {
+                        const needsReview =
+                          isReviewCandidate(word) &&
+                          !approvedWordIdSet.has(word.id);
+                        return (
+                          <button
+                            key={word.id}
+                            className={[
+                              index === selectedWordIndex ? "active" : "",
+                              needsReview ? "review" : "",
+                              approvedWordIdSet.has(word.id)
+                                ? "approved"
+                                : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
+                            onClick={() =>
+                              selectReviewItem({
+                                captionId: selectedCaption.id,
+                                captionIndex: captions.findIndex(
+                                  (caption) =>
+                                    caption.id === selectedCaption.id,
+                                ),
+                                wordIndex: index,
+                                globalIndex:
+                                  flatWords.find(
+                                    (item) => item.word.id === word.id,
+                                  )?.globalIndex ?? 0,
+                                word,
+                              })
+                            }
+                          >
+                            <span>{word.text}</span>
+                            {needsReview && <i>!</i>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="alignment-truth">
+                    <span>Alignment report</span>
+                    <div>
+                      <strong>
+                        {alignment?.waveformAlignedWords ?? flatWords.length}/
+                        {alignment?.totalWords ?? flatWords.length} acoustic
+                      </strong>
+                      <small>
+                        {alignment?.estimatedWords
+                          ? `${alignment.estimatedWords} estimated timing`
+                          : "no silent timing fallback"}
+                      </small>
+                    </div>
+                  </div>
                 </div>
               )}
 
               {tab === "style" && (
                 <div className="style-panel">
                   <div className="panel-heading">
-                    <small>LIVE ASS PREVIEW</small>
-                    <h2>Make the words hit.</h2>
+                    <small>INSTANT CLIENT PREVIEW</small>
+                    <h2>Choose the energy.</h2>
                     <p>
-                      Preview instantly here. Re-render only when the look is
-                      right.
+                      These controls change the overlay immediately. No video
+                      render is running.
                     </p>
                   </div>
 
@@ -1285,7 +1829,7 @@ export default function Home() {
                           style={{
                             color: preset.values.textColor,
                             background: rgba(
-                              preset.values.backgroundColor ?? "#09090B",
+                              preset.values.backgroundColor ?? "#070806",
                               preset.values.backgroundOpacity ?? 0,
                             ),
                             WebkitTextStroke: `${
@@ -1377,11 +1921,24 @@ export default function Home() {
                             captionStyle[key as keyof CaptionStyle],
                           )}
                           onChange={(event) =>
-                            setStyle({ [key]: Number(event.target.value) })
+                            setStyle({
+                              [key]: Number(event.target.value),
+                            } as Partial<CaptionStyle>)
                           }
                         />
                       </label>
                     ))}
+                  </div>
+
+                  <div className="style-note">
+                    <i>⌁</i>
+                    <div>
+                      <strong>Original video stays untouched</strong>
+                      <span>
+                        The player uses a synchronized HTML overlay. Advanced
+                        SubStation Alpha is generated only when you export.
+                      </span>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1389,27 +1946,79 @@ export default function Home() {
               {tab === "export" && (
                 <div className="export-panel">
                   <div
-                    className={`export-status ${showingFinal ? "ready" : ""}`}
+                    className={`export-status ${
+                      showingFinal
+                        ? "ready"
+                        : unresolvedItems.length
+                          ? "attention"
+                          : ""
+                    }`}
                   >
-                    <span>{showingFinal ? "✓" : "↻"}</span>
+                    <span>
+                      {showingFinal
+                        ? "✓"
+                        : job?.status === "rendering"
+                          ? "↻"
+                          : unresolvedItems.length
+                            ? "!"
+                            : "→"}
+                    </span>
                     <div>
                       <small>
-                        {showingFinal ? "FINAL VIDEO" : "RENDER STATUS"}
+                        {showingFinal
+                          ? "FINAL VIDEO"
+                          : job?.status === "rendering"
+                            ? "RENDERING"
+                            : "PRE-FLIGHT CHECK"}
                       </small>
                       <h2>
                         {showingFinal
                           ? "Ready to post."
-                          : isFinal && hasChanges
-                            ? "Preview has new changes."
-                            : "Still making the MP4."}
+                          : job?.status === "rendering"
+                            ? "Burning the approved cut."
+                            : unresolvedItems.length
+                              ? `${unresolvedItems.length} timing decision${
+                                  unresolvedItems.length === 1 ? "" : "s"
+                                } left.`
+                              : "Ready for one clean render."}
                       </h2>
                       <p>
                         {showingFinal
-                          ? "What you see in the player is the real burned-in file."
-                          : isFinal && hasChanges
-                            ? "Tap Update final video to burn this look into the MP4."
-                          : job?.message ?? "Waiting for caption processing."}
+                          ? "The player is now showing the real burned-in MP4."
+                          : job?.status === "rendering"
+                            ? job.message
+                            : unresolvedItems.length
+                              ? "Review the flagged words for the safest result, or export anyway if the preview already feels right."
+                              : "Your transcript, timing, and style are locked. FFmpeg starts only after you confirm."}
                       </p>
+                    </div>
+                  </div>
+
+                  <div className="preflight-list">
+                    <div className="pass">
+                      <i>✓</i>
+                      <span>
+                        <strong>Transcript ready</strong>
+                        <small>{flatWords.length} words in native script</small>
+                      </span>
+                    </div>
+                    <div className={unresolvedItems.length ? "warn" : "pass"}>
+                      <i>{unresolvedItems.length ? "!" : "✓"}</i>
+                      <span>
+                        <strong>Timing review</strong>
+                        <small>
+                          {unresolvedItems.length
+                            ? `${unresolvedItems.length} unchecked`
+                            : "all issues handled"}
+                        </small>
+                      </span>
+                    </div>
+                    <div className="pass">
+                      <i>✓</i>
+                      <span>
+                        <strong>ASS style ready</strong>
+                        <small>{captionStyle.animation} · {captionStyle.wordsPerCard} words/card</small>
+                      </span>
                     </div>
                   </div>
 
@@ -1432,19 +2041,59 @@ export default function Home() {
                     </div>
                   </div>
 
+                  {job?.status === "ready" && (
+                    <div className="export-actions">
+                      {unresolvedItems.length > 0 && (
+                        <button
+                          className="secondary"
+                          onClick={goToNextIssue}
+                        >
+                          Review {unresolvedItems.length} flagged words
+                        </button>
+                      )}
+                      <button
+                        className="primary"
+                        onClick={() =>
+                          void startRender(unresolvedItems.length > 0)
+                        }
+                      >
+                        {unresolvedItems.length
+                          ? "Preview looks right — render anyway"
+                          : "Start final render"}
+                        <span>→</span>
+                      </button>
+                    </div>
+                  )}
+
+                  {job?.status === "complete" && hasChanges && (
+                    <div className="export-actions">
+                      <button
+                        className="primary"
+                        onClick={() =>
+                          void startRender(unresolvedItems.length > 0)
+                        }
+                      >
+                        Update final video
+                        <span>↻</span>
+                      </button>
+                    </div>
+                  )}
+
                   {showingFinal && (
                     <div className="download-actions">
                       <button onClick={() => downloadResult("video")}>
                         Download final MP4
+                        <span>↓</span>
                       </button>
                       <button onClick={() => downloadResult("ass")}>
                         Download source .ASS
                       </button>
                     </div>
                   )}
+
                   <p className="hobby-note">
-                    MVP files are stored temporarily for 24 hours. Download
-                    your final MP4 before they expire.
+                    MVP files are temporary. Download the final MP4 before the
+                    project expires.
                   </p>
                 </div>
               )}
