@@ -50,6 +50,7 @@ const uploadRoot = path.join(runtimeRoot, "incoming");
 const jobsRoot = path.join(runtimeRoot, "jobs");
 const sarvamBaseUrl =
   process.env.SARVAM_BASE_URL ?? "https://api.sarvam.ai";
+const sarvamModel = process.env.SARVAM_MODEL ?? "saaras:v3";
 const defaultModalAlignerUrl =
   "https://dhrubasumatary--syncword-aligner-alignment-api.modal.run";
 const jobs = new Map();
@@ -816,20 +817,22 @@ async function sarvamRestTranscript(job, segment, mode) {
   }
 
   const audio = await readFile(path.join(job.directory, segment.fileName));
-  const payload = new FormData();
-  payload.append(
-    "file",
-    new Blob([audio], { type: "audio/wav" }),
-    segment.fileName,
-  );
-  payload.append("model", "saaras:v3");
-  payload.append("mode", mode);
-  payload.append("language_code", job.language);
-  payload.append("with_timestamps", "true");
 
   let lastError;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     throwIfCancelled(job);
+    // A Fetch multipart body is single-use. Rebuild it for every retry so a
+    // transient 429/5xx does not turn the next attempt into an empty upload.
+    const payload = new FormData();
+    payload.append(
+      "file",
+      new Blob([audio], { type: "audio/wav" }),
+      segment.fileName,
+    );
+    payload.append("model", sarvamModel);
+    payload.append("mode", mode);
+    payload.append("language_code", job.language);
+    payload.append("with_timestamps", "true");
     const response = await fetch(`${sarvamBaseUrl}/speech-to-text`, {
       method: "POST",
       headers: {
@@ -1142,7 +1145,7 @@ async function runSarvamTranscript(job, mode, progressFloor = 24) {
       method: "POST",
       body: JSON.stringify({
         job_parameters: {
-          model: "saaras:v3",
+          model: sarvamModel,
           mode,
           language_code: job.language,
           with_timestamps: true,

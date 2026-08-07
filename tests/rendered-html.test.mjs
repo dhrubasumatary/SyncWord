@@ -40,14 +40,13 @@ test("server-renders the SyncWord editor", async () => {
     html,
     /<title>SyncWord — Edit captions\. Then export\.<\/title>/i,
   );
-  assert.match(html, /Your words\./);
-  assert.match(html, /Ready to post\./);
+  assert.match(html, /What are we captioning\?/);
+  assert.match(html, /Assamese, Bodo, or mixed-language reel/);
   assert.match(html, /Choose a video/);
   assert.match(html, /3 min \/ 90 MB/);
-  assert.match(html, /Captions appear on your video automatically/);
-  assert.match(html, /Change any sentence that does not feel right/);
-  assert.match(html, /Nothing is burned into your original video/);
-  assert.match(html, /Pick a look and make a post-ready video/);
+  assert.match(html, /Automatic captions/);
+  assert.match(html, /Change text and timing directly/);
+  assert.match(html, /Rendering starts only when you approve/);
   assert.doesNotMatch(
     html,
     /মোৰ ভাষা|आंनि राव|brahmaputra-stories|MAJULI/i,
@@ -68,12 +67,12 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
   assert.match(page, /Everything said/);
-  assert.match(page, /Loop this word/);
-  assert.match(page, /What should people read/);
-  assert.match(page, /More timing control/);
-  assert.match(page, /Word start/);
-  assert.match(page, /Phrase 100 ms/);
-  assert.match(page, /Looks right/);
+  assert.match(page, /CaptionTimeline/);
+  assert.match(page, /Caption text/);
+  assert.match(page, /Fine timing/);
+  assert.match(page, /Start −30 ms/);
+  assert.match(page, /Done with this line/);
+  assert.match(page, /onChange=\{updateCaptionTiming\}/);
   assert.match(page, /Make my video/);
   assert.match(page, /uncertain words stay steady instead of drifting/);
   assert.match(page, /revision\.json\?check=/);
@@ -90,8 +89,12 @@ test("removes the disposable starter and wires product metadata", async () => {
   );
   assert.match(layout, /og-editor\.png/);
   assert.match(layout, /x-forwarded-host/);
-  assert.match(renderServer, /model: "saaras:v3"/);
-  assert.match(renderServer, /model: "saaras:v3",\s*mode,/);
+  assert.match(renderServer, /SARVAM_MODEL \?\? "saaras:v3"/);
+  assert.match(renderServer, /model: sarvamModel,\s*mode,/);
+  assert.match(
+    renderServer,
+    /for \(let attempt = 0; attempt < 3; attempt \+= 1\)[\s\S]{0,300}new FormData\(\)/,
+  );
   assert.match(renderServer, /"codemix", "verbatim", "transcribe"/);
   assert.match(renderServer, /with_timestamps: true/);
   assert.match(renderServer, /alignTranscriptWithModal/);

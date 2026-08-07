@@ -9,9 +9,10 @@ import {
 } from "react";
 import {
   canHighlightGroup,
-  canHighlightWord,
 } from "../shared/caption-quality.mjs";
 import { createLatestSeekController } from "../shared/preview-transport.mjs";
+import { retimeCaption } from "../shared/caption-timing.mjs";
+import { CaptionTimeline } from "./components/CaptionTimeline";
 
 type WordTiming = {
   id: string;
@@ -113,7 +114,7 @@ type ReviewItem = {
 type LoopRange = { start: number; end: number } | null;
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
-const appRevision = "syncword-web-2026-08-07-v23";
+const appRevision = "syncword-web-2026-08-07-v24";
 const expectedCaptionQualityRevision = "perceptual-gate-v1";
 
 const defaultStyle: CaptionStyle = {
@@ -377,7 +378,6 @@ export default function Home() {
   const [captions, setCaptions] = useState<Caption[]>([]);
   const [selectedCaptionId, setSelectedCaptionId] = useState("");
   const [selectedWordIndex, setSelectedWordIndex] = useState(0);
-  const [approvedWordIds, setApprovedWordIds] = useState<string[]>([]);
   const [loopRange, setLoopRange] = useState<LoopRange>(null);
   const [job, setJob] = useState<JobResponse | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -448,17 +448,10 @@ export default function Home() {
       word,
     })),
   );
-  const approvedWordIdSet = new Set(approvedWordIds);
   const selectedItem = flatWords.find(
     (item) =>
       item.captionId === selectedCaption?.id &&
       item.wordIndex === selectedWordIndex,
-  );
-  const flaggedItems = flatWords.filter((item) =>
-    isReviewCandidate(item.word),
-  );
-  const unresolvedItems = flaggedItems.filter(
-    (item) => !approvedWordIdSet.has(item.word.id),
   );
   const activeCaption = captions.find(
     (caption) =>
@@ -491,12 +484,6 @@ export default function Home() {
     selectedGlobalIndex >= 0
       ? flatWords[selectedGlobalIndex + 1]?.word ?? null
       : null;
-  const timingNeighborhood = selectedItem
-    ? flatWords.slice(
-        Math.max(0, selectedItem.globalIndex - 2),
-        Math.min(flatWords.length, selectedItem.globalIndex + 3),
-      )
-    : [];
   const isLooping = Boolean(loopRange);
 
   const previewStyle = {
@@ -933,7 +920,6 @@ export default function Home() {
     setCaptions([]);
     setSelectedCaptionId("");
     setSelectedWordIndex(0);
-    setApprovedWordIds([]);
     setCaptionDrafts({});
     setLoopRange(null);
     setJob(null);
@@ -976,7 +962,6 @@ export default function Home() {
     setCaptions([]);
     setSelectedCaptionId("");
     setSelectedWordIndex(0);
-    setApprovedWordIds([]);
     setCaptionDrafts({});
     setLoopRange(null);
     setJob(null);
@@ -1013,12 +998,6 @@ export default function Home() {
     }
   };
 
-  const markWordsHandled = (ids: string[]) => {
-    setApprovedWordIds((current) => [
-      ...new Set([...current, ...ids.filter(Boolean)]),
-    ]);
-  };
-
   const selectReviewItem = (item: ReviewItem, shouldLoop = false) => {
     setSelectedCaptionId(item.captionId);
     setSelectedWordIndex(item.wordIndex);
@@ -1044,26 +1023,6 @@ export default function Home() {
     }
   };
 
-  const approveSelectedAndContinue = () => {
-    if (!selectedWord) return;
-    markWordsHandled([selectedWord.id]);
-    const remaining = unresolvedItems.filter(
-      (item) => item.word.id !== selectedWord.id,
-    );
-    const next =
-      remaining.find(
-        (item) => item.globalIndex > (selectedItem?.globalIndex ?? -1),
-      ) ?? remaining[0];
-    setLoopRange(null);
-    if (next) {
-      selectReviewItem(next, true);
-      setToast("Saved. Playing the next caption.");
-    } else {
-      videoRef.current?.pause();
-      setToast("Captions are ready. Choose a style when you are happy.");
-    }
-  };
-
   const updateCaptionWords = (
     captionId: string,
     transform: (words: WordTiming[]) => WordTiming[],
@@ -1082,6 +1041,56 @@ export default function Home() {
       }),
     );
     setHasChanges(true);
+  };
+
+  const updateCaptionTiming = (
+    captionId: string,
+    requestedStart: number,
+    requestedEnd: number,
+  ) => {
+    const captionIndex = captions.findIndex(
+      (caption) => caption.id === captionId,
+    );
+    const target = captions[captionIndex];
+    if (!target?.words.length) return;
+
+    const previousEnd = captions[captionIndex - 1]?.end ?? 0;
+    const followingStart =
+      captions[captionIndex + 1]?.start ?? Math.max(duration, requestedEnd);
+    const updatedCaption = retimeCaption(
+      target,
+      requestedStart,
+      requestedEnd,
+      previousEnd,
+      followingStart,
+    ) as Caption;
+
+    setCaptions((items) =>
+      items.map((caption) =>
+        caption.id === captionId ? updatedCaption : caption,
+      ),
+    );
+    setHasChanges(true);
+    setToast("Caption timing updated.");
+    seek(updatedCaption.start);
+  };
+
+  const finishSelectedCaption = () => {
+    if (!selectedCaption) return;
+    const captionIndex = captions.findIndex(
+      (caption) => caption.id === selectedCaption.id,
+    );
+    const nextCaption = captions[captionIndex + 1];
+    setLoopRange(null);
+    if (!nextCaption) {
+      videoRef.current?.pause();
+      setTab("style");
+      setToast("Captions saved. Pick a look.");
+      return;
+    }
+    setSelectedCaptionId(nextCaption.id);
+    setSelectedWordIndex(0);
+    seek(nextCaption.start);
   };
 
   const updateSelectedWordText = (text: string) => {
@@ -1103,7 +1112,6 @@ export default function Home() {
       };
       return words;
     });
-    markWordsHandled([selectedWord.id]);
   };
 
   const commitCaptionDraft = () => {
@@ -1173,17 +1181,11 @@ export default function Home() {
     setSelectedWordIndex((current) =>
       Math.min(current, Math.max(0, tokens.length - 1)),
     );
-    if (sameWordCount) {
-      markWordsHandled(selectedCaption.words.map((word) => word.id));
-      setToast("Caption text updated. Word timing stayed intact.");
-    } else {
-      setApprovedWordIds((current) =>
-        current.filter(
-          (id) => !selectedCaption.words.some((word) => word.id === id),
-        ),
-      );
-      setToast("Caption updated. Check the new word boundaries before export.");
-    }
+    setToast(
+      sameWordCount
+        ? "Caption text updated. Word timing stayed intact."
+        : "Caption updated. Play the line once to check its new word timing.",
+    );
   };
 
   const adjustSelectedEdge = (
@@ -1216,7 +1218,6 @@ export default function Home() {
       word.source = "manual";
       return words;
     });
-    markWordsHandled([selectedWord.id]);
   };
 
   const shiftSelectedWord = (delta: number) => {
@@ -1238,39 +1239,7 @@ export default function Home() {
       word.source = "manual";
       return words;
     });
-    markWordsHandled([selectedWord.id]);
     jumpTo(nextStart);
-  };
-
-  const shiftSelectedPhrase = (delta: number) => {
-    if (!selectedCaption?.words.length) return;
-    const captionIndex = captions.findIndex(
-      (caption) => caption.id === selectedCaption.id,
-    );
-    const first = selectedCaption.words[0];
-    const last = selectedCaption.words.at(-1)!;
-    const previousEnd =
-      captions[captionIndex - 1]?.words.at(-1)?.end ?? 0;
-    const nextStart =
-      captions[captionIndex + 1]?.words[0]?.start ??
-      Math.max(duration, last.end);
-    const resolvedDelta = clamp(
-      delta,
-      previousEnd - first.start,
-      nextStart - last.end,
-    );
-    updateCaptionWords(selectedCaption.id, (words) =>
-      words.map((word) => ({
-        ...word,
-        start: Number((word.start + resolvedDelta).toFixed(3)),
-        end: Number((word.end + resolvedDelta).toFixed(3)),
-        confidence: 1,
-        source: "manual",
-      })),
-    );
-    markWordsHandled(selectedCaption.words.map((word) => word.id));
-    const nextTime = Math.max(0, currentTime + resolvedDelta);
-    jumpTo(nextTime);
   };
 
   const toggleWordLoop = () => {
@@ -1489,15 +1458,11 @@ export default function Home() {
       {!file ? (
         <section className="launch">
           <div className="launch-copy">
-            <span className="eyebrow">ASSAMESE + BODO CREATOR CAPTIONS</span>
-            <h1>
-              Your words.
-              <br />
-              <em>Ready to post.</em>
-            </h1>
+            <span className="eyebrow">NEW CAPTION VIDEO</span>
+            <h1>What are we captioning?</h1>
             <p>
-              Choose a reel. SyncWord writes the captions. You watch, tap what
-              feels wrong, and pick a look.
+              Add an Assamese, Bodo, or mixed-language reel. You can fix every
+              line before making the final video.
             </p>
           </div>
 
@@ -1582,33 +1547,29 @@ export default function Home() {
             </button>
           </div>
 
-          <ol className="promise-row">
+          <ol className="promise-row" aria-label="How SyncWord works">
             <li>
-              <b>01</b>
+              <b>1</b>
               <div>
-                <strong>Watch</strong>
-                <span>Captions appear on your video automatically</span>
+                <strong>Automatic captions</strong>
+                <span>See them on the video first</span>
               </div>
             </li>
             <li>
-              <b>02</b>
+              <b>2</b>
               <div>
-                <strong>Tap</strong>
-                <span>Change any sentence that does not feel right</span>
+                <strong>Tap to correct</strong>
+                <span>Change text and timing directly</span>
               </div>
             </li>
             <li>
-              <b>03</b>
+              <b>3</b>
               <div>
-                <strong>Share</strong>
-                <span>Pick a look and make a post-ready video</span>
+                <strong>Export once</strong>
+                <span>Rendering starts only when you approve</span>
               </div>
             </li>
           </ol>
-
-          <p className="truth-line">
-            Nothing is burned into your original video until you say so.
-          </p>
         </section>
       ) : (
         <div className="creator-workspace">
@@ -1818,64 +1779,54 @@ export default function Home() {
               )}
 
               {tab === "review" && selectedCaption && selectedWord && (
-                <div className="review-panel">
-                  <div className="review-heading">
-                    <small>STEP 1 · CAPTIONS</small>
-                    <h2>Watch. Tap. Fix.</h2>
-                    <p>
-                      Trust what you hear. Tap a caption only when the words or
-                      highlight feel wrong.
-                    </p>
-                  </div>
+                <div className="caption-editor">
+                  <header className="caption-editor-heading">
+                    <div>
+                      <small>CAPTIONS</small>
+                      <h2>Make it sound right.</h2>
+                      <p>Play the video. Tap the exact line or word you hear.</p>
+                    </div>
+                    <button onClick={() => setTab("style")}>Style</button>
+                  </header>
 
-                  {unresolvedItems.length > 0 ? (
-                    <div className="sync-assist">
-                      <i>♪</i>
-                      <div>
-                        <strong>Want a useful starting point?</strong>
-                        <span>
-                          Replay one moment where a word highlight may feel
-                          uncertain.
-                        </span>
-                      </div>
+                  <CaptionTimeline
+                    cues={captions}
+                    duration={duration}
+                    currentTime={currentTime}
+                    selectedCueId={selectedCaption.id}
+                    onSelect={(captionId, time) => {
+                      setSelectedCaptionId(captionId);
+                      setSelectedWordIndex(0);
+                      setLoopRange(null);
+                      seek(time);
+                    }}
+                    onChange={updateCaptionTiming}
+                  />
+
+                  <section className="caption-composer">
+                    <div className="composer-topline">
+                      <span>
+                        Line {captions.findIndex((caption) => caption.id === selectedCaption.id) + 1}
+                        <b>{compactTime(selectedCaption.start)}–{compactTime(selectedCaption.end)}</b>
+                      </span>
                       <button
-                        onClick={() => selectReviewItem(unresolvedItems[0], true)}
+                        onClick={() => {
+                          const range = {
+                            start: Math.max(0, selectedCaption.start - 0.18),
+                            end: Math.min(duration, selectedCaption.end + 0.18),
+                          };
+                          loopRangeRef.current = range;
+                          setLoopRange(range);
+                          jumpTo(range.start);
+                          void videoRef.current?.play();
+                        }}
                       >
-                        Listen
+                        ▶ Play line
                       </button>
                     </div>
-                  ) : (
-                    <div className="all-clear-card">
-                      <i>✓</i>
-                      <div>
-                        <strong>Captions ready</strong>
-                        <span>
-                          Your ears are the final check. Change only what feels
-                          wrong.
-                        </span>
-                      </div>
-                      <button onClick={() => setTab("style")}>Style captions</button>
-                    </div>
-                  )}
 
-                  <div className="selected-word-card">
-                    <div className="word-card-topline">
-                      <span
-                        className={
-                          isReviewCandidate(selectedWord) ? "attention" : ""
-                        }
-                      >
-                        {isReviewCandidate(selectedWord)
-                          ? "Replay this moment"
-                          : "Now editing"}
-                      </span>
-                      <small>Tap another word anytime</small>
-                    </div>
-
-                    <div className="caption-edit-field">
-                      <label htmlFor="caption-text">
-                        What should people read?
-                      </label>
+                    <label className="line-editor" htmlFor="caption-text">
+                      <span>Caption text</span>
                       <textarea
                         id="caption-text"
                         rows={2}
@@ -1897,246 +1848,103 @@ export default function Home() {
                             event.currentTarget.blur();
                           }
                         }}
-                        aria-describedby="caption-edit-help"
-                      />
-                      <div>
-                        <small id="caption-edit-help">
-                          Fix the sentence here, then press Save.
-                        </small>
-                        <button onClick={commitCaptionDraft}>Save</button>
-                      </div>
-                    </div>
-
-                    <label className="word-text-field">
-                      <span>Tapped word</span>
-                      <input
-                        value={selectedWord.text}
-                        onChange={(event) =>
-                          updateSelectedWordText(event.target.value)
-                        }
-                        aria-label="Selected word text"
                       />
                     </label>
 
-                    <button
-                      className={`listen-button ${isLooping ? "active" : ""}`}
-                      onClick={toggleWordLoop}
-                    >
-                      <i>{isLooping ? "■" : "▶"}</i>
-                      <span>
-                        <strong>
-                          {isLooping ? "Stop listening" : "Loop this word"}
-                        </strong>
-                        <small>
-                          {preciseTime(selectedWord.start)}–{preciseTime(selectedWord.end)}
-                        </small>
-                      </span>
-                      <b>
-                        {canHighlightWord(selectedWord) ? "HIGHLIGHT" : "LINE"}
-                      </b>
-                    </button>
-
-                    <div className="quick-sync">
-                      <div>
-                        <strong>Highlight feels off?</strong>
-                        <span>Nudge the tapped word while you listen.</span>
-                      </div>
-                      <button onClick={() => shiftSelectedWord(-0.06)}>
-                        ← Earlier
-                      </button>
-                      <button onClick={() => shiftSelectedWord(0.06)}>
-                        Later →
-                      </button>
+                    <div className="composer-save-row">
+                      <span>Tap a word to fix its highlight.</span>
+                      <button onClick={commitCaptionDraft}>Save text</button>
                     </div>
 
-                    <details
-                      className="timing-tools"
-                      key={selectedWord.id}
-                    >
-                      <summary>
-                        <span>More timing control</span>
-                        <small>optional</small>
-                      </summary>
-
-                      <div className="timing-strip">
-                        <div className="timing-ruler">
-                          {timingNeighborhood.map((item) => {
-                            const wordDuration = Math.max(
-                              0.08,
-                              item.word.end - item.word.start,
-                            );
-                            return (
-                              <button
-                                key={item.word.id}
-                                className={
-                                  item.word.id === selectedWord.id
-                                    ? "selected"
-                                    : ""
-                                }
-                                style={{ flexGrow: wordDuration }}
-                                onClick={() => selectReviewItem(item)}
-                              >
-                                <span>{item.word.text}</span>
-                                <small>{preciseTime(item.word.start)}</small>
-                              </button>
-                            );
-                          })}
-                        </div>
-                        <div className="playhead" aria-hidden="true">
-                          <span />
-                        </div>
-                      </div>
-
-                      <div className="precision-controls">
-                        <div className="control-row">
-                          <div>
-                            <span>Word start</span>
-                            <strong>{selectedWord.start.toFixed(3)}s</strong>
-                          </div>
-                          <button
-                            onClick={() => adjustSelectedEdge("start", -0.03)}
-                            aria-label="Move word start 30 milliseconds earlier"
-                          >
-                            −30
-                          </button>
-                          <button
-                            onClick={() => adjustSelectedEdge("start", 0.03)}
-                            aria-label="Move word start 30 milliseconds later"
-                          >
-                            +30
-                          </button>
-                        </div>
-                        <div className="control-row">
-                          <div>
-                            <span>Word end</span>
-                            <strong>{selectedWord.end.toFixed(3)}s</strong>
-                          </div>
-                          <button
-                            onClick={() => adjustSelectedEdge("end", -0.03)}
-                            aria-label="Move word end 30 milliseconds earlier"
-                          >
-                            −30
-                          </button>
-                          <button
-                            onClick={() => adjustSelectedEdge("end", 0.03)}
-                            aria-label="Move word end 30 milliseconds later"
-                          >
-                            +30
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="shift-actions">
-                        <button onClick={() => shiftSelectedWord(-0.03)}>
-                          <span>←</span>
-                          Word 30 ms
-                        </button>
-                        <button onClick={() => shiftSelectedWord(0.03)}>
-                          Word 30 ms
-                          <span>→</span>
-                        </button>
-                        <button onClick={() => shiftSelectedPhrase(-0.1)}>
-                          <span>←</span>
-                          Phrase 100 ms
-                        </button>
-                        <button onClick={() => shiftSelectedPhrase(0.1)}>
-                          Phrase 100 ms
-                          <span>→</span>
-                        </button>
-                      </div>
-                    </details>
-
-                    <button
-                      className="approve-button"
-                      onClick={approveSelectedAndContinue}
-                    >
-                      <span>
-                        <strong>Looks right</strong>
-                        <small>
-                          {unresolvedItems.length > 1
-                            ? "save and keep watching"
-                            : "save this correction"}
-                        </small>
-                      </span>
-                      <b>✓</b>
-                    </button>
-                  </div>
-
-                  <div className="transcript-section">
-                    <div className="section-label">
-                      <span>Your captions</span>
-                      <small>tap a line</small>
-                    </div>
-                    <div className="phrase-tabs">
-                      {captions.map((caption, index) => (
+                    <div className="word-strip" aria-label="Words in this caption">
+                      {selectedWords.map((word, index) => (
                         <button
-                          key={caption.id}
-                          className={
-                            caption.id === selectedCaption.id ? "active" : ""
+                          key={word.id}
+                          className={index === selectedWordIndex ? "active" : ""}
+                          onClick={() =>
+                            selectReviewItem({
+                              captionId: selectedCaption.id,
+                              captionIndex: captions.findIndex(
+                                (caption) => caption.id === selectedCaption.id,
+                              ),
+                              wordIndex: index,
+                              globalIndex:
+                                flatWords.find((item) => item.word.id === word.id)
+                                  ?.globalIndex ?? 0,
+                              word,
+                            })
                           }
-                          onClick={() => {
-                            setSelectedCaptionId(caption.id);
-                            setSelectedWordIndex(0);
-                            seek(caption.words[0]?.start ?? caption.start);
-                          }}
                         >
-                          <small>
-                            {compactTime(caption.start)} ·{" "}
-                            {String(index + 1).padStart(2, "0")}
-                          </small>
-                          <span>{caption.text}</span>
-                          {caption.words.some(
-                            (word) =>
-                              isReviewCandidate(word) &&
-                              !approvedWordIdSet.has(word.id),
-                          ) && <i>!</i>}
+                          {word.text}
                         </button>
                       ))}
                     </div>
-                    <p className="word-hint">
-                      Tap a word below when its highlight feels early or late.
-                    </p>
-                    <div className="word-grid">
-                      {selectedWords.map((word, index) => {
-                        const needsReview =
-                          isReviewCandidate(word) &&
-                          !approvedWordIdSet.has(word.id);
-                        return (
-                          <button
-                            key={word.id}
-                            className={[
-                              index === selectedWordIndex ? "active" : "",
-                              needsReview ? "review" : "",
-                              approvedWordIdSet.has(word.id)
-                                ? "approved"
-                                : "",
-                            ]
-                              .filter(Boolean)
-                              .join(" ")}
-                            onClick={() =>
-                              selectReviewItem({
-                                captionId: selectedCaption.id,
-                                captionIndex: captions.findIndex(
-                                  (caption) =>
-                                    caption.id === selectedCaption.id,
-                                ),
-                                wordIndex: index,
-                                globalIndex:
-                                  flatWords.find(
-                                    (item) => item.word.id === word.id,
-                                  )?.globalIndex ?? 0,
-                                word,
-                              })
-                            }
-                          >
-                            <span>{word.text}</span>
-                            {needsReview && <i>!</i>}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
 
+                    <div className="word-sync-card">
+                      <button
+                        className={`word-loop ${isLooping ? "active" : ""}`}
+                        onClick={toggleWordLoop}
+                        aria-label={isLooping ? "Stop word loop" : "Loop selected word"}
+                      >
+                        {isLooping ? "■" : "▶"}
+                      </button>
+                      <label>
+                        <span>Selected word</span>
+                        <input
+                          value={selectedWord.text}
+                          onChange={(event) => updateSelectedWordText(event.target.value)}
+                        />
+                      </label>
+                      <div>
+                        <button onClick={() => shiftSelectedWord(-0.06)}>← Earlier</button>
+                        <button onClick={() => shiftSelectedWord(0.06)}>Later →</button>
+                      </div>
+                    </div>
+
+                    <details className="fine-timing" key={selectedWord.id}>
+                      <summary>
+                        <span>Fine timing</span>
+                        <small>{preciseTime(selectedWord.start)}–{preciseTime(selectedWord.end)}</small>
+                      </summary>
+                      <div>
+                        <button onClick={() => adjustSelectedEdge("start", -0.03)}>Start −30 ms</button>
+                        <button onClick={() => adjustSelectedEdge("start", 0.03)}>Start +30 ms</button>
+                        <button onClick={() => adjustSelectedEdge("end", -0.03)}>End −30 ms</button>
+                        <button onClick={() => adjustSelectedEdge("end", 0.03)}>End +30 ms</button>
+                      </div>
+                    </details>
+
+                    <button className="next-caption" onClick={finishSelectedCaption}>
+                      <span>
+                        <strong>Done with this line</strong>
+                        <small>
+                          {captions.at(-1)?.id === selectedCaption.id
+                            ? "pick a style next"
+                            : "move to the next line"}
+                        </small>
+                      </span>
+                      <b>→</b>
+                    </button>
+                  </section>
+
+                  <nav className="caption-list" aria-label="All captions">
+                    {captions.map((caption, index) => (
+                      <button
+                        key={caption.id}
+                        className={caption.id === selectedCaption.id ? "active" : ""}
+                        onClick={() => {
+                          setSelectedCaptionId(caption.id);
+                          setSelectedWordIndex(0);
+                          setLoopRange(null);
+                          seek(caption.start);
+                        }}
+                      >
+                        <b>{String(index + 1).padStart(2, "0")}</b>
+                        <span>{caption.text}</span>
+                        <small>{compactTime(caption.start)}</small>
+                      </button>
+                    ))}
+                  </nav>
                 </div>
               )}
 
