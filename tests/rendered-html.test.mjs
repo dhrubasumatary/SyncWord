@@ -40,14 +40,14 @@ test("server-renders the SyncWord editor", async () => {
     html,
     /<title>SyncWord — Edit captions\. Then export\.<\/title>/i,
   );
-  assert.match(html, /Add captions\./);
-  assert.match(html, /Fix\. Export\./);
-  assert.match(html, /Upload your reel/);
+  assert.match(html, /Your words\./);
+  assert.match(html, /Ready to post\./);
+  assert.match(html, /Choose a video/);
   assert.match(html, /3 min \/ 90 MB/);
-  assert.match(html, /We create captions from the speech/);
-  assert.match(html, /Tap any sentence or word/);
-  assert.match(html, /original video stays untouched/);
-  assert.match(html, /Export when the preview looks right/);
+  assert.match(html, /Captions appear on your video automatically/);
+  assert.match(html, /Change any sentence that does not feel right/);
+  assert.match(html, /Nothing is burned into your original video/);
+  assert.match(html, /Pick a look and make a post-ready video/);
   assert.doesNotMatch(
     html,
     /মোৰ ভাষা|आंनि राव|brahmaputra-stories|MAJULI/i,
@@ -67,15 +67,15 @@ test("removes the disposable starter and wires product metadata", async () => {
 
   assert.match(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
-  assert.match(page, /Exact speech/);
+  assert.match(page, /Everything said/);
   assert.match(page, /Loop this word/);
-  assert.match(page, /Caption text/);
-  assert.match(page, /Fine-tune timing/);
+  assert.match(page, /What should people read/);
+  assert.match(page, /More timing control/);
   assert.match(page, /Word start/);
   assert.match(page, /Phrase 100 ms/);
-  assert.match(page, /Done with this word/);
-  assert.match(page, /Preview looks right — render/);
-  assert.match(page, /reliable words animate · uncertain lines stay steady/);
+  assert.match(page, /Looks right/);
+  assert.match(page, /Make my video/);
+  assert.match(page, /uncertain words stay steady instead of drifting/);
   assert.match(page, /revision\.json\?check=/);
   assert.match(page, /Reload before making captions/);
   assert.match(page, /expectedCaptionQualityRevision/);

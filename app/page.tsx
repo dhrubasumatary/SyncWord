@@ -113,7 +113,7 @@ type ReviewItem = {
 type LoopRange = { start: number; end: number } | null;
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
-const appRevision = "syncword-web-2026-08-07-v22";
+const appRevision = "syncword-web-2026-08-07-v23";
 const expectedCaptionQualityRevision = "perceptual-gate-v1";
 
 const defaultStyle: CaptionStyle = {
@@ -361,11 +361,6 @@ function isReviewCandidate(word: WordTiming) {
   return word.highlightReason === "invalid_boundary";
 }
 
-function confidenceLabel(word: WordTiming) {
-  if (word.source === "manual") return "Your timing";
-  return canHighlightWord(word) ? "Word animation" : "Phrase timing";
-}
-
 export default function Home() {
   const [tab, setTab] = useState<StudioTab>("review");
   const [file, setFile] = useState<File | null>(null);
@@ -378,6 +373,7 @@ export default function Home() {
   const [transcriptMode, setTranscriptMode] =
     useState<TranscriptMode>("codemix");
   const [captionStyle, setCaptionStyle] = useState(defaultStyle);
+  const [activePresetName, setActivePresetName] = useState("Signal");
   const [captions, setCaptions] = useState<Caption[]>([]);
   const [selectedCaptionId, setSelectedCaptionId] = useState("");
   const [selectedWordIndex, setSelectedWordIndex] = useState(0);
@@ -464,11 +460,6 @@ export default function Home() {
   const unresolvedItems = flaggedItems.filter(
     (item) => !approvedWordIdSet.has(item.word.id),
   );
-  const verifiedWords = Math.max(0, flatWords.length - unresolvedItems.length);
-  const reviewPercent = flatWords.length
-    ? Math.round((verifiedWords / flatWords.length) * 100)
-    : 0;
-  const alignment = job?.alignment;
   const activeCaption = captions.find(
     (caption) =>
       currentTime >= caption.start && currentTime < caption.end,
@@ -947,6 +938,7 @@ export default function Home() {
     setLoopRange(null);
     setJob(null);
     setHasChanges(false);
+    setActivePresetName("Signal");
     setTab("review");
   };
 
@@ -989,6 +981,7 @@ export default function Home() {
     setLoopRange(null);
     setJob(null);
     setHasChanges(false);
+    setActivePresetName("Signal");
     setTab("review");
     void uploadVideo(nextFile);
   };
@@ -1048,21 +1041,6 @@ export default function Home() {
           void videoRef.current.play();
         }
       }, 40);
-    }
-  };
-
-  const goToNextIssue = () => {
-    const next =
-      unresolvedItems.find(
-        (item) => item.globalIndex > (selectedItem?.globalIndex ?? -1),
-      ) ?? unresolvedItems[0];
-    if (next) {
-      setTab("review");
-      selectReviewItem(next, true);
-    } else {
-      setLoopRange(null);
-      setToast("Captions ready. Choose a style.");
-      setTab("style");
     }
   };
 
@@ -1312,18 +1290,13 @@ export default function Home() {
     void videoRef.current.play();
   };
 
-  const startRender = async (allowUnresolved = false) => {
+  const startRender = async () => {
     if (
       !job ||
       !["ready", "complete"].includes(job.status) ||
       (!usingDurableMedia && !apiBase) ||
       !captions.length
     ) {
-      return;
-    }
-    if (unresolvedItems.length && !allowUnresolved) {
-      setTab("export");
-      setToast("One caption needs a quick playback check.");
       return;
     }
     setUploading(true);
@@ -1372,8 +1345,12 @@ export default function Home() {
     link.click();
   };
 
-  const setStyle = (values: Partial<CaptionStyle>) => {
+  const setStyle = (
+    values: Partial<CaptionStyle>,
+    presetName = "",
+  ) => {
     setCaptionStyle((current) => ({ ...current, ...values }));
+    setActivePresetName(presetName);
     setHasChanges(true);
   };
 
@@ -1400,8 +1377,7 @@ export default function Home() {
       return;
     }
     if (tab === "review") {
-      if (unresolvedItems.length) goToNextIssue();
-      else setTab("style");
+      setTab("style");
       return;
     }
     if (tab === "style") {
@@ -1427,15 +1403,10 @@ export default function Home() {
       return `${job.message ?? "Processing"} · ${job.progress}%`;
     }
     if (tab === "review") {
-      return unresolvedItems.length
-        ? "Open captions"
-        : "Continue to style";
+      return "Choose a caption look";
     }
     if (tab === "style") return "Continue to export";
-    if (job.status === "ready" && unresolvedItems.length) {
-      return "Open captions";
-    }
-    if (job.status === "ready") return "Render final video";
+    if (job.status === "ready") return "Make my video";
     if (job.status === "complete" && hasChanges) return "Update final video";
     return "Download final MP4";
   })();
@@ -1518,15 +1489,15 @@ export default function Home() {
       {!file ? (
         <section className="launch">
           <div className="launch-copy">
-            <span className="eyebrow">AUTO CAPTIONS FOR ASSAMESE + BODO</span>
+            <span className="eyebrow">ASSAMESE + BODO CREATOR CAPTIONS</span>
             <h1>
-              Add captions.
+              Your words.
               <br />
-              <em>Fix. Export.</em>
+              <em>Ready to post.</em>
             </h1>
             <p>
-              Pick a reel. Edit the captions while it plays. Export only when
-              it looks right.
+              Choose a reel. SyncWord writes the captions. You watch, tap what
+              feels wrong, and pick a look.
             </p>
           </div>
 
@@ -1558,13 +1529,22 @@ export default function Home() {
               </div>
             </div>
 
-            <div className="transcript-row">
-              <span>Transcript</span>
+            <details className="transcript-row">
+              <summary>
+                <span>How should captions be written?</span>
+                <strong>
+                  {transcriptMode === "verbatim"
+                    ? "Everything said"
+                    : transcriptMode === "transcribe"
+                      ? "Cleaned up"
+                      : "Natural mix"}
+                </strong>
+              </summary>
               <div>
                 {[
                   ["codemix", "Natural mix"],
-                  ["verbatim", "Exact speech"],
-                  ["transcribe", "Clean"],
+                  ["verbatim", "Everything said"],
+                  ["transcribe", "Cleaned up"],
                 ].map(([value, label]) => (
                   <button
                     key={value}
@@ -1579,12 +1559,12 @@ export default function Home() {
               </div>
               <small>
                 {transcriptMode === "verbatim"
-                  ? "Keeps fillers and repetitions for an exact spoken transcript."
+                  ? "Keeps fillers, repetitions, and the way the person actually spoke."
                   : transcriptMode === "transcribe"
-                    ? "Cleans up speech while keeping the spoken language."
-                    : "English stays English; regional speech stays in its native script."}
+                    ? "Removes some speech clutter while keeping the original language."
+                    : "Recommended: English stays English and regional speech stays in its own script."}
               </small>
-            </div>
+            </details>
 
             <button
               className="upload-reel"
@@ -1597,7 +1577,7 @@ export default function Home() {
               }}
             >
               <i>＋</i>
-              <strong>Upload your reel</strong>
+              <strong>Choose a video</strong>
               <small>MVP · up to 3 min / 90 MB</small>
             </button>
           </div>
@@ -1606,28 +1586,28 @@ export default function Home() {
             <li>
               <b>01</b>
               <div>
-                <strong>Add</strong>
-                <span>We create captions from the speech in your reel</span>
+                <strong>Watch</strong>
+                <span>Captions appear on your video automatically</span>
               </div>
             </li>
             <li>
               <b>02</b>
               <div>
-                <strong>Fix</strong>
-                <span>Tap any sentence or word and change it</span>
+                <strong>Tap</strong>
+                <span>Change any sentence that does not feel right</span>
               </div>
             </li>
             <li>
               <b>03</b>
               <div>
-                <strong>Post</strong>
-                <span>Export when the preview looks right to you</span>
+                <strong>Share</strong>
+                <span>Pick a look and make a post-ready video</span>
               </div>
             </li>
           </ol>
 
           <p className="truth-line">
-            Your original video stays untouched until you export.
+            Nothing is burned into your original video until you say so.
           </p>
         </section>
       ) : (
@@ -1728,8 +1708,8 @@ export default function Home() {
                   </button>
                   <ol>
                     {(job?.status === "rendering"
-                      ? ["Upload", "Transcript", "Sync", "Review", "Render"]
-                      : ["Upload", "Audio", "Transcript", "Word sync"]
+                      ? ["Upload", "Captions", "Review", "Style", "Video"]
+                      : ["Upload", "Listen", "Write", "Ready"]
                     ).map((label, index) => (
                       <li
                         key={label}
@@ -1775,14 +1755,12 @@ export default function Home() {
             </div>
 
             {captions.length > 0 && (
-              <div className="mobile-review-meter">
-                <span style={{ width: `${reviewPercent}%` }} />
+              <div className="creator-hint">
+                <span>1</span>
                 <div>
-                  <strong>{verifiedWords} checked</strong>
+                  <strong>Play it once.</strong>
                   <small>
-                    {unresolvedItems.length
-                      ? `${unresolvedItems.length} need attention`
-                      : "sync ready"}
+                    Tap any caption below when the words or timing feel wrong.
                   </small>
                 </div>
               </div>
@@ -1797,9 +1775,9 @@ export default function Home() {
             >
               {(
                 [
-                  ["review", "CC", "Captions"],
-                  ["style", "Aa", "Style"],
-                  ["export", "↑", "Export"],
+                  ["review", "1", "Captions"],
+                  ["style", "2", "Look"],
+                  ["export", "3", "Export"],
                 ] as const
               ).map(([value, number, label]) => (
                 <button
@@ -1812,9 +1790,6 @@ export default function Home() {
                 >
                   <i>{number}</i>
                   <span>{label}</span>
-                  {value === "review" && unresolvedItems.length > 0 && (
-                    <b>{unresolvedItems.length}</b>
-                  )}
                 </button>
               ))}
             </nav>
@@ -1825,12 +1800,11 @@ export default function Home() {
                   <span className="panel-icon">⌁</span>
                   <h2>
                     {job?.status === "failed"
-                      ? "That sync needs another go."
-                      : "Building your editable preview."}
+                      ? "That video needs another try."
+                      : "Listening to your video…"}
                   </h2>
                   <p>
-                    Listening to the reel and preparing captions you can change
-                    before anything is exported.
+                    Your editable captions will appear here automatically.
                   </p>
                   {job && (
                     <div className="waiting-progress">
@@ -1846,47 +1820,29 @@ export default function Home() {
               {tab === "review" && selectedCaption && selectedWord && (
                 <div className="review-panel">
                   <div className="review-heading">
-                    <div>
-                      <small>CAPTIONS</small>
-                      <h2>Edit while the video plays.</h2>
-                      <p>Tap a line or word to change it.</p>
-                    </div>
-                    <div
-                      className="review-score"
-                      style={
-                        { "--review": reviewPercent } as CSSProperties
-                      }
-                    >
-                      <strong>{reviewPercent}%</strong>
-                      <span>checked</span>
-                    </div>
+                    <small>STEP 1 · CAPTIONS</small>
+                    <h2>Watch. Tap. Fix.</h2>
+                    <p>
+                      Trust what you hear. Tap a caption only when the words or
+                      highlight feel wrong.
+                    </p>
                   </div>
 
                   {unresolvedItems.length > 0 ? (
-                    <div className="issue-queue" aria-label="Captions to check">
-                      <div className="section-label">
-                        <span>Playback check</span>
-                        <small>{unresolvedItems.length}</small>
-                      </div>
+                    <div className="sync-assist">
+                      <i>♪</i>
                       <div>
-                        {unresolvedItems.map((item) => (
-                          <button
-                            key={item.word.id}
-                            className={
-                              item.word.id === selectedWord.id ? "active" : ""
-                            }
-                            onClick={() => selectReviewItem(item, true)}
-                            aria-current={
-                              item.word.id === selectedWord.id
-                                ? "true"
-                                : undefined
-                            }
-                          >
-                            <span>{item.word.text}</span>
-                            <small>{preciseTime(item.word.start)}</small>
-                          </button>
-                        ))}
+                        <strong>Want a useful starting point?</strong>
+                        <span>
+                          Replay one moment where a word highlight may feel
+                          uncertain.
+                        </span>
                       </div>
+                      <button
+                        onClick={() => selectReviewItem(unresolvedItems[0], true)}
+                      >
+                        Listen
+                      </button>
                     </div>
                   ) : (
                     <div className="all-clear-card">
@@ -1894,7 +1850,7 @@ export default function Home() {
                       <div>
                         <strong>Captions ready</strong>
                         <span>
-                          Play through them and change anything that sounds
+                          Your ears are the final check. Change only what feels
                           wrong.
                         </span>
                       </div>
@@ -1909,21 +1865,16 @@ export default function Home() {
                           isReviewCandidate(selectedWord) ? "attention" : ""
                         }
                       >
-                        {confidenceLabel(selectedWord)}
+                        {isReviewCandidate(selectedWord)
+                          ? "Replay this moment"
+                          : "Now editing"}
                       </span>
-                      <small>
-                        Phrase{" "}
-                        {String(
-                          captions.findIndex(
-                            (caption) => caption.id === selectedCaption.id,
-                          ) + 1,
-                        ).padStart(2, "0")}
-                      </small>
+                      <small>Tap another word anytime</small>
                     </div>
 
                     <div className="caption-edit-field">
                       <label htmlFor="caption-text">
-                        Caption text
+                        What should people read?
                       </label>
                       <textarea
                         id="caption-text"
@@ -1950,15 +1901,14 @@ export default function Home() {
                       />
                       <div>
                         <small id="caption-edit-help">
-                          Change the sentence here. Tap a word below for exact
-                          timing.
+                          Fix the sentence here, then press Save.
                         </small>
                         <button onClick={commitCaptionDraft}>Save</button>
                       </div>
                     </div>
 
                     <label className="word-text-field">
-                      <span>Selected word</span>
+                      <span>Tapped word</span>
                       <input
                         value={selectedWord.text}
                         onChange={(event) =>
@@ -1982,24 +1932,30 @@ export default function Home() {
                         </small>
                       </span>
                       <b>
-                        {canHighlightWord(selectedWord) ? "WORD" : "LINE"}
+                        {canHighlightWord(selectedWord) ? "HIGHLIGHT" : "LINE"}
                       </b>
                     </button>
+
+                    <div className="quick-sync">
+                      <div>
+                        <strong>Highlight feels off?</strong>
+                        <span>Nudge the tapped word while you listen.</span>
+                      </div>
+                      <button onClick={() => shiftSelectedWord(-0.06)}>
+                        ← Earlier
+                      </button>
+                      <button onClick={() => shiftSelectedWord(0.06)}>
+                        Later →
+                      </button>
+                    </div>
 
                     <details
                       className="timing-tools"
                       key={selectedWord.id}
-                      open={
-                        isReviewCandidate(selectedWord) &&
-                        !approvedWordIdSet.has(selectedWord.id)
-                      }
                     >
                       <summary>
-                        <span>Fine-tune timing</span>
-                        <small>
-                          {preciseTime(selectedWord.start)}–
-                          {preciseTime(selectedWord.end)}
-                        </small>
+                        <span>More timing control</span>
+                        <small>optional</small>
                       </summary>
 
                       <div className="timing-strip">
@@ -2095,11 +2051,11 @@ export default function Home() {
                       onClick={approveSelectedAndContinue}
                     >
                       <span>
-                        <strong>Done with this word</strong>
+                        <strong>Looks right</strong>
                         <small>
                           {unresolvedItems.length > 1
-                            ? "save & play next suggestion"
-                            : "finish caption check"}
+                            ? "save and keep watching"
+                            : "save this correction"}
                         </small>
                       </span>
                       <b>✓</b>
@@ -2108,8 +2064,8 @@ export default function Home() {
 
                   <div className="transcript-section">
                     <div className="section-label">
-                      <span>Caption track</span>
-                      <small>tap any caption</small>
+                      <span>Your captions</span>
+                      <small>tap a line</small>
                     </div>
                     <div className="phrase-tabs">
                       {captions.map((caption, index) => (
@@ -2137,6 +2093,9 @@ export default function Home() {
                         </button>
                       ))}
                     </div>
+                    <p className="word-hint">
+                      Tap a word below when its highlight feels early or late.
+                    </p>
                     <div className="word-grid">
                       {selectedWords.map((word, index) => {
                         const needsReview =
@@ -2178,30 +2137,16 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="alignment-truth">
-                    <span>Caption playback</span>
-                    <div>
-                      <strong>
-                        {alignment?.highlightSafeWords ?? flatWords.length} words
-                        animate individually
-                      </strong>
-                      <small>
-                        Other lines stay steady instead of showing a drifting
-                        highlight.
-                      </small>
-                    </div>
-                  </div>
                 </div>
               )}
 
               {tab === "style" && (
                 <div className="style-panel">
                   <div className="panel-heading">
-                    <small>INSTANT CLIENT PREVIEW</small>
-                    <h2>Choose the energy.</h2>
+                    <small>STEP 2 · LOOK</small>
+                    <h2>Pick a look. Watch it live.</h2>
                     <p>
-                      These controls change the overlay immediately. No video
-                      render is running.
+                      Tap a style, then play the video. Nothing is rendering yet.
                     </p>
                   </div>
 
@@ -2209,7 +2154,11 @@ export default function Home() {
                     {presets.map((preset) => (
                       <button
                         key={preset.name}
-                        onClick={() => setStyle(preset.values)}
+                        className={
+                          activePresetName === preset.name ? "active" : ""
+                        }
+                        onClick={() => setStyle(preset.values, preset.name)}
+                        aria-pressed={activePresetName === preset.name}
                       >
                         <i
                           style={{
@@ -2231,98 +2180,110 @@ export default function Home() {
                     ))}
                   </div>
 
-                  <div className="select-grid">
-                    <label>
-                      Script font
-                      <select
-                        value={captionStyle.fontFamily}
-                        onChange={(event) =>
-                          setStyle({ fontFamily: event.target.value })
-                        }
-                      >
-                        <option>Noto Sans Bengali</option>
-                        <option>Noto Sans Devanagari</option>
-                      </select>
-                    </label>
-                    <label>
-                      Motion
-                      <select
-                        value={captionStyle.animation}
-                        onChange={(event) =>
-                          setStyle({
-                            animation: event.target
-                              .value as CaptionStyle["animation"],
-                          })
-                        }
-                      >
-                        <option value="pop">Pop</option>
-                        <option value="slide">Slide up</option>
-                        <option value="fade">Fade</option>
-                      </select>
-                    </label>
-                  </div>
+                  <details className="style-customizer">
+                    <summary>
+                      <span>
+                        <strong>Make it yours</strong>
+                        <small>colors, size, motion and position</small>
+                      </span>
+                      <b>＋</b>
+                    </summary>
 
-                  <div className="color-grid">
-                    {(
-                      [
-                        ["Words", "textColor"],
-                        ["Active", "highlightColor"],
-                        ["Box", "backgroundColor"],
-                      ] as const
-                    ).map(([label, key]) => (
-                      <label key={key}>
-                        <input
-                          type="color"
-                          value={captionStyle[key]}
-                          onChange={(event) =>
-                            setStyle({ [key]: event.target.value })
-                          }
-                        />
-                        <span>{label}</span>
-                      </label>
-                    ))}
-                  </div>
+                    <div className="style-customizer-body">
+                      <div className="select-grid">
+                        <label>
+                          Script font
+                          <select
+                            value={captionStyle.fontFamily}
+                            onChange={(event) =>
+                              setStyle({ fontFamily: event.target.value })
+                            }
+                          >
+                            <option>Noto Sans Bengali</option>
+                            <option>Noto Sans Devanagari</option>
+                          </select>
+                        </label>
+                        <label>
+                          Motion
+                          <select
+                            value={captionStyle.animation}
+                            onChange={(event) =>
+                              setStyle({
+                                animation: event.target
+                                  .value as CaptionStyle["animation"],
+                              })
+                            }
+                          >
+                            <option value="pop">Pop</option>
+                            <option value="slide">Slide up</option>
+                            <option value="fade">Fade</option>
+                          </select>
+                        </label>
+                      </div>
 
-                  <div className="range-stack">
-                    {[
-                      ["Size", "fontSize", 28, 84, "px"],
-                      ["Words on screen", "wordsPerCard", 2, 7, ""],
-                      ["Position", "position", 56, 90, "%"],
-                      ["Box", "backgroundOpacity", 0, 100, "%"],
-                      ["Outline", "outlineWidth", 0, 8, "px"],
-                    ].map(([label, key, min, max, suffix]) => (
-                      <label key={String(key)}>
-                        <span>
-                          {label}
-                          <b>
-                            {captionStyle[key as keyof CaptionStyle]}
-                            {suffix}
-                          </b>
-                        </span>
-                        <input
-                          type="range"
-                          min={Number(min)}
-                          max={Number(max)}
-                          value={Number(
-                            captionStyle[key as keyof CaptionStyle],
-                          )}
-                          onChange={(event) =>
-                            setStyle({
-                              [key]: Number(event.target.value),
-                            } as Partial<CaptionStyle>)
-                          }
-                        />
-                      </label>
-                    ))}
-                  </div>
+                      <div className="color-grid">
+                        {(
+                          [
+                            ["Words", "textColor"],
+                            ["Active", "highlightColor"],
+                            ["Box", "backgroundColor"],
+                          ] as const
+                        ).map(([label, key]) => (
+                          <label key={key}>
+                            <input
+                              type="color"
+                              value={captionStyle[key]}
+                              onChange={(event) =>
+                                setStyle({ [key]: event.target.value })
+                              }
+                            />
+                            <span>{label}</span>
+                          </label>
+                        ))}
+                      </div>
+
+                      <div className="range-stack">
+                        {[
+                          ["Size", "fontSize", 28, 84, "px"],
+                          ["Words on screen", "wordsPerCard", 2, 7, ""],
+                          ["Position", "position", 56, 90, "%"],
+                          ["Box", "backgroundOpacity", 0, 100, "%"],
+                          ["Outline", "outlineWidth", 0, 8, "px"],
+                        ].map(([label, key, min, max, suffix]) => (
+                          <label key={String(key)}>
+                            <span>
+                              {label}
+                              <b>
+                                {captionStyle[key as keyof CaptionStyle]}
+                                {suffix}
+                              </b>
+                            </span>
+                            <input
+                              type="range"
+                              min={Number(min)}
+                              max={Number(max)}
+                              value={Number(
+                                captionStyle[key as keyof CaptionStyle],
+                              )}
+                              onChange={(event) =>
+                                setStyle({
+                                  [key]: Number(event.target.value),
+                                } as Partial<CaptionStyle>)
+                              }
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </details>
 
                   <div className="style-note">
                     <i>⌁</i>
                     <div>
-                      <strong>Original video stays untouched</strong>
+                      <strong>This is only a preview</strong>
                       <span>
-                        Every style change appears instantly. The downloadable
-                        video is created only when you export.
+                        Play, change and compare freely. Your downloadable video
+                        starts only after you confirm.
                       </span>
                     </div>
                   </div>
@@ -2333,11 +2294,7 @@ export default function Home() {
                 <div className="export-panel">
                   <div
                     className={`export-status ${
-                      showingFinal
-                        ? "ready"
-                        : unresolvedItems.length
-                          ? "attention"
-                          : ""
+                      showingFinal ? "ready" : ""
                     }`}
                   >
                     <span>
@@ -2345,33 +2302,29 @@ export default function Home() {
                         ? "✓"
                         : job?.status === "rendering"
                           ? "↻"
-                          : unresolvedItems.length
-                            ? "!"
-                            : "→"}
+                          : "→"}
                     </span>
                     <div>
                       <small>
                         {showingFinal
-                          ? "FINAL VIDEO"
+                          ? "READY"
                           : job?.status === "rendering"
-                            ? "RENDERING"
-                            : "PRE-FLIGHT CHECK"}
+                            ? "MAKING YOUR VIDEO"
+                            : "STEP 3 · EXPORT"}
                       </small>
                       <h2>
                         {showingFinal
                           ? "Ready to post."
                           : job?.status === "rendering"
-                            ? "Burning the approved cut."
-                            : unresolvedItems.length
-                              ? "Give one caption a quick playback check."
-                              : "Ready for one clean render."}
+                            ? "Adding captions to every frame…"
+                            : "Happy with the preview?"}
                       </h2>
                       <p>
                         {showingFinal
-                          ? "The player is now showing the real burned-in MP4."
+                          ? "Download it and post wherever your audience is."
                           : job?.status === "rendering"
                             ? job.message
-                            : "Your captions and style are ready. The downloadable video starts only after you confirm."}
+                            : "Play it once more if you want. When you confirm, we will make one downloadable MP4."}
                       </p>
                     </div>
                   </div>
@@ -2380,24 +2333,24 @@ export default function Home() {
                     <div className="pass">
                       <i>✓</i>
                       <span>
-                        <strong>Caption text ready</strong>
-                        <small>{flatWords.length} words you can edit</small>
+                        <strong>Captions stay editable</strong>
+                        <small>Go back and tap any line whenever you want</small>
                       </span>
                     </div>
-                    <div className={unresolvedItems.length ? "warn" : "pass"}>
-                      <i>{unresolvedItems.length ? "!" : "✓"}</i>
+                    <div className="pass">
+                      <i>✓</i>
                       <span>
-                        <strong>Caption timing</strong>
+                        <strong>Safer word effects</strong>
                         <small>
-                          reliable words animate · uncertain lines stay steady
+                          uncertain words stay steady instead of drifting
                         </small>
                       </span>
                     </div>
                     <div className="pass">
                       <i>✓</i>
                       <span>
-                        <strong>Style ready</strong>
-                        <small>{captionStyle.animation} · {captionStyle.wordsPerCard} words/card</small>
+                        <strong>Your original stays safe</strong>
+                        <small>SyncWord creates a separate downloadable copy</small>
                       </span>
                     </div>
                   </div>
@@ -2423,23 +2376,17 @@ export default function Home() {
 
                   {job?.status === "ready" && (
                     <div className="export-actions">
-                      {unresolvedItems.length > 0 && (
-                        <button
-                          className="secondary"
-                          onClick={goToNextIssue}
-                        >
-                          Open caption
-                        </button>
-                      )}
+                      <button
+                        className="secondary"
+                        onClick={() => setTab("review")}
+                      >
+                        Back to captions
+                      </button>
                       <button
                         className="primary"
-                        onClick={() =>
-                          void startRender(unresolvedItems.length > 0)
-                        }
+                        onClick={() => void startRender()}
                       >
-                        {unresolvedItems.length
-                          ? "Preview looks right — render"
-                          : "Start final render"}
+                        Make my video
                         <span>→</span>
                       </button>
                     </div>
@@ -2449,11 +2396,9 @@ export default function Home() {
                     <div className="export-actions">
                       <button
                         className="primary"
-                        onClick={() =>
-                          void startRender(unresolvedItems.length > 0)
-                        }
+                        onClick={() => void startRender()}
                       >
-                        Update final video
+                        Update my video
                         <span>↻</span>
                       </button>
                     </div>
@@ -2472,8 +2417,8 @@ export default function Home() {
                   )}
 
                   <p className="hobby-note">
-                    MVP files are temporary. Download the final MP4 before the
-                    project expires.
+                    This MVP keeps files temporarily. Download your finished
+                    video when it is ready.
                   </p>
                 </div>
               )}
