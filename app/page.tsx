@@ -11,6 +11,7 @@ import {
   canHighlightGroup,
   canHighlightWord,
 } from "../shared/caption-quality.mjs";
+import { createLatestSeekController } from "../shared/preview-transport.mjs";
 
 type WordTiming = {
   id: string;
@@ -112,7 +113,7 @@ type ReviewItem = {
 type LoopRange = { start: number; end: number } | null;
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
-const appRevision = "syncword-web-2026-07-31-v21";
+const appRevision = "syncword-web-2026-08-07-v22";
 const expectedCaptionQualityRevision = "perceptual-gate-v1";
 
 const defaultStyle: CaptionStyle = {
@@ -399,6 +400,10 @@ export default function Home() {
   );
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
+  const seekControllerRef = useRef<ReturnType<
+    typeof createLatestSeekController
+  > | null>(null);
+  const loopRangeRef = useRef<LoopRange>(null);
 
   const configuredApi =
     process.env.NEXT_PUBLIC_RENDER_API_URL?.replace(/\/$/, "") ?? "";
@@ -526,6 +531,96 @@ export default function Home() {
     const timeout = window.setTimeout(() => setToast(""), 4200);
     return () => window.clearTimeout(timeout);
   }, [toast]);
+
+  useEffect(() => {
+    loopRangeRef.current = loopRange;
+  }, [loopRange]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !playbackUrl) return;
+
+    const seekController = createLatestSeekController(video);
+    seekControllerRef.current = seekController;
+    let stopped = false;
+    let videoFrameId: number | null = null;
+    let animationFrameId: number | null = null;
+
+    const cancelClock = () => {
+      if (videoFrameId !== null) {
+        video.cancelVideoFrameCallback(videoFrameId);
+        videoFrameId = null;
+      }
+      if (animationFrameId !== null) {
+        window.cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+      }
+    };
+
+    const syncClock = (time: number, enforceLoop = true) => {
+      if (!Number.isFinite(time)) return;
+      const activeLoop = loopRangeRef.current;
+      if (enforceLoop && activeLoop && time >= activeLoop.end) {
+        seekController.jump(activeLoop.start);
+        setCurrentTime(activeLoop.start);
+        if (video.paused) void video.play();
+        return;
+      }
+      setCurrentTime((current) =>
+        Math.abs(current - time) >= 0.004 ? time : current,
+      );
+    };
+
+    const onVideoFrame: VideoFrameRequestCallback = (_now, metadata) => {
+      syncClock(metadata.mediaTime);
+      if (!stopped && !video.paused) {
+        videoFrameId = video.requestVideoFrameCallback(onVideoFrame);
+      }
+    };
+
+    const onAnimationFrame = () => {
+      syncClock(video.currentTime);
+      if (!stopped && !video.paused) {
+        animationFrameId = window.requestAnimationFrame(onAnimationFrame);
+      }
+    };
+
+    const startClock = () => {
+      cancelClock();
+      if (typeof video.requestVideoFrameCallback === "function") {
+        videoFrameId = video.requestVideoFrameCallback(onVideoFrame);
+      } else {
+        animationFrameId = window.requestAnimationFrame(onAnimationFrame);
+      }
+    };
+
+    const settleClock = () => {
+      cancelClock();
+      syncClock(video.currentTime, false);
+    };
+
+    const resumeClockAfterSeek = () => {
+      syncClock(video.currentTime, !video.paused);
+      if (!video.paused) startClock();
+    };
+
+    video.addEventListener("play", startClock);
+    video.addEventListener("pause", settleClock);
+    video.addEventListener("seeked", resumeClockAfterSeek);
+    if (!video.paused) startClock();
+
+    return () => {
+      stopped = true;
+      cancelClock();
+      seekController.dispose();
+      if (seekControllerRef.current === seekController) {
+        seekControllerRef.current = null;
+      }
+      video.removeEventListener("play", startClock);
+      video.removeEventListener("pause", settleClock);
+      video.removeEventListener("seeked", resumeClockAfterSeek);
+    };
+  }, [playbackUrl]);
 
   useEffect(() => {
     let active = true;
@@ -898,6 +993,33 @@ export default function Home() {
     void uploadVideo(nextFile);
   };
 
+  const mediaTime = (seconds: number) =>
+    Math.max(0, duration > 0 ? Math.min(duration, seconds) : seconds);
+
+  const jumpTo = (seconds: number) => {
+    const next = mediaTime(seconds);
+    setCurrentTime(next);
+    const video = videoRef.current;
+    if (!video) return;
+    if (seekControllerRef.current) {
+      seekControllerRef.current.jump(next);
+    } else {
+      video.currentTime = next;
+    }
+  };
+
+  const previewAt = (seconds: number) => {
+    const next = mediaTime(seconds);
+    setCurrentTime(next);
+    const video = videoRef.current;
+    if (!video) return;
+    if (seekControllerRef.current) {
+      seekControllerRef.current.preview(next);
+    } else {
+      video.currentTime = next;
+    }
+  };
+
   const markWordsHandled = (ids: string[]) => {
     setApprovedWordIds((current) => [
       ...new Set([...current, ...ids.filter(Boolean)]),
@@ -909,20 +1031,20 @@ export default function Home() {
     setSelectedWordIndex(item.wordIndex);
     setLoopRange(null);
     const start = Math.max(0, item.word.start - 0.12);
-    setCurrentTime(start);
     if (videoRef.current) {
       videoRef.current.pause();
-      videoRef.current.currentTime = start;
     }
+    jumpTo(start);
     if (shouldLoop) {
       window.setTimeout(() => {
         const range = {
           start: Math.max(0, item.word.start - 0.48),
           end: Math.min(duration, item.word.end + 0.48),
         };
+        loopRangeRef.current = range;
         setLoopRange(range);
         if (videoRef.current) {
-          videoRef.current.currentTime = range.start;
+          jumpTo(range.start);
           void videoRef.current.play();
         }
       }, 40);
@@ -1139,8 +1261,7 @@ export default function Home() {
       return words;
     });
     markWordsHandled([selectedWord.id]);
-    setCurrentTime(nextStart);
-    if (videoRef.current) videoRef.current.currentTime = nextStart;
+    jumpTo(nextStart);
   };
 
   const shiftSelectedPhrase = (delta: number) => {
@@ -1171,8 +1292,7 @@ export default function Home() {
     );
     markWordsHandled(selectedCaption.words.map((word) => word.id));
     const nextTime = Math.max(0, currentTime + resolvedDelta);
-    setCurrentTime(nextTime);
-    if (videoRef.current) videoRef.current.currentTime = nextTime;
+    jumpTo(nextTime);
   };
 
   const toggleWordLoop = () => {
@@ -1186,8 +1306,9 @@ export default function Home() {
       start: Math.max(0, selectedWord.start - 0.48),
       end: Math.min(duration, selectedWord.end + 0.48),
     };
+    loopRangeRef.current = range;
     setLoopRange(range);
-    videoRef.current.currentTime = range.start;
+    jumpTo(range.start);
     void videoRef.current.play();
   };
 
@@ -1257,10 +1378,9 @@ export default function Home() {
   };
 
   const seek = (seconds: number) => {
-    const next = Math.max(0, Math.min(duration, seconds));
+    loopRangeRef.current = null;
     setLoopRange(null);
-    setCurrentTime(next);
-    if (videoRef.current) videoRef.current.currentTime = next;
+    previewAt(seconds);
   };
 
   const togglePlayback = () => {
@@ -1555,11 +1675,10 @@ export default function Home() {
                   }
                 }}
                 onTimeUpdate={(event) => {
-                  const nextTime = event.currentTarget.currentTime;
-                  setCurrentTime(nextTime);
-                  if (loopRange && nextTime >= loopRange.end) {
-                    event.currentTarget.currentTime = loopRange.start;
-                    void event.currentTarget.play();
+                  // Paused/buffered updates are a fallback. During playback,
+                  // the decoded-frame clock above drives caption highlighting.
+                  if (event.currentTarget.paused) {
+                    setCurrentTime(event.currentTarget.currentTime);
                   }
                 }}
                 onPlay={() => setPlaying(true)}
