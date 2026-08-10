@@ -30,7 +30,7 @@ async function render() {
   );
 }
 
-test("server-renders the SyncWord editor", async () => {
+test("server-renders subtitles by miithii", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -38,14 +38,14 @@ test("server-renders the SyncWord editor", async () => {
   const html = await response.text();
   assert.match(
     html,
-    /<title>SyncWord — Edit captions\. Then export\.<\/title>/i,
+    /<title>subtitles — by miithii<\/title>/i,
   );
-  assert.match(html, /What are we captioning\?/);
-  assert.match(html, /Assamese, Bodo, or mixed-language reel/);
+  assert.match(html, /Make every word/);
+  assert.match(html, /Assamese or Bodo video/);
   assert.match(html, /Choose a video/);
-  assert.match(html, /3 min \/ 90 MB/);
-  assert.match(html, /Automatic captions/);
-  assert.match(html, /Change text and timing directly/);
+  assert.match(html, /up to 3 min · 90 MB/);
+  assert.match(html, /First-pass captions/);
+  assert.match(html, /Make each one small or large/);
   assert.match(html, /Rendering starts only when you approve/);
   assert.doesNotMatch(
     html,
@@ -55,16 +55,34 @@ test("server-renders the SyncWord editor", async () => {
 });
 
 test("removes the disposable starter and wires product metadata", async () => {
-  const [page, layout, packageJson, renderServer, renderDockerfile] =
+  const [
+    page,
+    layout,
+    fontsCss,
+    packageJson,
+    renderServer,
+    renderDockerfile,
+    mediaWorker,
+    projectClient,
+    projectWorker,
+    webRevision,
+  ] =
     await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/fonts.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../server/index.mjs", import.meta.url), "utf8"),
     readFile(new URL("../server/Dockerfile", import.meta.url), "utf8"),
+    readFile(new URL("../worker/media.ts", import.meta.url), "utf8"),
+    readFile(new URL("../shared/project-client.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../worker/projects.ts", import.meta.url), "utf8"),
+    readFile(new URL("../public/revision.json", import.meta.url), "utf8"),
   ]);
 
-  assert.match(page, /SyncWord/);
+  assert.match(page, /subtitles/);
+  assert.match(page, /by miithii/);
+  assert.doesNotMatch(page, /SyncWord/);
   assert.match(page, /NEXT_PUBLIC_RENDER_API_URL/);
   assert.match(page, /Everything said/);
   assert.match(page, /CaptionTimeline/);
@@ -74,11 +92,42 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(page, /Done with this line/);
   assert.match(page, /onChange=\{updateCaptionTiming\}/);
   assert.match(page, /Make my video/);
+  assert.match(page, /createProjectProcessingJob/);
+  assert.match(page, /createProjectRevision/);
+  assert.match(page, /createProjectRenderJob/);
+  assert.match(page, /fps: "source"/);
+  assert.match(page, /activeRenderRequestScope/);
+  assert.match(page, /activeRenderAttemptDiscriminator/);
+  assert.match(page, /lastCompletedRenderJobId/);
+  assert.match(page, /selectCompletedRenderArtifact/);
+  assert.match(
+    page,
+    /const dispatchSessionPersisted = await persistProjectSession\([\s\S]{0,700}attemptedProjectDispatch = true;[\s\S]{0,300}createProjectRenderJob/,
+  );
+  assert.match(page, /expectedProcessorRevision = "syncword-caption-v3"/);
+  assert.match(page, /expectedRendererRevision = "syncword-render-v2"/);
+  assert.match(page, /renderHealthIsCompatible/);
+  assert.match(page, /loadBrowserVideoMetadata/);
+  assert.match(
+    page,
+    /accept="\.mp4,\.webm,\.m4v,video\/mp4,video\/webm,video\/x-m4v"/,
+  );
+  assert.doesNotMatch(page, /accept="video\/\*,\.mkv"/);
+  assert.match(page, /projectAssetContentUrl/);
+  assert.match(
+    page,
+    /if \(usingDurableMedia\) \{[\s\S]{0,1400}reserveProjectAsset[\s\S]{0,1800}createProjectProcessingJob/,
+  );
+  assert.doesNotMatch(
+    page,
+    /createProjectRenderJob\([\s\S]{0,500}\{\s*captions\s*,\s*style/,
+  );
   assert.match(page, /uncertain words stay steady instead of drifting/);
   assert.match(page, /revision\.json\?check=/);
+  assert.match(page, new RegExp(JSON.parse(webRevision).revision));
   assert.match(page, /Reload before making captions/);
   assert.match(page, /expectedCaptionQualityRevision/);
-  assert.match(page, /Reload SyncWord before uploading another video/);
+  assert.match(page, /Reload the editor before uploading another video/);
   assert.doesNotMatch(
     page,
     /initialCaptions|demoDuration|importSrt|Download SRT|distributeWords/,
@@ -87,8 +136,14 @@ test("removes the disposable starter and wires product metadata", async () => {
     page,
     /const processingStatuses[\s\S]{0,160}"ready"/,
   );
-  assert.match(layout, /og-editor\.png/);
-  assert.match(layout, /x-forwarded-host/);
+  assert.match(layout, /title: "subtitles — by miithii"/);
+  assert.match(layout, /fonts\.css/);
+  assert.match(layout, /miithii-tokens\.css/);
+  assert.match(fontsCss, /Noto Sans Bengali/);
+  assert.match(fontsCss, /Noto Sans Devanagari/);
+  assert.match(fontsCss, /\/fonts\/noto-sans-bengali-script\.woff2/);
+  assert.match(fontsCss, /\/fonts\/noto-sans-devanagari-script\.woff2/);
+  assert.doesNotMatch(fontsCss, /[A-Z]:[\\/]/);
   assert.match(renderServer, /SARVAM_MODEL \?\? "saaras:v3"/);
   assert.match(renderServer, /model: sarvamModel,\s*mode,/);
   assert.match(
@@ -111,10 +166,37 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /chooseBetterAlignment/);
   assert.match(renderServer, /phraseTimedWords/);
   assert.match(renderServer, /canHighlightGroup/);
-  assert.match(renderServer, /perceptual-and-coverage-gate-v2/);
+  assert.match(
+    renderServer,
+    /const captionQualityRevision = CAPTION_QUALITY_REVISION/,
+  );
+  assert.match(renderServer, /const rendererRevision =/);
+  assert.match(renderServer, /project_renderer_revision_unsupported/);
+  assert.match(
+    page,
+    /const expectedCaptionQualityRevision = CAPTION_QUALITY_REVISION/,
+  );
+  assert.doesNotMatch(page, /perceptual-gate-v1/);
   assert.match(renderServer, /speech_coverage_recovery_started/);
   assert.match(renderServer, /caption_job_review_required/);
-  assert.match(renderServer, /canRenderCaptionTrack/);
+  assert.match(renderServer, /validateRenderCaptionSubmission/);
+  assert.match(renderServer, /acceptRenderCaptionSubmission/);
+  assert.match(renderServer, /uncoveredIntervals/);
+  assert.match(mediaWorker, /caption_coverage_unverified/);
+  assert.match(mediaWorker, /"review_required"/);
+  assert.match(mediaWorker, /job.alignment = payload.alignment/);
+  assert.match(mediaWorker, /job.captions = payload.captions/);
+  assert.match(projectWorker, /\/v3\/processing-jobs/);
+  assert.match(projectWorker, /finalizeProcessingResult/);
+  assert.match(projectWorker, /serveAssetContent/);
+  assert.match(projectWorker, /\/v3\/render-jobs/);
+  assert.match(
+    projectWorker,
+    /DEFAULT_RENDER_API = "https:\/\/syncword-render-dhrub404\.onrender\.com"/,
+  );
+  assert.match(projectWorker, /video_artifact_required/);
+  assert.match(projectClient, /credentials: "same-origin"/);
+  assert.doesNotMatch(projectClient, /authorization\s*:/i);
   assert.match(renderServer, /caption_job_queued/);
   assert.match(renderServer, /caption_job_ready/);
   assert.match(renderServer, /phraseTimedWords: timingQuality\.phraseTimedWords/);
@@ -159,5 +241,19 @@ test("removes the disposable starter and wires product metadata", async () => {
 
   await assert.rejects(
     access(new URL("../app/_sites-preview/SkeletonPreview.tsx", templateRoot)),
+  );
+  await Promise.all(
+    [
+      "manrope-latin.woff2",
+      "space-grotesk-latin.woff2",
+      "space-mono-latin-400.woff2",
+      "space-mono-latin-700.woff2",
+      "noto-sans-bengali-script.woff2",
+      "noto-sans-bengali-latin.woff2",
+      "noto-sans-devanagari-script.woff2",
+      "noto-sans-devanagari-latin.woff2",
+    ].map((name) =>
+      access(new URL(`public/fonts/${name}`, templateRoot)),
+    ),
   );
 });

@@ -11,6 +11,7 @@ import {
   editorRevisionId,
   markRevisionBase,
   parseEditorDraft,
+  rebaseRevisionHistory,
   redoRevision,
   revisionHistoryDirty,
   serializeEditorDraft,
@@ -77,6 +78,27 @@ test("revision history tracks a clean base and deterministic undo/redo", () => {
   assert.equal(saved.baseRevision, saved.present.revisionId);
 });
 
+test("remote-head rebase preserves dirty autosaved work without keeping a stale base", () => {
+  const staleBase = createRevisionHistory(snapshot("stale remote text"));
+  const localDraft = commitRevision(staleBase, snapshot("unsaved local edit"));
+  const rebased = rebaseRevisionHistory(
+    localDraft,
+    snapshot("new remote head"),
+  );
+
+  assert.equal(revisionHistoryDirty(rebased), true);
+  assert.equal(rebased.present.snapshot.captions[0].text, "unsaved local edit");
+  assert.equal(rebased.past.at(-1).snapshot.captions[0].text, "new remote head");
+  assert.equal(rebased.baseRevision, rebased.past.at(-1).revisionId);
+
+  const clean = rebaseRevisionHistory(
+    markRevisionBase(localDraft),
+    snapshot("new remote head"),
+  );
+  assert.equal(revisionHistoryDirty(clean), false);
+  assert.equal(clean.present.snapshot.captions[0].text, "new remote head");
+});
+
 test("committing after undo clears redo and history stays bounded", () => {
   let history = createRevisionHistory(snapshot("0"), { limit: 2 });
   history = commitRevision(history, snapshot("1"));
@@ -95,6 +117,25 @@ test("content revision IDs do not depend on object key insertion order", () => {
   assert.equal(
     editorRevisionId({ captions: [], style: { color: "white", size: 72 } }),
     editorRevisionId({ style: { size: 72, color: "white" }, captions: [] }),
+  );
+});
+
+test("large word styling survives a serialized draft reload", () => {
+  const styledSnapshot = snapshot("ডাঙৰ");
+  styledSnapshot.captions[0].words[0].displaySize = "large";
+  const serialized = serializeEditorDraft(
+    createEditorDraft({
+      savedAt: "2026-08-10T09:00:00.000Z",
+      history: createRevisionHistory(styledSnapshot),
+      media: null,
+      job: null,
+    }),
+  );
+
+  const restored = parseEditorDraft(serialized);
+  assert.equal(
+    restored.history.present.snapshot.captions[0].words[0].displaySize,
+    "large",
   );
 });
 
@@ -127,8 +168,25 @@ test("draft serialization excludes File-like instances and object URLs", () => {
         durable: true,
         duration: 12.5,
         videoRatio: 9 / 16,
+        videoWidth: 720,
+        videoHeight: 1280,
         file: new FakeFile(),
         objectUrl: "blob:https://syncword.test/source",
+      },
+      projectSession: {
+        projectId: "project-1",
+        sourceAssetId: "asset-1",
+        activeProcessingJobId: "processing-1",
+        headRevisionId: "revision-1",
+        headEditorRevisionId: "local-revision-1",
+        activeRenderJobId: "render-1",
+        activeRenderIdempotencyKey: "render-key-1",
+        activeRenderRequestScope: "render-scope-1",
+        activeRenderAttemptDiscriminator: "render-terminal-0",
+        lastCompletedRenderJobId: "render-complete-1",
+        lastExportArtifactId: "artifact-1",
+        capabilityToken: "project-secret",
+        callbackAuthorization: "Bearer callback-secret",
       },
       job: {
         id: "job-1",
@@ -142,6 +200,8 @@ test("draft serialization excludes File-like instances and object URLs", () => {
         tab: "review",
         selectedCaptionId: "caption-1",
         selectedWordIndex: 0,
+        pendingRenderRevision: "local-pending",
+        lastRenderedRevision: "local-rendered",
         captionDrafts: { "caption-1": "draft text" },
       },
     }),
@@ -161,13 +221,31 @@ test("draft serialization excludes File-like instances and object URLs", () => {
     durable: true,
     duration: 12.5,
     videoRatio: 9 / 16,
+    videoWidth: 720,
+    videoHeight: 1280,
+  });
+  assert.deepEqual(restored.projectSession, {
+    projectId: "project-1",
+    sourceAssetId: "asset-1",
+    activeProcessingJobId: "processing-1",
+    headRevisionId: "revision-1",
+    headEditorRevisionId: "local-revision-1",
+    activeRenderJobId: "render-1",
+    activeRenderIdempotencyKey: "render-key-1",
+    activeRenderRequestScope: "render-scope-1",
+    activeRenderAttemptDiscriminator: "render-terminal-0",
+    lastCompletedRenderJobId: "render-complete-1",
+    lastExportArtifactId: "artifact-1",
   });
   assert.equal("capabilityToken" in restored.job, false);
   assert.equal(serialized.includes("secret-capability"), false);
   assert.equal(serialized.includes("callback-secret"), false);
   assert.equal(serialized.includes("persisted-secret"), false);
+  assert.equal(serialized.includes("project-secret"), false);
   assert.equal("previewUrl" in restored.job, false);
   assert.equal("runtimeFile" in restored.history.present.snapshot, false);
+  assert.equal(restored.view.pendingRenderRevision, "local-pending");
+  assert.equal(restored.view.lastRenderedRevision, "local-rendered");
 });
 
 test("parsing rejects corrupt and future-version drafts", () => {
@@ -198,6 +276,17 @@ test("resilient storage falls back and restores the newest valid copy", async ()
   const store = createResilientDraftStore({ primary, fallback });
 
   assert.equal(await store.load("active"), newDraft);
+  assert.equal(await store.save("active", oldDraft), "primary");
+  assert.equal(
+    await fallback.getItem("active"),
+    newDraft,
+    "an older primary write must not remove a newer lifecycle fallback",
+  );
+  assert.equal(await store.load("active"), newDraft);
+
+  const newestDraft = draftAt("2026-08-10T10:00:00.000Z", "newest");
+  assert.equal(await store.save("active", newestDraft), "primary");
+  assert.equal(await fallback.getItem("active"), null);
 
   const unavailablePrimary = {
     async getItem() {

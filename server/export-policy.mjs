@@ -24,6 +24,20 @@ export function parseFrameRate(value) {
   return frameRate > 0 ? frameRate : DEFAULT_FPS;
 }
 
+export function exportFrameRateMatchesSource(
+  sourceFrameRate,
+  requestedFrameRate,
+  tolerance = 0.02,
+) {
+  if (requestedFrameRate === "source") return true;
+  const requested = finiteNumber(requestedFrameRate);
+  return (
+    requested !== undefined &&
+    requested > 0 &&
+    Math.abs(parseFrameRate(sourceFrameRate) - requested) <= tolerance
+  );
+}
+
 /**
  * Builds the loss/seekability policy for a caption-only MP4 export.
  *

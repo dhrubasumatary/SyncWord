@@ -1,3 +1,5 @@
+import { isSupportedLanguageCode } from "../shared/project-contract.mjs";
+
 const timestampPattern =
   /silence_(start|end):\s*(-?\d+(?:\.\d+)?)/gi;
 
@@ -134,8 +136,11 @@ export function planSpeechSegments(
 
 export function combineSegmentTranscripts(
   results,
-  requestedLanguage = "unknown",
+  requestedLanguage,
 ) {
+  if (!isSupportedLanguageCode(requestedLanguage)) {
+    throw new TypeError("requestedLanguage must be as-IN or brx-IN.");
+  }
   const captions = (results ?? [])
     .flatMap((result) =>
       (result.captions ?? []).map((caption) => ({
@@ -160,14 +165,10 @@ export function combineSegmentTranscripts(
       id: `stt-${index + 1}`,
     }));
 
-  const detectedLanguage = (results ?? [])
-    .map((result) => result.languageCode)
-    .find((language) => language && language !== "unknown");
-
   return {
     request_id: `syncword-segmented-${Date.now()}`,
     transcript: captions.map((caption) => caption.text).join(" "),
-    language_code: detectedLanguage ?? requestedLanguage,
+    language_code: requestedLanguage,
     timestamps: {
       words: captions.map((caption) => caption.text),
       start_time_seconds: captions.map((caption) => caption.start),

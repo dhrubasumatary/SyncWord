@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import {
   useCallback,
   useEffect,
@@ -12,6 +13,7 @@ import {
 import {
   canHighlightGroup,
 } from "../shared/caption-quality.mjs";
+import { CAPTION_QUALITY_REVISION } from "../shared/caption-coverage.mjs";
 import { createLatestSeekController } from "../shared/preview-transport.mjs";
 import { retimeCaption } from "../shared/caption-timing.mjs";
 import {
@@ -22,13 +24,53 @@ import {
   createRevisionHistory,
   markRevisionBase,
   parseEditorDraft,
+  rebaseRevisionHistory,
   redoRevision,
   replaceRevisionBase,
   revisionHistoryDirty,
   serializeEditorDraft,
   undoRevision,
 } from "../shared/editor-draft.mjs";
+import {
+  createManualCaptionForGap,
+  normalizeRenderPreflight,
+  normalizeUncoveredIntervals,
+} from "../shared/editor-coverage.mjs";
+import {
+  ProjectClientError,
+  cancelProjectProcessingJob,
+  cancelProjectRenderJob,
+  createProject,
+  createProjectProcessingJob,
+  createProjectRenderJob,
+  createProjectRevision,
+  getProject,
+  getProjectProcessingJob,
+  getProjectRenderJob,
+  getProjectRevision,
+  listProjectExports,
+  projectAssetContentUrl,
+  projectExportContentUrl,
+  reserveProjectAsset,
+  uploadProjectAsset,
+} from "../shared/project-client.mjs";
+import {
+  editorCaptionsFromProject,
+  jobAfterProjectRevisionSave,
+  projectProcessingStatusForHydration,
+  projectDocumentFromEditor,
+  projectRenderRequestScope,
+  projectSessionAfterTerminalRender,
+  reconcileProjectSessionHead,
+  safeProjectSession,
+  selectCompletedRenderArtifact,
+  selectProjectRenderDispatchIdentity,
+} from "../shared/project-editor-adapter.mjs";
 import { CaptionTimeline } from "./components/CaptionTimeline";
+import {
+  miithiiColors,
+  miithiiSemanticColors,
+} from "../shared/miithii-tokens.mjs";
 
 type WordTiming = {
   id: string;
@@ -36,6 +78,7 @@ type WordTiming = {
   start: number;
   end: number;
   confidence: number;
+  displaySize?: "small" | "large";
   highlightSafe?: boolean;
   highlightReason?: string;
   source:
@@ -52,7 +95,7 @@ type Caption = {
   start: number;
   end: number;
   text: string;
-  language: "as" | "brx" | "mix";
+  language: "as" | "brx";
   words: WordTiming[];
 };
 
@@ -87,12 +130,44 @@ type AlignmentSummary = {
   qualityScore?: number;
   transcriptRecoveryAttempted?: boolean;
   transcriptRecoverySelected?: boolean;
+  coverage?: CaptionCoverageSummary;
+};
+
+type CoverageInterval = {
+  start: number;
+  end: number;
+  duration: number;
+};
+
+type CaptionCoverageSummary = {
+  revision?: string;
+  complete?: boolean;
+  coverageRatio?: number;
+  largestUncoveredGapSeconds?: number;
+  uncoveredIntervals?: CoverageInterval[];
+  reasons?: string[];
+  [key: string]: unknown;
+};
+
+type RenderPreflight = {
+  code: string;
+  message: string;
+  coverage: CaptionCoverageSummary | null;
+  uncoveredIntervals: CoverageInterval[];
+};
+
+type DraftSaveState = {
+  status: "idle" | "saving" | "saved" | "error";
+  savedAt?: number;
+  message?: string;
 };
 
 type JobStatus =
   | "queued"
   | "extracting"
   | "transcribing"
+  | "aligning"
+  | "recovering"
   | "ready"
   | "review_required"
   | "rendering"
@@ -121,6 +196,7 @@ type JobResponse = {
 type StudioTab = "review" | "style" | "export";
 type EngineState = "offline" | "waking" | "online";
 type TranscriptMode = "codemix" | "verbatim" | "transcribe";
+type SupportedLanguage = "as-IN" | "brx-IN";
 type ReviewItem = {
   captionId: string;
   captionIndex: number;
@@ -130,7 +206,7 @@ type ReviewItem = {
 };
 type LoopRange = { start: number; end: number } | null;
 type EditorDocument = {
-  language: string;
+  language: SupportedLanguage;
   transcriptMode: TranscriptMode;
   captionStyle: CaptionStyle;
   activePresetName: string;
@@ -144,18 +220,78 @@ type MediaIdentity = {
   durable: boolean;
 };
 
+type ProjectSession = {
+  projectId: string;
+  sourceAssetId: string;
+  activeProcessingJobId: string | null;
+  headRevisionId: string | null;
+  headEditorRevisionId: string | null;
+  activeRenderJobId: string | null;
+  activeRenderIdempotencyKey: string | null;
+  activeRenderRequestScope: string | null;
+  activeRenderAttemptDiscriminator: string | null;
+  lastCompletedRenderJobId: string | null;
+  lastExportArtifactId: string | null;
+};
+
+type ProjectProcessingJob = {
+  id: string;
+  projectId: string;
+  sourceAssetId: string;
+  revisionId: string | null;
+  language: SupportedLanguage;
+  mode: string;
+  status:
+    | "queued"
+    | "extracting"
+    | "transcribing"
+    | "aligning"
+    | "recovering"
+    | "ready"
+    | "review_required"
+    | "failed"
+    | "cancelled";
+  progress: number;
+  message?: string;
+  failureCode?: string | null;
+  updatedAt?: string;
+};
+
+type ProjectArtifact = {
+  id: string;
+  renderJobId: string;
+  revisionId: string;
+  kind: "video" | "captions_ass" | "captions_srt" | "captions_vtt";
+  contentUrl: string;
+};
+
+type ProjectRenderJob = {
+  id: string;
+  projectId: string;
+  revisionId: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  progress: number;
+  message?: string;
+  failureCode?: string | null;
+  updatedAt?: string;
+  exportSpec?: Record<string, unknown>;
+  artifacts?: ProjectArtifact[];
+};
+
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
-const appRevision = "syncword-web-2026-08-07-v24";
-const expectedCaptionQualityRevision = "perceptual-gate-v1";
+const appRevision = "subtitles-web-2026-08-10-v27";
+const expectedCaptionQualityRevision = CAPTION_QUALITY_REVISION;
+const expectedProcessorRevision = "syncword-caption-v3";
+const expectedRendererRevision = "syncword-render-v2";
 
 const defaultStyle: CaptionStyle = {
   fontFamily: "Noto Sans Bengali",
-  fontSize: 78,
-  textColor: "#FFFFFF",
-  highlightColor: "#CFFF47",
-  backgroundColor: "#070806",
-  backgroundOpacity: 76,
-  outlineColor: "#070806",
+  fontSize: 72,
+  textColor: miithiiSemanticColors.dark.text,
+  highlightColor: miithiiSemanticColors.dark.accent,
+  backgroundColor: miithiiSemanticColors.dark.background,
+  backgroundOpacity: 68,
+  outlineColor: miithiiSemanticColors.dark.background,
   outlineWidth: 2,
   position: 74,
   weight: "800",
@@ -170,48 +306,48 @@ const presets: Array<{
   values: Partial<CaptionStyle>;
 }> = [
   {
-    name: "Signal",
-    note: "clean creator hit",
-    sample: "NOW",
+    name: "Pulse",
+    note: "the miithii signature",
+    sample: "PLAY",
     values: {
-      textColor: "#FFFFFF",
-      highlightColor: "#CFFF47",
-      backgroundColor: "#070806",
-      backgroundOpacity: 76,
-      outlineColor: "#070806",
+      textColor: miithiiColors.cream50,
+      highlightColor: miithiiColors.lime400,
+      backgroundColor: miithiiColors.teal950,
+      backgroundOpacity: 68,
+      outlineColor: miithiiColors.teal950,
       outlineWidth: 2,
       animation: "pop",
       wordsPerCard: 4,
     },
   },
   {
-    name: "Impact",
-    note: "hard social outline",
-    sample: "LOUD",
+    name: "Clean",
+    note: "quiet and open",
+    sample: "CLEAR",
     values: {
-      textColor: "#FFFFFF",
-      highlightColor: "#FF6D5D",
-      backgroundColor: "#070806",
+      textColor: miithiiColors.cream50,
+      highlightColor: miithiiColors.jade400,
+      backgroundColor: miithiiColors.teal950,
       backgroundOpacity: 0,
-      outlineColor: "#070806",
-      outlineWidth: 6,
-      animation: "pop",
-      wordsPerCard: 3,
+      outlineColor: miithiiColors.teal950,
+      outlineWidth: 3,
+      animation: "fade",
+      wordsPerCard: 4,
     },
   },
   {
-    name: "Electric",
-    note: "cool blue motion",
-    sample: "PLAY",
+    name: "Poster",
+    note: "bold and compact",
+    sample: "LOUD",
     values: {
-      textColor: "#FFFFFF",
-      highlightColor: "#70A7FF",
-      backgroundColor: "#11192B",
-      backgroundOpacity: 58,
-      outlineColor: "#070B12",
+      textColor: miithiiColors.cream50,
+      highlightColor: miithiiColors.lime400,
+      backgroundColor: miithiiColors.teal900,
+      backgroundOpacity: 82,
+      outlineColor: miithiiColors.teal950,
       outlineWidth: 4,
-      animation: "slide",
-      wordsPerCard: 4,
+      animation: "pop",
+      wordsPerCard: 3,
     },
   },
 ];
@@ -220,6 +356,8 @@ const processingStatuses: JobStatus[] = [
   "queued",
   "extracting",
   "transcribing",
+  "aligning",
+  "recovering",
   "rendering",
 ];
 const subscribeHydration = () => () => {};
@@ -228,6 +366,21 @@ const serverSnapshot = () => false;
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.max(minimum, Math.min(maximum, value));
+}
+
+function supportedLanguage(value: unknown): SupportedLanguage {
+  return value === "brx-IN" ? "brx-IN" : "as-IN";
+}
+
+function normalizeCaptionDisplaySizes(items: Caption[]): Caption[] {
+  return items.map((caption) => ({
+    ...caption,
+    language: caption.language === "brx" ? "brx" : "as",
+    words: caption.words.map((word) => ({
+      ...word,
+      displaySize: word.displaySize === "large" ? "large" : "small",
+    })),
+  }));
 }
 
 function compactTime(seconds: number) {
@@ -275,12 +428,86 @@ async function getRenderHealth(apiBase: string) {
     return (await response.json()) as {
       ok?: boolean;
       captionQualityRevision?: string;
+      processorRevision?: string;
+      rendererRevision?: string;
+      sarvamConfigured?: boolean;
+      modalAlignerConfigured?: boolean;
     };
   } catch {
     return null;
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+function renderHealthIsCompatible(
+  health: Awaited<ReturnType<typeof getRenderHealth>>,
+) {
+  return Boolean(
+    health?.ok &&
+      health.captionQualityRevision === expectedCaptionQualityRevision &&
+      health.processorRevision === expectedProcessorRevision &&
+      health.rendererRevision === expectedRendererRevision,
+  );
+}
+
+function loadBrowserVideoMetadata(sourceUrl: string) {
+  return new Promise<{
+    duration: number;
+    width: number;
+    height: number;
+  }>((resolve, reject) => {
+    const probe = document.createElement("video");
+    let settled = false;
+    const timeout = window.setTimeout(() => {
+      finish(new Error("Video preview timed out."));
+    }, 15_000);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      probe.onloadedmetadata = null;
+      probe.onerror = null;
+      probe.removeAttribute("src");
+      probe.load();
+    };
+    const finish = (
+      error?: Error,
+      metadata?: { duration: number; width: number; height: number },
+    ) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else if (metadata) resolve(metadata);
+    };
+    probe.preload = "metadata";
+    probe.muted = true;
+    probe.onloadedmetadata = () => {
+      const metadata = {
+        duration: probe.duration,
+        width: probe.videoWidth,
+        height: probe.videoHeight,
+      };
+      if (
+        !Number.isFinite(metadata.duration) ||
+        metadata.duration <= 0 ||
+        metadata.width <= 0 ||
+        metadata.height <= 0
+      ) {
+        finish(new Error("Video metadata is unavailable."));
+        return;
+      }
+      finish(undefined, metadata);
+    };
+    probe.onerror = () => {
+      finish(
+        new Error(
+          "This browser cannot preview that video. Use a browser-playable H.264 MP4 or WebM file.",
+        ),
+      );
+    };
+    probe.src = sourceUrl;
+    probe.load();
+  });
 }
 
 const cardBreakGapSeconds = 0.52;
@@ -447,7 +674,7 @@ function normalizeEditorDocument(value: unknown): EditorDocument | null {
   const record = value as Partial<EditorDocument>;
   const captions = Array.isArray(record.captions) &&
     record.captions.every(isAlignedCaption)
-    ? record.captions
+    ? normalizeCaptionDisplaySizes(record.captions)
     : [];
   const transcriptMode = ["codemix", "verbatim", "transcribe"].includes(
     String(record.transcriptMode),
@@ -455,14 +682,13 @@ function normalizeEditorDocument(value: unknown): EditorDocument | null {
     ? (String(record.transcriptMode) as TranscriptMode)
     : "codemix";
   return {
-    language:
-      typeof record.language === "string" ? record.language : "unknown",
+    language: supportedLanguage(record.language),
     transcriptMode,
     captionStyle: normalizeRestoredStyle(record.captionStyle),
     activePresetName:
       typeof record.activePresetName === "string"
         ? record.activePresetName
-        : "Signal",
+        : "Pulse",
     captions,
   };
 }
@@ -477,6 +703,8 @@ function normalizeRestoredJob(
     "queued",
     "extracting",
     "transcribing",
+    "aligning",
+    "recovering",
     "ready",
     "review_required",
     "rendering",
@@ -499,6 +727,42 @@ function normalizeRestoredJob(
   };
 }
 
+function jobFromProjectProcessing(
+  processing: ProjectProcessingJob,
+  captions: Caption[] = [],
+  coverage?: CaptionCoverageSummary,
+): JobResponse {
+  return {
+    id: processing.id,
+    captionQualityRevision: CAPTION_QUALITY_REVISION,
+    status: processing.status,
+    progress: processing.progress,
+    message: processing.message,
+    captions,
+    updatedAt: processing.updatedAt,
+    ...(coverage
+      ? {
+          alignment: {
+            method: "project-caption-v3",
+            totalWords: captions.reduce(
+              (total, caption) => total + caption.words.length,
+              0,
+            ),
+            waveformAlignedWords: captions.reduce(
+              (total, caption) =>
+                total +
+                caption.words.filter((word) => word.source !== "manual").length,
+              0,
+            ),
+            averageConfidence: 0,
+            needsReview: processing.status === "review_required" ? 1 : 0,
+            coverage,
+          },
+        }
+      : {}),
+  };
+}
+
 export default function Home() {
   const [tab, setTab] = useState<StudioTab>("review");
   const [file, setFile] = useState<File | null>(null);
@@ -507,24 +771,40 @@ export default function Home() {
   const [videoUrl, setVideoUrl] = useState("");
   const [duration, setDuration] = useState(0);
   const [videoRatio, setVideoRatio] = useState(9 / 16);
+  const [videoDimensions, setVideoDimensions] = useState({
+    width: 0,
+    height: 0,
+  });
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [language, setLanguage] = useState("unknown");
+  const [language, setLanguage] = useState<SupportedLanguage>("as-IN");
   const [transcriptMode, setTranscriptMode] =
     useState<TranscriptMode>("codemix");
   const [captionStyle, setCaptionStyle] = useState(defaultStyle);
-  const [activePresetName, setActivePresetName] = useState("Signal");
+  const [activePresetName, setActivePresetName] = useState("Pulse");
   const [captions, setCaptions] = useState<Caption[]>([]);
   const [selectedCaptionId, setSelectedCaptionId] = useState("");
   const [selectedWordIndex, setSelectedWordIndex] = useState(0);
   const [loopRange, setLoopRange] = useState<LoopRange>(null);
   const [job, setJob] = useState<JobResponse | null>(null);
+  const [projectSession, setProjectSession] =
+    useState<ProjectSession | null>(null);
+  const [projectRenderJob, setProjectRenderJob] =
+    useState<ProjectRenderJob | null>(null);
+  const [projectAccessDenied, setProjectAccessDenied] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [engineState, setEngineState] =
     useState<EngineState>("offline");
   const [hasChanges, setHasChanges] = useState(false);
   const [updateRequired, setUpdateRequired] = useState(false);
   const [toast, setToast] = useState("");
+  const [renderPreflight, setRenderPreflight] =
+    useState<RenderPreflight | null>(null);
+  const [draftSaveState, setDraftSaveState] = useState<DraftSaveState>({
+    status: "idle",
+  });
+  const [pendingRenderRevision, setPendingRenderRevision] = useState("");
+  const [lastRenderedRevision, setLastRenderedRevision] = useState("");
   const [captionDrafts, setCaptionDrafts] = useState<
     Record<string, string>
   >({});
@@ -532,6 +812,7 @@ export default function Home() {
   const [historyControls, setHistoryControls] = useState({
     canUndo: false,
     canRedo: false,
+    currentRevisionId: "",
   });
   const hydrated = useSyncExternalStore(
     subscribeHydration,
@@ -546,10 +827,10 @@ export default function Home() {
   const loopRangeRef = useRef<LoopRange>(null);
   const revisionHistoryRef = useRef(
     createRevisionHistory({
-      language: "unknown",
+      language: "as-IN",
       transcriptMode: "codemix",
       captionStyle: defaultStyle,
-      activePresetName: "Signal",
+      activePresetName: "Pulse",
       captions: [],
     }),
   );
@@ -558,6 +839,28 @@ export default function Home() {
   > | null>(null);
   const draftReadyRef = useRef(false);
   const suppressHistoryTrackingRef = useRef(false);
+  const pendingRenderRevisionRef = useRef("");
+  const videoSelectionGenerationRef = useRef(0);
+  const draftSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const draftSaveGenerationRef = useRef(0);
+  const draftViewTimerRef = useRef<number | null>(null);
+  const draftLastViewSaveRef = useRef(0);
+  const draftPersistenceMountedRef = useRef(true);
+  const draftPersistenceSnapshotRef = useRef<{
+    mediaIdentity: MediaIdentity | null;
+    duration: number;
+    videoRatio: number;
+    videoDimensions: { width: number; height: number };
+    projectSession: ProjectSession | null;
+    job: JobResponse | null;
+    tab: StudioTab;
+    selectedCaptionId: string;
+    selectedWordIndex: number;
+    currentTime: number;
+    captionDrafts: Record<string, string>;
+    pendingRenderRevision: string;
+    lastRenderedRevision: string;
+  } | null>(null);
 
   const configuredApi =
     process.env.NEXT_PUBLIC_RENDER_API_URL?.replace(/\/$/, "") ?? "";
@@ -580,19 +883,35 @@ export default function Home() {
   const hasProject = Boolean(file || mediaIdentity || job);
   const mediaName = file?.name ?? mediaIdentity?.name ?? "Recovered project";
   const draftNeedsAuthorization = Boolean(
-    mediaIdentity?.durable && job && !job.capabilityToken,
+    mediaIdentity?.durable &&
+      job &&
+      (projectSession ? projectAccessDenied : !job.capabilityToken),
   );
   const isProcessing = Boolean(
     uploading || (job && processingStatuses.includes(job.status)),
   );
-  const isFinal = job?.status === "complete" && Boolean(job.previewUrl);
+  const projectVideoArtifact = projectRenderJob?.artifacts?.find(
+    (artifact) => artifact.kind === "video",
+  );
+  const projectFinalVideoUrl = projectSession?.lastExportArtifactId
+    ? projectExportContentUrl(
+        projectSession.projectId,
+        projectSession.lastExportArtifactId,
+      )
+    : projectVideoArtifact?.contentUrl ?? "";
+  const isFinal =
+    job?.status === "complete" &&
+    Boolean(projectSession ? projectFinalVideoUrl : job.previewUrl);
   const showingFinal = isFinal && !hasChanges;
-  const finalVideoUrl =
-    showingFinal && job?.previewUrl
-      ? `${jobsBase}${job.previewUrl}?v=${encodeURIComponent(
-          job.updatedAt ?? "",
-        )}`
-      : "";
+  const finalVideoUrl = showingFinal
+    ? projectSession
+      ? projectFinalVideoUrl
+      : job?.previewUrl
+        ? `${jobsBase}${job.previewUrl}?v=${encodeURIComponent(
+            job.updatedAt ?? "",
+          )}`
+        : ""
+    : "";
   const playbackUrl = finalVideoUrl || videoUrl;
   const selectedCaption =
     captions.find((caption) => caption.id === selectedCaptionId) ?? captions[0];
@@ -648,6 +967,19 @@ export default function Home() {
       ? flatWords[selectedGlobalIndex + 1]?.word ?? null
       : null;
   const isLooping = Boolean(loopRange);
+  const uncoveredIntervals = useMemo(
+    () =>
+      normalizeUncoveredIntervals(
+        renderPreflight?.uncoveredIntervals ??
+          job?.alignment?.coverage?.uncoveredIntervals,
+        duration,
+      ) as CoverageInterval[],
+    [duration, job?.alignment?.coverage?.uncoveredIntervals, renderPreflight],
+  );
+  const coverageMessage =
+    renderPreflight?.message ??
+    job?.message ??
+    "Some spoken audio is still missing trusted captions. Review every highlighted gap before exporting.";
   const editorDocument = useMemo<EditorDocument>(
     () => ({
       language,
@@ -678,6 +1010,7 @@ export default function Home() {
       setHistoryControls({
         canUndo: history.past.length > 0,
         canRedo: history.future.length > 0,
+        currentRevisionId: history.present.revisionId,
       });
       setRevisionHistoryVersion((version) => version + 1);
     },
@@ -700,9 +1033,171 @@ export default function Home() {
     "--caption-outline-color": captionStyle.outlineColor,
     "--caption-font":
       captionStyle.fontFamily === "Noto Sans Devanagari"
-        ? '"Noto Sans Devanagari", "Nirmala UI", sans-serif'
-        : '"Noto Sans Bengali", "Nirmala UI", sans-serif',
+        ? "var(--font-bodo)"
+        : "var(--font-assamese)",
   } as CSSProperties;
+
+  const persistDraft = useCallback(
+    (options: {
+      synchronousFallback?: boolean;
+      surfaceStatus?: boolean;
+    } = {}) => {
+      const snapshot = draftPersistenceSnapshotRef.current;
+      const store = draftStoreRef.current;
+      if (
+        !draftReadyRef.current ||
+        !snapshot ||
+        !store ||
+        (!snapshot.mediaIdentity && !snapshot.job)
+      ) {
+        return Promise.resolve(false);
+      }
+
+      let serialized: string;
+      try {
+        const draft = createEditorDraft({
+          projectId:
+            snapshot.projectSession?.projectId ?? snapshot.job?.id ?? "active",
+          savedAt: new Date().toISOString(),
+          media: snapshot.mediaIdentity
+            ? {
+                ...snapshot.mediaIdentity,
+                duration: snapshot.duration,
+                videoRatio: snapshot.videoRatio,
+                videoWidth: snapshot.videoDimensions.width,
+                videoHeight: snapshot.videoDimensions.height,
+              }
+            : null,
+          projectSession: snapshot.projectSession,
+          job: snapshot.job,
+          history: revisionHistoryRef.current,
+          view: {
+            tab: snapshot.tab,
+            selectedCaptionId: snapshot.selectedCaptionId,
+            selectedWordIndex: snapshot.selectedWordIndex,
+            currentTime: snapshot.currentTime,
+            captionDrafts: snapshot.captionDrafts,
+            pendingRenderRevision: snapshot.pendingRenderRevision,
+            lastRenderedRevision: snapshot.lastRenderedRevision,
+          },
+        });
+        serialized = serializeEditorDraft(draft);
+      } catch (error) {
+        if (draftPersistenceMountedRef.current) {
+          setDraftSaveState({
+            status: "error",
+            message:
+              error instanceof Error
+                ? error.message
+                : "The local draft could not be prepared.",
+          });
+        }
+        return Promise.resolve(false);
+      }
+
+      let synchronousFallbackSaved = false;
+      if (options.synchronousFallback) {
+        try {
+          window.localStorage.setItem(EDITOR_DRAFT_STORAGE_KEY, serialized);
+          synchronousFallbackSaved = true;
+        } catch {
+          // The queued resilient store still gets a chance to use IndexedDB.
+        }
+      }
+
+      const generation = ++draftSaveGenerationRef.current;
+      if (
+        options.surfaceStatus !== false &&
+        draftPersistenceMountedRef.current
+      ) {
+        setDraftSaveState({ status: "saving" });
+      }
+      const save = draftSaveQueueRef.current.then(() =>
+        store.save(EDITOR_DRAFT_STORAGE_KEY, serialized),
+      );
+      draftSaveQueueRef.current = save.catch(() => undefined);
+      return save
+        .then(() => {
+          if (
+            generation === draftSaveGenerationRef.current &&
+            draftPersistenceMountedRef.current
+          ) {
+            setDraftSaveState({ status: "saved", savedAt: Date.now() });
+          }
+          return true;
+        })
+        .catch((error) => {
+          if (
+            generation === draftSaveGenerationRef.current &&
+            draftPersistenceMountedRef.current
+          ) {
+            setDraftSaveState({
+              status: "error",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "Local draft storage is unavailable.",
+              });
+          }
+          return synchronousFallbackSaved;
+        });
+    },
+    [],
+  );
+
+  const persistProjectSession = useCallback(
+    async (nextSession: ProjectSession) => {
+      setProjectSession((current) =>
+        current?.projectId === nextSession.projectId ? nextSession : current,
+      );
+      const snapshot = draftPersistenceSnapshotRef.current;
+      if (
+        snapshot?.projectSession?.projectId === nextSession.projectId
+      ) {
+        draftPersistenceSnapshotRef.current = {
+          ...snapshot,
+          projectSession: nextSession,
+        };
+      }
+      return persistDraft({
+        synchronousFallback: true,
+        surfaceStatus: false,
+      });
+    },
+    [persistDraft],
+  );
+
+  useEffect(() => {
+    draftPersistenceSnapshotRef.current = {
+      mediaIdentity,
+      duration,
+      videoRatio,
+      videoDimensions,
+      projectSession,
+      job,
+      tab,
+      selectedCaptionId,
+      selectedWordIndex,
+      currentTime,
+      captionDrafts,
+      pendingRenderRevision,
+      lastRenderedRevision,
+    };
+  }, [
+    captionDrafts,
+    currentTime,
+    duration,
+    job,
+    lastRenderedRevision,
+    mediaIdentity,
+    pendingRenderRevision,
+    selectedCaptionId,
+    selectedWordIndex,
+    tab,
+    videoRatio,
+    videoDimensions,
+    projectSession,
+  ]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -715,18 +1210,125 @@ export default function Home() {
         const serialized = await store.load(EDITOR_DRAFT_STORAGE_KEY);
         if (!active || !serialized) return;
         const draft = parseEditorDraft(serialized);
-        const restoredDocument = normalizeEditorDocument(
+        const draftDocument = normalizeEditorDocument(
           draft?.history.present.snapshot,
         );
-        if (!draft || !restoredDocument) return;
+        if (!draft || !draftDocument) return;
+        let restoredDocument: EditorDocument = draftDocument;
 
-        const restoredJob = normalizeRestoredJob(
+        let restoredHistory = draft.history;
+        let restoredJob = normalizeRestoredJob(
           draft.job,
           restoredDocument.captions,
         );
+        let restoredProjectSession = safeProjectSession(
+          draft.projectSession,
+        ) as ProjectSession | null;
+        let restoredDuration = draft.media?.duration ?? 0;
+        let restoredDimensions = {
+          width: draft.media?.videoWidth ?? 0,
+          height: draft.media?.videoHeight ?? 0,
+        };
+        let restoredRatio = draft.media?.videoRatio ?? 9 / 16;
+        let projectAccessLost = false;
+        let remoteHeadChanged = false;
+        let remoteHeadCheckFailed = false;
+
+        if (restoredProjectSession) {
+          try {
+            const project = await getProject(
+              fetch,
+              restoredProjectSession.projectId,
+            );
+            if (!active) return;
+            const remoteHeadRevisionId =
+              typeof project.headRevisionId === "string" &&
+              project.headRevisionId
+                ? project.headRevisionId
+                : null;
+            remoteHeadChanged =
+              remoteHeadRevisionId !== restoredProjectSession.headRevisionId;
+
+            if (remoteHeadChanged && remoteHeadRevisionId) {
+              const revision = await getProjectRevision(
+                fetch,
+                restoredProjectSession.projectId,
+                remoteHeadRevisionId,
+              );
+              if (!active) return;
+              const projectDocument = revision.document as {
+                durationMs: number;
+                canvas: { width: number; height: number };
+                captionTrack: {
+                  languageCode: string;
+                  status: "ready" | "review_required" | "complete";
+                  style?: unknown;
+                };
+              };
+              const remoteCaptions = normalizeCaptionDisplaySizes(
+                editorCaptionsFromProject(revision.document) as Caption[],
+              );
+              if (
+                !remoteCaptions.length ||
+                !remoteCaptions.every(isAlignedCaption)
+              ) {
+                throw new Error("The remote project revision is invalid.");
+              }
+              const remoteEditorDocument: EditorDocument = {
+                language: supportedLanguage(
+                  projectDocument.captionTrack.languageCode,
+                ),
+                transcriptMode: restoredDocument.transcriptMode,
+                captionStyle: normalizeRestoredStyle(
+                  projectDocument.captionTrack.style ??
+                    restoredDocument.captionStyle,
+                ),
+                activePresetName: restoredDocument.activePresetName,
+                captions: remoteCaptions,
+              };
+              restoredHistory = rebaseRevisionHistory(
+                restoredHistory,
+                remoteEditorDocument,
+              );
+              const reconciledDocument = normalizeEditorDocument(
+                restoredHistory.present.snapshot,
+              );
+              if (!reconciledDocument) {
+                throw new Error("The reconciled project draft is invalid.");
+              }
+              restoredDocument = reconciledDocument;
+              restoredDuration = projectDocument.durationMs / 1_000;
+              restoredDimensions = projectDocument.canvas;
+              restoredRatio =
+                projectDocument.canvas.width / projectDocument.canvas.height;
+              if (restoredJob) {
+                restoredJob = jobAfterProjectRevisionSave(
+                  restoredJob,
+                  revision.document,
+                  restoredDocument.captions,
+                ) as JobResponse;
+              }
+            }
+
+            restoredProjectSession = reconcileProjectSessionHead(
+              restoredProjectSession,
+              remoteHeadRevisionId,
+              remoteHeadChanged ? restoredHistory.baseRevision : null,
+            ) as ProjectSession;
+          } catch (error) {
+            remoteHeadChanged = false;
+            if (error instanceof ProjectClientError && error.status === 401) {
+              projectAccessLost = true;
+            } else {
+              remoteHeadCheckFailed = true;
+            }
+          }
+        }
+
+        if (!active) return;
         applyEditorDocument(restoredDocument);
-        publishRevisionHistory(draft.history);
-        setHasChanges(revisionHistoryDirty(draft.history));
+        publishRevisionHistory(restoredHistory);
+        setHasChanges(revisionHistoryDirty(restoredHistory));
         setMediaIdentity(
           draft.media
             ? {
@@ -738,23 +1340,67 @@ export default function Home() {
               }
             : null,
         );
-        setDuration(draft.media?.duration ?? 0);
-        setVideoRatio(draft.media?.videoRatio ?? 9 / 16);
+        setDuration(restoredDuration);
+        setVideoRatio(restoredRatio);
+        setVideoDimensions(restoredDimensions);
+        setProjectSession(restoredProjectSession);
+        setProjectAccessDenied(projectAccessLost);
+        setProjectRenderJob(null);
+        if (restoredProjectSession) {
+          setVideoUrl(
+            projectAssetContentUrl(
+              restoredProjectSession.projectId,
+              restoredProjectSession.sourceAssetId,
+            ),
+          );
+        }
         setTab(draft.view.tab as StudioTab);
         setSelectedCaptionId(
-          draft.view.selectedCaptionId ||
+          (restoredDocument.captions.some(
+            (caption) => caption.id === draft.view.selectedCaptionId,
+          )
+            ? draft.view.selectedCaptionId
+            : "") ||
             restoredDocument.captions[0]?.id ||
             "",
         );
         setSelectedWordIndex(draft.view.selectedWordIndex);
         setCurrentTime(draft.view.currentTime);
         setCaptionDrafts(
-          draft.view.captionDrafts as Record<string, string>,
+          remoteHeadChanged && !revisionHistoryDirty(draft.history)
+            ? {}
+            : (draft.view.captionDrafts as Record<string, string>),
+        );
+        const restoredPendingRevision = String(
+          draft.view.pendingRenderRevision ?? "",
+        );
+        pendingRenderRevisionRef.current = restoredPendingRevision;
+        setPendingRenderRevision(restoredPendingRevision);
+        setLastRenderedRevision(
+          String(draft.view.lastRenderedRevision ?? ""),
         );
         setJob(restoredJob);
+        setDraftSaveState({
+          status: "saved",
+          savedAt: Date.parse(draft.savedAt) || Date.now(),
+        });
         draftReadyRef.current = true;
 
-        if (restoredJob?.status === "review_required") {
+        if (projectAccessLost) {
+          setToast(
+            "This browser no longer has access to the recovered project.",
+          );
+        } else if (remoteHeadCheckFailed) {
+          setToast(
+            "Draft restored. The latest project head could not be checked yet.",
+          );
+        } else if (remoteHeadChanged && revisionHistoryDirty(restoredHistory)) {
+          setToast(
+            "Latest project head restored. Your unsaved local edits are preserved on top.",
+          );
+        } else if (remoteHeadChanged) {
+          setToast("Latest saved project revision restored.");
+        } else if (restoredJob?.status === "review_required") {
           setTab("review");
           setToast(
             restoredJob.message ??
@@ -796,52 +1442,66 @@ export default function Home() {
   }, [editorDocument, hasChanges, publishRevisionHistory]);
 
   useEffect(() => {
-    if (
-      !draftReadyRef.current ||
-      !draftStoreRef.current ||
-      (!mediaIdentity && !job)
-    ) {
-      return;
-    }
+    if (!draftReadyRef.current) return;
     const timeout = window.setTimeout(() => {
-      try {
-        const draft = createEditorDraft({
-          projectId: job?.id ?? "active",
-          savedAt: new Date().toISOString(),
-          media: mediaIdentity
-            ? { ...mediaIdentity, duration, videoRatio }
-            : null,
-          job,
-          history: revisionHistoryRef.current,
-          view: {
-            tab,
-            selectedCaptionId,
-            selectedWordIndex,
-            currentTime,
-            captionDrafts,
-          },
-        });
-        void draftStoreRef.current?.save(
-          EDITOR_DRAFT_STORAGE_KEY,
-          serializeEditorDraft(draft),
-        );
-      } catch {
-        // Persistence is best-effort and never interrupts active editing.
-      }
+      void persistDraft();
     }, 320);
     return () => window.clearTimeout(timeout);
   }, [
     captionDrafts,
-    currentTime,
     duration,
     job,
+    lastRenderedRevision,
     mediaIdentity,
+    pendingRenderRevision,
+    persistDraft,
+    projectSession,
     revisionHistoryVersion,
+    videoDimensions,
+    videoRatio,
+  ]);
+
+  useEffect(() => {
+    if (!draftReadyRef.current || draftViewTimerRef.current !== null) return;
+    const elapsed = Date.now() - draftLastViewSaveRef.current;
+    const wait = Math.max(0, 1_250 - elapsed);
+    draftViewTimerRef.current = window.setTimeout(() => {
+      draftViewTimerRef.current = null;
+      draftLastViewSaveRef.current = Date.now();
+      void persistDraft();
+    }, wait);
+  }, [
+    currentTime,
+    persistDraft,
     selectedCaptionId,
     selectedWordIndex,
     tab,
-    videoRatio,
   ]);
+
+  useEffect(() => {
+    draftPersistenceMountedRef.current = true;
+    const flushDraft = () => {
+      if (draftViewTimerRef.current !== null) {
+        window.clearTimeout(draftViewTimerRef.current);
+        draftViewTimerRef.current = null;
+      }
+      void persistDraft({
+        synchronousFallback: true,
+        surfaceStatus: false,
+      });
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") flushDraft();
+    };
+    window.addEventListener("pagehide", flushDraft);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      flushDraft();
+      draftPersistenceMountedRef.current = false;
+      window.removeEventListener("pagehide", flushDraft);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [persistDraft]);
 
   useEffect(
     () => () => {
@@ -992,14 +1652,22 @@ export default function Home() {
       for (let attempt = 0; attempt < 18 && active; attempt += 1) {
         const health = await getRenderHealth(apiBase);
         if (health?.ok) {
-          if (
-            health.captionQualityRevision &&
-            health.captionQualityRevision !==
-              expectedCaptionQualityRevision
-          ) {
+          if (!renderHealthIsCompatible(health)) {
             if (active) {
               setUpdateRequired(true);
               setEngineState("offline");
+              setToast(
+                "The editor and caption engine are on different versions. Reload after the update finishes.",
+              );
+            }
+            return;
+          }
+          if (isLocalBrowser && health.sarvamConfigured === false) {
+            if (active) {
+              setEngineState("offline");
+              setToast(
+                "Local engine is running, but SARVAM_API_KEY is missing. Copy .env.example to .env and add the key.",
+              );
             }
             return;
           }
@@ -1013,11 +1681,189 @@ export default function Home() {
     return () => {
       active = false;
     };
-  }, [apiBase]);
+  }, [apiBase, isLocalBrowser]);
+
+  useEffect(() => {
+    if (
+      !usingDurableMedia ||
+      !projectSession?.activeProcessingJobId ||
+      projectAccessDenied
+    ) {
+      return;
+    }
+    let active = true;
+    let timer: number | null = null;
+    const projectId = projectSession.projectId;
+    const processingJobId = projectSession.activeProcessingJobId;
+
+    const pollProcessing = async () => {
+      try {
+        const processing = (await getProjectProcessingJob(
+          fetch,
+          projectId,
+          processingJobId,
+        )) as ProjectProcessingJob;
+        if (!active) return;
+        setEngineState("online");
+        const waitsForRevisionHydration =
+          ["ready", "review_required"].includes(processing.status) &&
+          Boolean(processing.revisionId);
+        const visibleProcessing = waitsForRevisionHydration
+          ? {
+              ...processing,
+              status: projectProcessingStatusForHydration(
+                processing.status,
+              ) as ProjectProcessingJob["status"],
+              progress: Math.min(processing.progress, 99),
+              message: "Loading the saved caption revision",
+            }
+          : processing;
+        setJob((current) =>
+          jobFromProjectProcessing(
+            visibleProcessing,
+            current?.captions ?? [],
+            current?.alignment?.coverage,
+          ),
+        );
+
+        if (waitsForRevisionHydration && processing.revisionId) {
+          const revision = await getProjectRevision(
+            fetch,
+            projectId,
+            processing.revisionId,
+          );
+          if (!active) return;
+          const projectDocument = revision.document as {
+            durationMs: number;
+            canvas: { width: number; height: number };
+            captionTrack: {
+              languageCode: string;
+              status: "ready" | "review_required";
+              style?: unknown;
+              coverage?: CaptionCoverageSummary;
+            };
+          };
+          const nextCaptions = normalizeCaptionDisplaySizes(
+            editorCaptionsFromProject(revision.document) as Caption[],
+          );
+          if (!nextCaptions.length || !nextCaptions.every(isAlignedCaption)) {
+            throw new Error("The immutable caption revision is empty or invalid.");
+          }
+          const nextEditorDocument: EditorDocument = {
+            language: supportedLanguage(
+              projectDocument.captionTrack.languageCode,
+            ),
+            transcriptMode: processing.mode as TranscriptMode,
+            captionStyle: normalizeRestoredStyle(
+              projectDocument.captionTrack.style ?? captionStyle,
+            ),
+            activePresetName,
+            captions: nextCaptions,
+          };
+          suppressHistoryTrackingRef.current = true;
+          applyEditorDocument(nextEditorDocument);
+          const cleanHistory = replaceRevisionBase(
+            revisionHistoryRef.current,
+            nextEditorDocument,
+          );
+          publishRevisionHistory(cleanHistory);
+          setHasChanges(false);
+          setDuration(projectDocument.durationMs / 1_000);
+          setVideoDimensions(projectDocument.canvas);
+          setVideoRatio(
+            projectDocument.canvas.width / projectDocument.canvas.height,
+          );
+          const coverage = projectDocument.captionTrack.coverage;
+          setJob(
+            jobFromProjectProcessing(
+              processing,
+              nextCaptions,
+              coverage,
+            ),
+          );
+          setSelectedCaptionId(nextCaptions[0]?.id ?? "");
+          setSelectedWordIndex(0);
+          setProjectSession((current) =>
+            current && current.projectId === projectId
+              ? {
+                  ...current,
+                  activeProcessingJobId: null,
+                  headRevisionId: processing.revisionId,
+                  headEditorRevisionId: cleanHistory.present.revisionId,
+                  activeRenderIdempotencyKey: null,
+                  activeRenderRequestScope: null,
+                  activeRenderAttemptDiscriminator: null,
+                }
+              : current,
+          );
+          if (processing.status === "review_required") {
+            const intervals = normalizeUncoveredIntervals(
+              coverage?.uncoveredIntervals,
+              projectDocument.durationMs / 1_000,
+            ) as CoverageInterval[];
+            setRenderPreflight({
+              code: "caption_coverage_incomplete",
+              message:
+                processing.message ??
+                "Some speech still needs a caption before export.",
+              coverage: coverage ?? null,
+              uncoveredIntervals: intervals,
+            });
+            setTab("review");
+            setToast(
+              processing.message ??
+                "Captions need review in the highlighted speech gaps.",
+            );
+          } else {
+            setRenderPreflight(null);
+            setTab("review");
+            setToast("Captions ready. Play through and edit anything.");
+          }
+          return;
+        }
+
+        if (["failed", "cancelled"].includes(processing.status)) {
+          setProjectSession((current) =>
+            current && current.projectId === projectId
+              ? { ...current, activeProcessingJobId: null }
+              : current,
+          );
+          setToast(processing.message ?? "Caption processing failed.");
+          return;
+        }
+      } catch (error) {
+        if (!active) return;
+        if (error instanceof ProjectClientError && error.status === 401) {
+          setProjectAccessDenied(true);
+          setToast("Project access expired in this browser.");
+          return;
+        }
+        setEngineState("waking");
+      }
+      if (active) timer = window.setTimeout(pollProcessing, 2_000);
+    };
+
+    void pollProcessing();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [
+    activePresetName,
+    applyEditorDocument,
+    captionStyle,
+    language,
+    projectAccessDenied,
+    projectSession?.activeProcessingJobId,
+    projectSession?.projectId,
+    publishRevisionHistory,
+    usingDurableMedia,
+  ]);
 
   useEffect(() => {
     if (
       !job ||
+      (usingDurableMedia && Boolean(projectSession)) ||
       (!usingDurableMedia && !apiBase) ||
       ["ready", "review_required", "complete", "failed", "cancelled"].includes(
         job.status,
@@ -1056,21 +1902,27 @@ export default function Home() {
             expectedCaptionQualityRevision
         ) {
           setUpdateRequired(true);
-          setToast("SyncWord was updated. Reload before continuing.");
+          setToast("The editor was updated. Reload before continuing.");
           return;
         }
         setJob((current) => ({
           ...next,
           capabilityToken: current?.capabilityToken,
         }));
+        const pendingRevision = pendingRenderRevisionRef.current;
+        const documentChangedSinceRender = Boolean(
+          pendingRevision &&
+            revisionHistoryRef.current.present.revisionId !== pendingRevision,
+        );
         const nextCaptions =
           Array.isArray(next.captions) &&
           next.captions.every(isAlignedCaption)
-            ? next.captions
+            ? normalizeCaptionDisplaySizes(next.captions)
             : [];
         if (nextCaptions.length) {
           setCaptions((current) =>
-            current.length && next.status === "rendering"
+            current.length &&
+            (next.status === "rendering" || documentChangedSinceRender)
               ? current
               : nextCaptions,
           );
@@ -1092,6 +1944,7 @@ export default function Home() {
           }
         }
         if (next.status === "ready") {
+          setRenderPreflight(null);
           setTab("review");
           setToast("Captions ready. Play through and edit anything.");
         } else if (next.status === "review_required") {
@@ -1101,9 +1954,30 @@ export default function Home() {
               "Some speech is still missing captions and needs review.",
           );
         } else if (next.status === "complete") {
+          setRenderPreflight(null);
+          if (pendingRevision) {
+            pendingRenderRevisionRef.current = "";
+            setPendingRenderRevision("");
+            setLastRenderedRevision(pendingRevision);
+            if (!documentChangedSinceRender) {
+              const cleanHistory = markRevisionBase(
+                revisionHistoryRef.current,
+              );
+              publishRevisionHistory(cleanHistory);
+              setHasChanges(false);
+            }
+          }
           setTab("export");
-          setToast("Your final video is ready to download.");
+          setToast(
+            documentChangedSinceRender
+              ? "That render is ready. Your newer draft edits are still unsent."
+              : "Your final video is ready to download.",
+          );
         } else if (["failed", "cancelled"].includes(next.status)) {
+          if (pendingRevision) {
+            pendingRenderRevisionRef.current = "";
+            setPendingRenderRevision("");
+          }
           setToast(next.message ?? "Processing failed.");
         }
       } catch {
@@ -1115,13 +1989,169 @@ export default function Home() {
     apiBase,
     job,
     jobsBase,
+    publishRevisionHistory,
+    projectSession,
     selectedCaptionId,
+    usingDurableMedia,
+  ]);
+
+  useEffect(() => {
+    if (
+      !usingDurableMedia ||
+      !projectSession?.activeRenderJobId ||
+      projectAccessDenied
+    ) {
+      return;
+    }
+    let active = true;
+    let timer: number | null = null;
+    const projectId = projectSession.projectId;
+    const renderJobId = projectSession.activeRenderJobId;
+
+    const pollRender = async () => {
+      try {
+        const renderJob = (await getProjectRenderJob(
+          fetch,
+          projectId,
+          renderJobId,
+        )) as ProjectRenderJob;
+        if (!active) return;
+        setProjectRenderJob(renderJob);
+        if (["queued", "running"].includes(renderJob.status)) {
+          setJob((current) =>
+            current
+              ? {
+                  ...current,
+                  status: "rendering",
+                  progress: renderJob.progress,
+                  message: renderJob.message,
+                  updatedAt: renderJob.updatedAt,
+                }
+              : current,
+          );
+        } else if (renderJob.status === "succeeded") {
+          const videoArtifact = selectCompletedRenderArtifact(
+            renderJob.artifacts,
+            renderJob.id,
+            "video",
+          ) as ProjectArtifact | null;
+          if (!videoArtifact) {
+            throw new Error("The render succeeded without a video artifact.");
+          }
+          const pendingRevision = pendingRenderRevisionRef.current;
+          const changedSinceRender = Boolean(
+            pendingRevision &&
+              revisionHistoryRef.current.present.revisionId !== pendingRevision,
+          );
+          pendingRenderRevisionRef.current = "";
+          setPendingRenderRevision("");
+          if (pendingRevision) setLastRenderedRevision(pendingRevision);
+          setProjectSession((current) =>
+            current && current.projectId === projectId
+              ? {
+                  ...current,
+                  activeRenderJobId: null,
+                  activeRenderIdempotencyKey: null,
+                  activeRenderRequestScope: null,
+                  activeRenderAttemptDiscriminator: null,
+                  lastCompletedRenderJobId: renderJob.id,
+                  lastExportArtifactId: videoArtifact.id,
+                }
+              : current,
+          );
+          setJob((current) =>
+            current
+              ? {
+                  ...current,
+                  status: "complete",
+                  progress: 100,
+                  message: "Your final video is ready.",
+                  previewUrl: videoArtifact.contentUrl,
+                  downloadUrl: videoArtifact.contentUrl,
+                  updatedAt: renderJob.updatedAt,
+                }
+              : current,
+          );
+          setTab("export");
+          setToast(
+            changedSinceRender
+              ? "That render is ready. Your newer draft edits are still unsent."
+              : "Your final video is ready to download.",
+          );
+          return;
+        } else {
+          pendingRenderRevisionRef.current = "";
+          setPendingRenderRevision("");
+          const terminalRequestScope =
+            projectSession.activeRenderRequestScope ??
+            (renderJob.exportSpec
+              ? projectRenderRequestScope(
+                  renderJob.revisionId,
+                  renderJob.exportSpec,
+                )
+              : null);
+          if (!terminalRequestScope) {
+            throw new Error(
+              "The terminal render is missing its immutable request scope.",
+            );
+          }
+          await persistProjectSession(
+            projectSessionAfterTerminalRender(
+              projectSession,
+              terminalRequestScope,
+              renderJob.id,
+            ) as ProjectSession,
+          );
+          setJob((current) =>
+            current
+              ? {
+                  ...current,
+                  status: current.alignment?.coverage?.complete
+                    ? "ready"
+                    : "review_required",
+                  message:
+                    renderJob.message ??
+                    (renderJob.status === "cancelled"
+                      ? "Render cancelled. Retry when you are ready."
+                      : "Render failed. Your saved revision can be retried."),
+                }
+              : current,
+          );
+          setToast(
+            renderJob.message ??
+              (renderJob.status === "cancelled"
+                ? "Render cancelled. Retry when you are ready."
+                : "Render failed. Your saved revision can be retried."),
+          );
+          return;
+        }
+      } catch (error) {
+        if (!active) return;
+        if (error instanceof ProjectClientError && error.status === 401) {
+          setProjectAccessDenied(true);
+          setToast("Project access expired in this browser.");
+          return;
+        }
+        setEngineState("waking");
+      }
+      if (active) timer = window.setTimeout(pollRender, 2_000);
+    };
+
+    void pollRender();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [
+    projectAccessDenied,
+    persistProjectSession,
+    projectSession,
     usingDurableMedia,
   ]);
 
   const uploadVideo = async (nextFile: File) => {
     if (updateRequired) {
-      setToast("Reload SyncWord before uploading another video.");
+      setToast("Reload the editor before uploading another video.");
       return;
     }
     if (!apiBase) {
@@ -1135,14 +2165,21 @@ export default function Home() {
       let engineReady = false;
       for (let attempt = 0; attempt < 18; attempt += 1) {
         const health = await getRenderHealth(apiBase);
-        if (
-          health?.ok &&
-          health.captionQualityRevision ===
-            expectedCaptionQualityRevision
-        ) {
+        if (renderHealthIsCompatible(health)) {
+          if (isLocalBrowser && health?.sarvamConfigured === false) {
+            throw new Error(
+              "Local engine is running, but SARVAM_API_KEY is missing. Copy .env.example to .env and add the key.",
+            );
+          }
           engineReady = true;
           setEngineState("online");
           break;
+        }
+        if (health?.ok) {
+          setUpdateRequired(true);
+          throw new Error(
+            "The editor and caption engine are on different versions. Reload after the update finishes.",
+          );
         }
         await clientDelay(4_000);
       }
@@ -1154,57 +2191,56 @@ export default function Home() {
 
       let data: JobResponse & { error?: string };
       if (usingDurableMedia) {
-        const createResponse = await fetch("/api/media/jobs", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            originalName: nextFile.name,
-            contentType: nextFile.type || "video/mp4",
-            size: nextFile.size,
-            language,
-            mode: transcriptMode,
-            style: captionStyle,
-          }),
-        });
-        data = (await createResponse.json()) as JobResponse & {
-          error?: string;
-        };
-        if (!createResponse.ok) {
-          throw new Error(data.error ?? "Could not create the upload.");
-        }
-        if (!data.capabilityToken || !data.uploadUrl || !data.processUrl) {
-          throw new Error("Durable upload capability is incomplete.");
-        }
-        setJob(data);
+        const project = await createProject(
+          fetch,
+          nextFile.name.replace(/\.[^.]+$/u, "") || "Untitled caption project",
+        );
+        const asset = await reserveProjectAsset(fetch, project.id, nextFile);
+        const initialProjectSession = safeProjectSession({
+          projectId: project.id,
+          sourceAssetId: asset.id,
+        }) as ProjectSession;
+        setProjectSession(initialProjectSession);
+        setProjectAccessDenied(false);
+        setProjectRenderJob(null);
         setToast("Saving your original video securely.");
-        const uploadResponse = await fetch(data.uploadUrl, {
-          method: "PUT",
-          headers: {
-            authorization: `Bearer ${data.capabilityToken}`,
-            "content-type": nextFile.type || "video/mp4",
-          },
-          body: nextFile,
-        });
-        const uploaded = (await uploadResponse.json()) as JobResponse & {
-          error?: string;
-        };
-        if (!uploadResponse.ok) {
-          throw new Error(uploaded.error ?? "Video upload failed.");
+        const uploadedAsset = await uploadProjectAsset(
+          fetch,
+          asset.uploadUrl,
+          nextFile,
+        );
+        if (uploadedAsset.status !== "ready") {
+          throw new Error("The durable source upload did not finalize.");
         }
-        setJob({ ...uploaded, capabilityToken: data.capabilityToken });
-        const processResponse = await fetch(data.processUrl, {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${data.capabilityToken}`,
-          },
-        });
-        const processing = (await processResponse.json()) as JobResponse & {
-          error?: string;
-        };
-        if (!processResponse.ok) {
-          throw new Error(processing.error ?? "Processing could not start.");
+        const processingKey = `process:${project.id}:${asset.id}:${language}:${transcriptMode}`;
+        let processing: ProjectProcessingJob | null = null;
+        let processingError: unknown = null;
+        for (let attempt = 0; attempt < 3 && !processing; attempt += 1) {
+          try {
+            processing = (await createProjectProcessingJob(fetch, project.id, {
+              sourceAssetId: asset.id,
+              language,
+              mode: transcriptMode,
+              idempotencyKey: processingKey,
+            })) as ProjectProcessingJob;
+          } catch (error) {
+            processingError = error;
+            if (
+              !(error instanceof ProjectClientError) ||
+              error.status !== 502 ||
+              attempt === 2
+            ) {
+              throw error;
+            }
+            await clientDelay(1_500 * (attempt + 1));
+          }
         }
-        data = { ...processing, capabilityToken: data.capabilityToken };
+        if (!processing) throw processingError ?? new Error("Processing could not start.");
+        setProjectSession({
+          ...initialProjectSession,
+          activeProcessingJobId: processing.id,
+        });
+        data = jobFromProjectProcessing(processing);
       } else {
         const payload = new FormData();
         payload.append("video", nextFile);
@@ -1223,7 +2259,7 @@ export default function Home() {
         data.captionQualityRevision !== expectedCaptionQualityRevision
       ) {
         setUpdateRequired(true);
-        throw new Error("SyncWord was updated. Reload and upload again.");
+        throw new Error("The editor was updated. Reload and upload again.");
       }
       setJob(data);
       setToast("Upload complete. Creating editable captions.");
@@ -1243,6 +2279,22 @@ export default function Home() {
       return;
     }
     try {
+      if (usingDurableMedia && projectSession) {
+        if (projectSession.activeProcessingJobId) {
+          await cancelProjectProcessingJob(
+            fetch,
+            projectSession.projectId,
+            projectSession.activeProcessingJobId,
+          );
+        } else if (projectSession.activeRenderJobId) {
+          await cancelProjectRenderJob(
+            fetch,
+            projectSession.projectId,
+            projectSession.activeRenderJobId,
+          );
+        }
+        return;
+      }
       const response = await fetch(`${jobsBase}${jobRoute(jobToCancel.id)}`, {
         method: "DELETE",
         headers:
@@ -1265,22 +2317,45 @@ export default function Home() {
     }
   };
 
+  const removePersistedDraft = () => {
+    const store = draftStoreRef.current;
+    if (!store) return;
+    draftSaveGenerationRef.current += 1;
+    const remove = draftSaveQueueRef.current.then(() =>
+      store.remove(EDITOR_DRAFT_STORAGE_KEY),
+    );
+    draftSaveQueueRef.current = remove.catch(() => undefined);
+    void remove.catch((error) => {
+      if (draftPersistenceMountedRef.current) {
+        setDraftSaveState({
+          status: "error",
+          message:
+            error instanceof Error
+              ? error.message
+              : "The previous local draft could not be removed.",
+        });
+      }
+    });
+  };
+
   const clearProject = () => {
+    videoSelectionGenerationRef.current += 1;
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     suppressHistoryTrackingRef.current = true;
     publishRevisionHistory(
       createRevisionHistory({
         ...editorDocument,
-        activePresetName: "Signal",
+        activePresetName: "Pulse",
         captions: [],
       }),
     );
-    void draftStoreRef.current?.remove(EDITOR_DRAFT_STORAGE_KEY);
+    removePersistedDraft();
     setFile(null);
     setMediaIdentity(null);
     setVideoUrl("");
     setDuration(0);
     setVideoRatio(9 / 16);
+    setVideoDimensions({ width: 0, height: 0 });
     setCurrentTime(0);
     setCaptions([]);
     setSelectedCaptionId("");
@@ -1288,8 +2363,16 @@ export default function Home() {
     setCaptionDrafts({});
     setLoopRange(null);
     setJob(null);
+    setProjectSession(null);
+    setProjectRenderJob(null);
+    setProjectAccessDenied(false);
     setHasChanges(false);
-    setActivePresetName("Signal");
+    setRenderPreflight(null);
+    pendingRenderRevisionRef.current = "";
+    setPendingRenderRevision("");
+    setLastRenderedRevision("");
+    setDraftSaveState({ status: "idle" });
+    setActivePresetName("Pulse");
     setTab("review");
   };
 
@@ -1302,33 +2385,52 @@ export default function Home() {
 
   const acceptVideo = async (nextFile: File) => {
     if (updateRequired) {
-      setToast("Reload SyncWord before uploading another video.");
+      setToast("Reload the editor before uploading another video.");
       return;
     }
-    const looksLikeVideo =
-      nextFile.type.startsWith("video/") ||
-      /\.(mp4|mov|webm|mkv|m4v)$/i.test(nextFile.name);
-    if (!looksLikeVideo) {
-      setToast("Choose an MP4, MOV, WebM, MKV, or M4V video.");
+    const hasPreviewableExtension = /\.(mp4|webm|m4v)$/i.test(nextFile.name);
+    if (!hasPreviewableExtension) {
+      setToast("Choose a browser-playable MP4, WebM, or M4V video.");
       return;
     }
     if (nextFile.size > 90 * 1024 * 1024) {
       setToast("Keep the reel under 90 MB for this MVP.");
       return;
     }
+    const selectionGeneration = ++videoSelectionGenerationRef.current;
+    const localUrl = URL.createObjectURL(nextFile);
+    setToast("Checking that this browser can preview the video.");
+    let previewMetadata: Awaited<ReturnType<typeof loadBrowserVideoMetadata>>;
+    try {
+      previewMetadata = await loadBrowserVideoMetadata(localUrl);
+    } catch (error) {
+      URL.revokeObjectURL(localUrl);
+      if (selectionGeneration === videoSelectionGenerationRef.current) {
+        setToast(
+          error instanceof Error
+            ? error.message
+            : "Use a browser-playable H.264 MP4 or WebM file.",
+        );
+      }
+      return;
+    }
+    if (selectionGeneration !== videoSelectionGenerationRef.current) {
+      URL.revokeObjectURL(localUrl);
+      return;
+    }
+
     const previousJob = job;
     await cancelRemoteJob(previousJob);
     if (videoUrl) URL.revokeObjectURL(videoUrl);
-    const localUrl = URL.createObjectURL(nextFile);
     suppressHistoryTrackingRef.current = true;
     publishRevisionHistory(
       createRevisionHistory({
         ...editorDocument,
-        activePresetName: "Signal",
+        activePresetName: "Pulse",
         captions: [],
       }),
     );
-    void draftStoreRef.current?.remove(EDITOR_DRAFT_STORAGE_KEY);
+    removePersistedDraft();
     setFile(nextFile);
     setMediaIdentity({
       name: nextFile.name,
@@ -1338,8 +2440,12 @@ export default function Home() {
       durable: usingDurableMedia,
     });
     setVideoUrl(localUrl);
-    setDuration(0);
-    setVideoRatio(9 / 16);
+    setDuration(previewMetadata.duration);
+    setVideoRatio(previewMetadata.width / previewMetadata.height);
+    setVideoDimensions({
+      width: previewMetadata.width,
+      height: previewMetadata.height,
+    });
     setCurrentTime(0);
     setCaptions([]);
     setSelectedCaptionId("");
@@ -1347,8 +2453,16 @@ export default function Home() {
     setCaptionDrafts({});
     setLoopRange(null);
     setJob(null);
+    setProjectSession(null);
+    setProjectRenderJob(null);
+    setProjectAccessDenied(false);
     setHasChanges(false);
-    setActivePresetName("Signal");
+    setRenderPreflight(null);
+    pendingRenderRevisionRef.current = "";
+    setPendingRenderRevision("");
+    setLastRenderedRevision("");
+    setDraftSaveState({ status: "idle" });
+    setActivePresetName("Pulse");
     setTab("review");
     void uploadVideo(nextFile);
   };
@@ -1403,6 +2517,46 @@ export default function Home() {
         }
       }, 40);
     }
+  };
+
+  const addCaptionForGap = (gap: CoverageInterval) => {
+    const manualIdBase = `manual-gap-${Math.round(
+      gap.start * 1000,
+    ).toString(36)}-${Math.round(gap.end * 1000).toString(36)}`;
+    const matchingManualCaptions = captions.filter((caption) =>
+      caption.id.startsWith(manualIdBase),
+    ).length;
+    const manualId = matchingManualCaptions
+      ? `${manualIdBase}-${matchingManualCaptions + 1}`
+      : manualIdBase;
+    const captionLanguage: Caption["language"] =
+      language === "brx-IN" ? "brx" : "as";
+    const manualCaption = normalizeCaptionDisplaySizes([
+      createManualCaptionForGap(gap, {
+        id: manualId,
+        language: captionLanguage,
+      }) as Caption,
+    ])[0];
+    setCaptions((items) =>
+      [...items, manualCaption].sort(
+        (left, right) => left.start - right.start || left.end - right.end,
+      ),
+    );
+    setCaptionDrafts((current) => {
+      const next = { ...current };
+      delete next[manualId];
+      return next;
+    });
+    setSelectedCaptionId(manualId);
+    setSelectedWordIndex(0);
+    setLoopRange(null);
+    setTab("review");
+    setHasChanges(true);
+    videoRef.current?.pause();
+    jumpTo(gap.start);
+    setToast(
+      "Manual caption added. Replace “Type-here” with the words you hear, then check coverage again.",
+    );
   };
 
   const updateCaptionWords = (
@@ -1467,7 +2621,7 @@ export default function Home() {
     if (!nextCaption) {
       videoRef.current?.pause();
       setTab("style");
-      setToast("Captions saved. Pick a look.");
+      setToast("Caption review complete. Pick a look.");
       return;
     }
     setSelectedCaptionId(nextCaption.id);
@@ -1494,6 +2648,22 @@ export default function Home() {
       };
       return words;
     });
+  };
+
+  const setSelectedWordDisplaySize = (displaySize: "small" | "large") => {
+    if (!selectedCaption || !selectedWord) return;
+    updateCaptionWords(selectedCaption.id, (words) => {
+      words[selectedWordIndex] = {
+        ...words[selectedWordIndex],
+        displaySize,
+      };
+      return words;
+    });
+    setToast(
+      displaySize === "large"
+        ? "That word now lands large."
+        : "That word now sits small.",
+    );
   };
 
   const commitCaptionDraft = () => {
@@ -1551,6 +2721,7 @@ export default function Home() {
           start: Number(start.toFixed(4)),
           end: Number(cursor.toFixed(4)),
           confidence: 0.2,
+          displaySize: "small",
           source: "grapheme-prior",
         };
       }),
@@ -1644,16 +2815,275 @@ export default function Home() {
   const startRender = async () => {
     if (
       !job ||
-      !["ready", "complete"].includes(job.status) ||
+      !["ready", "review_required", "complete"].includes(job.status) ||
       (!usingDurableMedia && !apiBase) ||
       !captions.length
     ) {
       return;
     }
+    if (
+      usingDurableMedia &&
+      ((projectSession && projectAccessDenied) ||
+        (!projectSession && !job.capabilityToken))
+    ) {
+      const message =
+        "This recovered draft needs project authorization before it can render again.";
+      setRenderPreflight({
+        code: "render_authorization_required",
+        message,
+        coverage: job.alignment?.coverage ?? null,
+        uncoveredIntervals,
+      });
+      setToast(message);
+      return;
+    }
+    if (job.status === "review_required" && !hasChanges) {
+      const message =
+        "Add or repair a caption in each speech gap, then check coverage again.";
+      setRenderPreflight((current) => ({
+        code: current?.code ?? "caption_coverage_incomplete",
+        message,
+        coverage: current?.coverage ?? job.alignment?.coverage ?? null,
+        uncoveredIntervals,
+      }));
+      setTab("review");
+      setToast(message);
+      return;
+    }
     setUploading(true);
     setLoopRange(null);
     videoRef.current?.pause();
+    let attemptedProjectDispatch = false;
     try {
+      if (usingDurableMedia && projectSession) {
+        const width =
+          videoDimensions.width || videoRef.current?.videoWidth || 0;
+        const height =
+          videoDimensions.height || videoRef.current?.videoHeight || 0;
+        if (width < 16 || height < 16 || duration <= 0) {
+          throw new Error(
+            "Video metadata is still loading. Wait a moment and try again.",
+          );
+        }
+
+        const latestHistory = commitRevision(
+          revisionHistoryRef.current,
+          editorDocument,
+        );
+        if (latestHistory !== revisionHistoryRef.current) {
+          publishRevisionHistory(latestHistory);
+        }
+        const submittedEditorRevision = latestHistory.present.revisionId;
+        let revisionId = projectSession.headRevisionId;
+        const needsRevisionSave =
+          !revisionId ||
+          projectSession.headEditorRevisionId !== submittedEditorRevision;
+        let submittedProjectDocument: ReturnType<
+          typeof projectDocumentFromEditor
+        > | null = null;
+
+        if (needsRevisionSave) {
+          const speechIntervals = job.alignment?.coverage?.speechIntervals;
+          submittedProjectDocument = projectDocumentFromEditor({
+            sourceAssetId: projectSession.sourceAssetId,
+            durationSeconds: duration,
+            canvas: { width, height },
+            languageCode: language,
+            captions,
+            style: captionStyle,
+            speechIntervals: Array.isArray(speechIntervals)
+              ? speechIntervals
+              : undefined,
+            requestedStatus: "ready",
+          });
+          const revision = await createProjectRevision(
+            fetch,
+            projectSession.projectId,
+            {
+              baseRevisionId: projectSession.headRevisionId,
+              document: submittedProjectDocument,
+              changeSummary:
+                job.status === "review_required"
+                  ? "Repair missing speech captions"
+                  : "Save caption and style edits",
+            },
+          );
+          revisionId = revision.id;
+          setProjectSession((current) =>
+            current && current.projectId === projectSession.projectId
+              ? {
+                  ...current,
+                  headRevisionId: revision.id,
+                  headEditorRevisionId: submittedEditorRevision,
+                  activeRenderIdempotencyKey: null,
+                  activeRenderRequestScope: null,
+                  activeRenderAttemptDiscriminator: null,
+                }
+              : current,
+          );
+          if (
+            revisionHistoryRef.current.present.revisionId ===
+            submittedEditorRevision
+          ) {
+            const cleanHistory = markRevisionBase(
+              revisionHistoryRef.current,
+            );
+            publishRevisionHistory(cleanHistory);
+            setHasChanges(false);
+          }
+
+          const freshCoverage = (
+            submittedProjectDocument.captionTrack as typeof submittedProjectDocument.captionTrack & {
+              coverage: CaptionCoverageSummary;
+            }
+          ).coverage;
+          setJob((current) =>
+            current
+              ? (jobAfterProjectRevisionSave(
+                  current,
+                  submittedProjectDocument,
+                  captions,
+                ) as JobResponse)
+              : current,
+          );
+          if (submittedProjectDocument.captionTrack.status === "review_required") {
+            const diagnostics: RenderPreflight = {
+              code: "caption_coverage_incomplete",
+              message:
+                "Some spoken audio is still missing a caption. Repair every highlighted gap before export.",
+              coverage: freshCoverage,
+              uncoveredIntervals: normalizeUncoveredIntervals(
+                freshCoverage.uncoveredIntervals,
+                duration,
+              ) as CoverageInterval[],
+            };
+            setRenderPreflight(diagnostics);
+            setTab("review");
+            setToast(diagnostics.message);
+            return;
+          }
+        }
+
+        if (!revisionId) {
+          throw new Error("The project revision could not be saved.");
+        }
+        const exportSpec = {
+          width,
+          height,
+          fps: "source" as const,
+          quality: "balanced",
+          container: "mp4",
+          videoCodec: "h264",
+          audioCodec: "aac",
+          captionMode: "burned",
+        };
+        const renderRequestScope = projectRenderRequestScope(
+          revisionId,
+          exportSpec,
+        );
+        const renderDispatchIdentity = await selectProjectRenderDispatchIdentity(
+          projectSession,
+          revisionId,
+          renderRequestScope,
+        );
+        const renderIdempotencyKey =
+          renderDispatchIdentity.idempotencyKey;
+        const dispatchSession = {
+          ...projectSession,
+          headRevisionId: revisionId,
+          headEditorRevisionId: submittedEditorRevision,
+          activeRenderJobId: null,
+          activeRenderIdempotencyKey: renderIdempotencyKey,
+          activeRenderRequestScope: renderRequestScope,
+          activeRenderAttemptDiscriminator:
+            renderDispatchIdentity.attemptDiscriminator,
+        } satisfies ProjectSession;
+        const dispatchSessionPersisted = await persistProjectSession(
+          dispatchSession,
+        );
+        if (
+          renderDispatchIdentity.attemptDiscriminator &&
+          !dispatchSessionPersisted
+        ) {
+          throw new Error(
+            "The render retry could not be saved locally. Free browser storage and try again.",
+          );
+        }
+        attemptedProjectDispatch = true;
+        const renderJob = (await createProjectRenderJob(
+          fetch,
+          projectSession.projectId,
+          {
+            revisionId,
+            exportSpec,
+            idempotencyKey: renderIdempotencyKey,
+          },
+        )) as ProjectRenderJob;
+        pendingRenderRevisionRef.current = submittedEditorRevision;
+        setPendingRenderRevision(submittedEditorRevision);
+        setRenderPreflight(null);
+        setProjectRenderJob(renderJob);
+        if (["failed", "cancelled"].includes(renderJob.status)) {
+          pendingRenderRevisionRef.current = "";
+          setPendingRenderRevision("");
+          await persistProjectSession(
+            projectSessionAfterTerminalRender(
+              dispatchSession,
+              renderRequestScope,
+              renderJob.id,
+            ) as ProjectSession,
+          );
+          setJob((current) =>
+            current
+              ? {
+                  ...current,
+                  status: current.alignment?.coverage?.complete
+                    ? "ready"
+                    : "review_required",
+                  message:
+                    renderJob.status === "cancelled"
+                      ? "The previous render was cancelled. Retry when you are ready."
+                      : "The previous render failed. Retry this saved revision when you are ready.",
+                }
+              : current,
+          );
+          setToast(
+            "The previous attempt is terminal and was not reopened. Choose Make my video to start a new attempt.",
+          );
+          return;
+        }
+        setProjectSession((current) =>
+          current && current.projectId === projectSession.projectId
+            ? {
+                ...current,
+                activeRenderJobId: renderJob.id,
+                activeRenderIdempotencyKey: renderIdempotencyKey,
+                activeRenderRequestScope: renderRequestScope,
+                activeRenderAttemptDiscriminator:
+                  renderDispatchIdentity.attemptDiscriminator,
+              }
+            : current,
+        );
+        setJob((current) =>
+          current
+            ? {
+                ...current,
+                status: "rendering",
+                progress: renderJob.progress,
+                message: renderJob.message,
+                updatedAt: renderJob.updatedAt,
+              }
+            : current,
+        );
+        setTab("export");
+        setToast(
+          job.status === "review_required"
+            ? "Coverage passed. Your immutable revision is rendering now."
+            : "Saved revision is rendering. You can keep editing while it runs.",
+        );
+        return;
+      }
+
       const response = await fetch(
         `${jobsBase}${jobRoute(job.id)}/render`,
         {
@@ -1669,30 +3099,183 @@ export default function Home() {
           body: JSON.stringify({ captions, style: captionStyle }),
         },
       );
-      const data = (await response.json()) as JobResponse & { error?: string };
-      if (!response.ok) throw new Error(data.error ?? "Render failed.");
+      let payload: unknown = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      if (!response.ok) {
+        const diagnostics = normalizeRenderPreflight(payload, {
+          durationSeconds: duration,
+          fallbackMessage: "The render preflight failed. Review this draft and try again.",
+        }) as RenderPreflight;
+        setRenderPreflight(diagnostics);
+        if (
+          diagnostics.code === "caption_coverage_incomplete" ||
+          diagnostics.code === "caption_coverage_unverified"
+        ) {
+          pendingRenderRevisionRef.current = "";
+          setPendingRenderRevision("");
+          setJob((current) =>
+            current
+              ? {
+                  ...current,
+                  status: "review_required",
+                  message: diagnostics.message,
+                  alignment:
+                    current.alignment && diagnostics.coverage
+                      ? {
+                          ...current.alignment,
+                          coverage: diagnostics.coverage,
+                        }
+                      : current.alignment,
+                }
+              : current,
+          );
+          setTab("review");
+        }
+        setToast(diagnostics.message);
+        return;
+      }
+      const data = payload as JobResponse;
+      const submittedRevision = revisionHistoryRef.current.present.revisionId;
+      pendingRenderRevisionRef.current = submittedRevision;
+      setPendingRenderRevision(submittedRevision);
+      setRenderPreflight(null);
       setJob({
         ...data,
         capabilityToken: job.capabilityToken,
       });
-      setHasChanges(false);
       setTab("export");
-      setToast("Final render started. You can download it when it finishes.");
+      setToast(
+        job.status === "review_required"
+          ? "Coverage passed. Your final render is now running."
+          : "Final render started. You can keep editing this draft while it runs.",
+      );
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Render failed.");
+      if (
+        error instanceof ProjectClientError &&
+        error.code === "revision_conflict"
+      ) {
+        const message =
+          "This project changed in another tab. Reload that revision before saving over it.";
+        setRenderPreflight({
+          code: "revision_conflict",
+          message,
+          coverage: job.alignment?.coverage ?? null,
+          uncoveredIntervals,
+        });
+        setToast(message);
+      } else if (
+        error instanceof ProjectClientError &&
+        error.code === "invalid_project_coverage"
+      ) {
+        const message =
+          "Speech coverage changed while saving. Review the highlighted gaps and try again.";
+        setRenderPreflight({
+          code: error.code,
+          message,
+          coverage: job.alignment?.coverage ?? null,
+          uncoveredIntervals,
+        });
+        setTab("review");
+        setToast(message);
+      } else if (
+        error instanceof ProjectClientError &&
+        error.status === 401
+      ) {
+        setProjectAccessDenied(true);
+        setToast("Project access expired in this browser.");
+      } else if (
+        attemptedProjectDispatch &&
+        error instanceof ProjectClientError &&
+        error.code === "idempotency_conflict"
+      ) {
+        setToast(
+          "The saved render identity conflicts with different input. Reload before trying again.",
+        );
+      } else if (
+        attemptedProjectDispatch &&
+        (!(error instanceof ProjectClientError) ||
+          error.status === 429 ||
+          error.status >= 500)
+      ) {
+        setToast(
+          "Your revision is saved. Render dispatch is temporarily unavailable; try Make my video again.",
+        );
+      } else {
+        setToast(error instanceof Error ? error.message : "Render failed.");
+      }
     } finally {
       setUploading(false);
     }
   };
 
-  const downloadResult = (kind: "video" | "ass") => {
-    const resultPath = kind === "video" ? job?.downloadUrl : job?.assUrl;
+  const downloadResult = async (kind: "video" | "ass") => {
+    let resultPath = kind === "video" ? job?.downloadUrl : job?.assUrl;
+    if (projectSession) {
+      resultPath = "";
+      const artifactKind = kind === "video" ? "video" : "captions_ass";
+      const completedRenderJobId = projectSession.lastCompletedRenderJobId;
+      const exactArtifactId =
+        kind === "video" ? projectSession.lastExportArtifactId : null;
+      let artifact =
+        completedRenderJobId &&
+        projectRenderJob?.id === completedRenderJobId &&
+        projectRenderJob.status === "succeeded"
+          ? (selectCompletedRenderArtifact(
+              projectRenderJob.artifacts,
+              completedRenderJobId,
+              artifactKind,
+              exactArtifactId,
+            ) as ProjectArtifact | null)
+          : null;
+
+      if (exactArtifactId) {
+        resultPath =
+          artifact?.contentUrl ??
+          projectExportContentUrl(projectSession.projectId, exactArtifactId);
+      } else if (artifact) {
+        resultPath = artifact.contentUrl;
+      }
+
+      if (!resultPath && completedRenderJobId) {
+        try {
+          const payload = await listProjectExports(
+            fetch,
+            projectSession.projectId,
+          );
+          artifact = selectCompletedRenderArtifact(
+            Array.isArray(payload.exports) ? payload.exports : [],
+            completedRenderJobId,
+            artifactKind,
+            exactArtifactId,
+          ) as ProjectArtifact | null;
+        } catch (error) {
+          setToast(
+            error instanceof Error
+              ? error.message
+              : "The export list could not be loaded.",
+          );
+          return;
+        }
+        resultPath = artifact?.contentUrl;
+      }
+    }
     if (!resultPath) {
       setToast(`${kind === "video" ? "Video" : "ASS file"} is not ready.`);
       return;
     }
     const link = document.createElement("a");
-    link.href = `${jobsBase}${resultPath}`;
+    if (projectSession) {
+      const downloadUrl = new URL(resultPath, window.location.href);
+      downloadUrl.searchParams.set("download", "1");
+      link.href = downloadUrl.toString();
+      link.download = kind === "video" ? "subtitles-by-miithii.mp4" : "subtitles-by-miithii.ass";
+    } else {
+      link.href = `${jobsBase}${resultPath}`;
+    }
     link.click();
   };
 
@@ -1724,7 +3307,7 @@ export default function Home() {
           ? captionId
           : document.captions[0]?.id ?? "",
       );
-      setSelectedWordIndex((wordIndex) => Math.max(0, wordIndex));
+      setSelectedWordIndex(0);
       setToast(direction === "undo" ? "Edit undone." : "Edit restored.");
     },
     [applyEditorDocument, publishRevisionHistory],
@@ -1779,9 +3362,14 @@ export default function Home() {
     }
     if (job.status === "review_required") {
       setTab("review");
-      setToast(
-        job.message ?? "Caption every speech gap before exporting this draft.",
-      );
+      if (hasChanges) {
+        void startRender();
+      } else {
+        setToast(
+          coverageMessage ??
+            "Caption every speech gap before exporting this draft.",
+        );
+      }
       return;
     }
     if (tab === "review") {
@@ -1820,7 +3408,9 @@ export default function Home() {
     if (isProcessing) {
       return `${job.message ?? "Processing"} · ${job.progress}%`;
     }
-    if (job.status === "review_required") return "Review missing speech";
+    if (job.status === "review_required") {
+      return hasChanges ? "Check coverage again" : "Review missing speech";
+    }
     if (tab === "review") {
       return "Choose a caption look";
     }
@@ -1829,6 +3419,19 @@ export default function Home() {
     if (job.status === "ready") return "Make my video";
     if (job.status === "complete" && hasChanges) return "Update final video";
     return "Download final MP4";
+  })();
+  const renderedCurrentRevision = Boolean(
+    lastRenderedRevision &&
+      historyControls.currentRevisionId === lastRenderedRevision,
+  );
+  const draftSaveLabel = (() => {
+    if (draftSaveState.status === "error") return "Draft save failed";
+    if (draftSaveState.status === "saving") return "Saving…";
+    if (draftSaveState.status === "idle") return "Not saved yet";
+    if (pendingRenderRevision) return "Saved · render pending";
+    if (hasChanges) return "Saved · not rendered";
+    if (renderedCurrentRevision) return "Saved · rendered";
+    return "Draft saved";
   })();
 
   return (
@@ -1843,16 +3446,31 @@ export default function Home() {
               void cancelRemoteJob(activeJob);
             }
           }}
-          aria-label="SyncWord home"
+          aria-label="subtitles by miithii home"
         >
-          <i aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </i>
-          <strong>SyncWord</strong>
+          <Image
+            src="/miithii-mark.svg"
+            alt=""
+            width={38}
+            height={32}
+            priority
+          />
+          <span>
+            <strong>subtitles</strong>
+            <small>by miithii</small>
+          </span>
         </button>
         <div className="header-actions">
+          {hasProject && (
+            <span
+              className={`draft-save-state ${draftSaveState.status}`}
+              role="status"
+              title={draftSaveState.message ?? draftSaveLabel}
+            >
+              <i aria-hidden="true" />
+              {draftSaveLabel}
+            </span>
+          )}
           {hasProject && captions.length > 0 && (
             <div className="history-actions" aria-label="Edit history">
               <button
@@ -1900,6 +3518,13 @@ export default function Home() {
             }
           >
             <span />
+            <small>
+              {engineState === "online"
+                ? "Engine ready"
+                : engineState === "waking"
+                  ? "Engine starting"
+                  : "Engine offline"}
+            </small>
           </div>
         </div>
       </header>
@@ -1920,7 +3545,7 @@ export default function Home() {
               </small>
             )}
             <button onClick={() => window.location.reload()}>
-              Reload SyncWord
+              Reload subtitles
             </button>
           </div>
         </section>
@@ -1929,11 +3554,13 @@ export default function Home() {
       {!hasProject ? (
         <section className="launch">
           <div className="launch-copy">
-            <span className="eyebrow">NEW CAPTION VIDEO</span>
-            <h1>What are we captioning?</h1>
+            <span className="eyebrow">SUBTITLES · BY MIITHII</span>
+            <h1>
+              Make every word <em>land.</em>
+            </h1>
             <p>
-              Add an Assamese, Bodo, or mixed-language reel. You can fix every
-              line before making the final video.
+              Add an Assamese or Bodo video, refine every line, then play with
+              large and small words before you export.
             </p>
           </div>
 
@@ -1942,15 +3569,14 @@ export default function Home() {
               <span>Spoken language</span>
               <div>
                 {[
-                  ["unknown", "Auto"],
-                  ["as-IN", "অসমীয়া"],
-                  ["brx-IN", "बड़ो"],
+                  ["as-IN", "অসমীয়া · Assamese"],
+                  ["brx-IN", "बड़ो · Bodo"],
                 ].map(([value, label]) => (
                   <button
                     key={value}
                     className={language === value ? "active" : ""}
                     onClick={() => {
-                      setLanguage(value);
+                      setLanguage(value as SupportedLanguage);
                       setStyle({
                         fontFamily:
                           value === "brx-IN"
@@ -1973,12 +3599,12 @@ export default function Home() {
                     ? "Everything said"
                     : transcriptMode === "transcribe"
                       ? "Cleaned up"
-                      : "Natural mix"}
+                      : "Keep mixed words"}
                 </strong>
               </summary>
               <div>
                 {[
-                  ["codemix", "Natural mix"],
+                  ["codemix", "Keep mixed words"],
                   ["verbatim", "Everything said"],
                   ["transcribe", "Cleaned up"],
                 ].map(([value, label]) => (
@@ -2014,23 +3640,23 @@ export default function Home() {
             >
               <i>＋</i>
               <strong>Choose a video</strong>
-              <small>MVP · up to 3 min / 90 MB</small>
+              <small>up to 3 min · 90 MB</small>
             </button>
           </div>
 
-          <ol className="promise-row" aria-label="How SyncWord works">
+          <ol className="promise-row" aria-label="How subtitles by miithii works">
             <li>
               <b>1</b>
               <div>
-                <strong>Automatic captions</strong>
-                <span>See them on the video first</span>
+                <strong>First-pass captions</strong>
+                <span>Assamese or Bodo, ready to review</span>
               </div>
             </li>
             <li>
               <b>2</b>
               <div>
-                <strong>Tap to correct</strong>
-                <span>Change text and timing directly</span>
+                <strong>Play with words</strong>
+                <span>Make each one small or large</span>
               </div>
             </li>
             <li>
@@ -2082,6 +3708,10 @@ export default function Home() {
                     event.currentTarget.videoWidth &&
                     event.currentTarget.videoHeight
                   ) {
+                    setVideoDimensions({
+                      width: event.currentTarget.videoWidth,
+                      height: event.currentTarget.videoHeight,
+                    });
                     setVideoRatio(
                       event.currentTarget.videoWidth /
                         event.currentTarget.videoHeight,
@@ -2097,6 +3727,14 @@ export default function Home() {
                 }}
                 onPlay={() => setPlaying(true)}
                 onPause={() => setPlaying(false)}
+                onError={() => {
+                  setPlaying(false);
+                  setToast(
+                    showingFinal
+                      ? "The final video could not be played in this browser. Download it to inspect the file."
+                      : "This browser cannot preview that source. Use a browser-playable H.264 MP4 or WebM file.",
+                  );
+                }}
                 playsInline
               />
 
@@ -2110,7 +3748,11 @@ export default function Home() {
                   {activeWordGroup.map((word) => (
                     <span
                       key={word.id}
-                      className={activeWord?.id === word.id ? "active" : ""}
+                      className={`${
+                        word.displaySize === "large"
+                          ? "word-size-large"
+                          : "word-size-small"
+                      } ${activeWord?.id === word.id ? "active" : ""}`}
                     >
                       {word.text}
                     </span>
@@ -2209,8 +3851,8 @@ export default function Home() {
             >
               {(
                 [
-                  ["review", "1", "Captions"],
-                  ["style", "2", "Look"],
+                  ["review", "1", "Words"],
+                  ["style", "2", "Style"],
                   ["export", "3", "Export"],
                 ] as const
               ).map(([value, number, label]) => (
@@ -2220,7 +3862,34 @@ export default function Home() {
                   onClick={() => setTab(value)}
                   disabled={!captions.length && value !== "review"}
                   role="tab"
+                  id={`workflow-tab-${value}`}
+                  aria-controls={`workflow-panel-${value}`}
                   aria-selected={tab === value}
+                  tabIndex={tab === value ? 0 : -1}
+                  onKeyDown={(event) => {
+                    if (![
+                      "ArrowLeft",
+                      "ArrowRight",
+                      "Home",
+                      "End",
+                    ].includes(event.key)) return;
+                    event.preventDefault();
+                    const available: Array<"review" | "style" | "export"> =
+                      captions.length
+                        ? ["review", "style", "export"]
+                        : ["review"];
+                    const currentIndex = available.indexOf(tab);
+                    const nextIndex = event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? available.length - 1
+                        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + available.length) % available.length;
+                    const nextTab = available[nextIndex];
+                    setTab(nextTab);
+                    requestAnimationFrame(() => {
+                      document.getElementById(`workflow-tab-${nextTab}`)?.focus();
+                    });
+                  }}
                 >
                   <i>{number}</i>
                   <span>{label}</span>
@@ -2228,14 +3897,80 @@ export default function Home() {
               ))}
             </nav>
 
-            <div className="tool-body">
-              {job?.status === "review_required" && (
+            <div
+              className="tool-body"
+              role="tabpanel"
+              id={`workflow-panel-${tab}`}
+              aria-labelledby={`workflow-tab-${tab}`}
+            >
+              {(job?.status === "review_required" || renderPreflight) && (
                 <div className="coverage-warning" role="alert">
-                  <strong>Speech coverage needs review</strong>
-                  <span>
-                    {job.message ??
-                      "Some spoken audio is still missing trusted captions. Export stays locked until coverage is complete."}
-                  </span>
+                  <strong>
+                    {renderPreflight &&
+                    !renderPreflight.code.startsWith("caption_coverage")
+                      ? "Render check needs attention"
+                      : "Speech coverage needs review"}
+                  </strong>
+                  <span>{coverageMessage}</span>
+                  {uncoveredIntervals.length > 0 && (
+                    <ol className="coverage-gap-list">
+                      {uncoveredIntervals.map((gap, index) => {
+                        const hasManualCaption = captions.some(
+                          (caption) =>
+                            caption.id.startsWith("manual-gap-") &&
+                            caption.start < gap.end &&
+                            caption.end > gap.start,
+                        );
+                        return (
+                          <li key={`${gap.start}-${gap.end}`}>
+                            <button
+                              className="coverage-gap-seek"
+                              onClick={() => {
+                                setTab("review");
+                                videoRef.current?.pause();
+                                seek(gap.start);
+                              }}
+                            >
+                              <b>Gap {index + 1}</b>
+                              <small>
+                                {compactTime(gap.start)}–{compactTime(gap.end)} ·{" "}
+                                {gap.duration.toFixed(1)}s
+                              </small>
+                            </button>
+                            <button
+                              className="coverage-gap-add"
+                              onClick={() => addCaptionForGap(gap)}
+                              disabled={hasManualCaption}
+                            >
+                              {hasManualCaption
+                                ? "Caption added"
+                                : "Add caption here"}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  )}
+                  {job?.status === "review_required" &&
+                    uncoveredIntervals.length === 0 && (
+                      <small className="coverage-no-gaps">
+                        The engine could not provide trustworthy gap locations.
+                        Edit any known missing line, then run the check again.
+                      </small>
+                    )}
+                  {job?.status === "review_required" && (
+                    <button
+                      className="coverage-recheck"
+                      onClick={() => void startRender()}
+                      disabled={uploading || !hasChanges}
+                    >
+                      {uploading
+                        ? "Checking coverage…"
+                        : hasChanges
+                          ? "Check coverage again"
+                          : "Edit a gap to recheck"}
+                    </button>
+                  )}
                 </div>
               )}
               {tab === "review" && !captions.length && (
@@ -2265,8 +4000,8 @@ export default function Home() {
                   <header className="caption-editor-heading">
                     <div>
                       <small>CAPTIONS</small>
-                      <h2>Make it sound right.</h2>
-                      <p>Play the video. Tap the exact line or word you hear.</p>
+                      <h2>Make every word land.</h2>
+                      <p>Fix the line, select a word, then make it small or large.</p>
                     </div>
                     <button onClick={() => setTab("style")}>Style</button>
                   </header>
@@ -2334,7 +4069,7 @@ export default function Home() {
                     </label>
 
                     <div className="composer-save-row">
-                      <span>Tap a word to fix its highlight.</span>
+                      <span>Select a word to edit its timing and size.</span>
                       <button onClick={commitCaptionDraft}>Save text</button>
                     </div>
 
@@ -2342,7 +4077,17 @@ export default function Home() {
                       {selectedWords.map((word, index) => (
                         <button
                           key={word.id}
-                          className={index === selectedWordIndex ? "active" : ""}
+                          className={`${
+                            index === selectedWordIndex ? "active" : ""
+                          } ${
+                            word.displaySize === "large"
+                              ? "word-is-large"
+                              : "word-is-small"
+                          }`}
+                          aria-label={`${word.text}, ${
+                            word.displaySize === "large" ? "large" : "small"
+                          }`}
+                          aria-pressed={index === selectedWordIndex}
                           onClick={() =>
                             selectReviewItem({
                               captionId: selectedCaption.id,
@@ -2381,6 +4126,29 @@ export default function Home() {
                         <button onClick={() => shiftSelectedWord(-0.06)}>← Earlier</button>
                         <button onClick={() => shiftSelectedWord(0.06)}>Later →</button>
                       </div>
+                      <fieldset className="word-size-control">
+                        <legend>Word size</legend>
+                        <button
+                          type="button"
+                          aria-pressed={selectedWord.displaySize !== "large"}
+                          className={
+                            selectedWord.displaySize !== "large" ? "active" : ""
+                          }
+                          onClick={() => setSelectedWordDisplaySize("small")}
+                        >
+                          Small
+                        </button>
+                        <button
+                          type="button"
+                          aria-pressed={selectedWord.displaySize === "large"}
+                          className={
+                            selectedWord.displaySize === "large" ? "active" : ""
+                          }
+                          onClick={() => setSelectedWordDisplaySize("large")}
+                        >
+                          Large
+                        </button>
+                      </fieldset>
                     </div>
 
                     <details className="fine-timing" key={selectedWord.id}>
@@ -2401,7 +4169,7 @@ export default function Home() {
                         <strong>Done with this line</strong>
                         <small>
                           {captions.at(-1)?.id === selectedCaption.id
-                            ? "pick a style next"
+                            ? "shape the overall look next"
                             : "move to the next line"}
                         </small>
                       </span>
@@ -2433,10 +4201,10 @@ export default function Home() {
               {tab === "style" && (
                 <div className="style-panel">
                   <div className="panel-heading">
-                    <small>STEP 2 · LOOK</small>
-                    <h2>Pick a look. Watch it live.</h2>
+                    <small>STEP 2 · STYLE</small>
+                    <h2>Shape the rhythm.</h2>
                     <p>
-                      Tap a style, then play the video. Nothing is rendering yet.
+                      Your small and large word choices stay intact in every look.
                     </p>
                   </div>
 
@@ -2454,7 +4222,8 @@ export default function Home() {
                           style={{
                             color: preset.values.textColor,
                             background: rgba(
-                              preset.values.backgroundColor ?? "#070806",
+                              preset.values.backgroundColor ??
+                                miithiiColors.teal950,
                               preset.values.backgroundOpacity ?? 0,
                             ),
                             WebkitTextStroke: `${
@@ -2474,7 +4243,7 @@ export default function Home() {
                     <summary>
                       <span>
                         <strong>Make it yours</strong>
-                        <small>colors, size, motion and position</small>
+                        <small>color, base size, motion and position</small>
                       </span>
                       <b>＋</b>
                     </summary>
@@ -2584,12 +4353,18 @@ export default function Home() {
                 <div className="export-panel">
                   <div
                     className={`export-status ${
-                      showingFinal ? "ready" : ""
+                      showingFinal
+                        ? "ready"
+                        : job?.status === "review_required"
+                          ? "blocked"
+                          : ""
                     }`}
                   >
                     <span>
                       {showingFinal
                         ? "✓"
+                        : job?.status === "review_required"
+                          ? "!"
                         : job?.status === "rendering"
                           ? "↻"
                           : "→"}
@@ -2598,6 +4373,8 @@ export default function Home() {
                       <small>
                         {showingFinal
                           ? "READY"
+                          : job?.status === "review_required"
+                            ? "COVERAGE REVIEW REQUIRED"
                           : job?.status === "rendering"
                             ? "MAKING YOUR VIDEO"
                             : "STEP 3 · EXPORT"}
@@ -2605,6 +4382,8 @@ export default function Home() {
                       <h2>
                         {showingFinal
                           ? "Ready to post."
+                          : job?.status === "review_required"
+                            ? "Caption the missing speech first."
                           : job?.status === "rendering"
                             ? "Adding captions to every frame…"
                             : "Happy with the preview?"}
@@ -2612,6 +4391,8 @@ export default function Home() {
                       <p>
                         {showingFinal
                           ? "Download it and post wherever your audience is."
+                          : job?.status === "review_required"
+                            ? coverageMessage
                           : job?.status === "rendering"
                             ? job.message
                             : "Play it once more if you want. When you confirm, we will make one downloadable MP4."}
@@ -2640,7 +4421,7 @@ export default function Home() {
                       <i>✓</i>
                       <span>
                         <strong>Your original stays safe</strong>
-                        <small>SyncWord creates a separate downloadable copy</small>
+                        <small>miithii creates a separate downloadable copy</small>
                       </span>
                     </div>
                   </div>
@@ -2656,7 +4437,7 @@ export default function Home() {
                     </div>
                     <div>
                       <span>Word effect</span>
-                      <strong>Automatic where reliable</strong>
+                      <strong>Small + large, exactly as chosen</strong>
                     </div>
                     <div>
                       <span>Compatibility</span>
@@ -2682,6 +4463,25 @@ export default function Home() {
                     </div>
                   )}
 
+                  {job?.status === "review_required" && (
+                    <div className="export-actions">
+                      <button
+                        className="secondary"
+                        onClick={() => setTab("review")}
+                      >
+                        Review speech gaps
+                      </button>
+                      <button
+                        className="primary"
+                        onClick={() => void startRender()}
+                        disabled={uploading || !hasChanges}
+                      >
+                        {uploading ? "Checking…" : "Check coverage again"}
+                        <span>↻</span>
+                      </button>
+                    </div>
+                  )}
+
                   {job?.status === "complete" && hasChanges && (
                     <div className="export-actions">
                       <button
@@ -2696,11 +4496,11 @@ export default function Home() {
 
                   {showingFinal && (
                     <div className="download-actions">
-                      <button onClick={() => downloadResult("video")}>
+                      <button onClick={() => void downloadResult("video")}>
                         Download final MP4
                         <span>↓</span>
                       </button>
-                      <button onClick={() => downloadResult("ass")}>
+                      <button onClick={() => void downloadResult("ass")}>
                         Download caption file
                       </button>
                     </div>
@@ -2720,7 +4520,7 @@ export default function Home() {
       <input
         ref={videoInputRef}
         type="file"
-        accept="video/*,.mkv"
+        accept=".mp4,.webm,.m4v,video/mp4,video/webm,video/x-m4v"
         hidden
         onChange={(event) => {
           const nextFile = event.target.files?.[0];

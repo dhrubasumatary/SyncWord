@@ -1,0 +1,80 @@
+/* Miithii design tokens — Pulse direction.
+   Components consume semantic values from this file; brand primitives stay here. */
+
+:root {
+  --miithii-teal-950: #081f1c;
+  --miithii-teal-900: #0b3b36;
+  --miithii-jade-500: #1d9e75;
+  --miithii-jade-400: #35c696;
+  --miithii-lime-400: #c6ff3d;
+  --miithii-cream-50: #f2f5f1;
+
+  --color-bg: var(--miithii-cream-50);
+  --color-surface: #ffffff;
+  --color-text-primary: var(--miithii-teal-900);
+  --color-text-secondary: #4c6b63;
+  --color-text-muted: #5f7b72;
+  --color-border: #dce7e1;
+  --color-border-strong: #b9ccc4;
+  --color-primary: var(--miithii-jade-500);
+  --color-primary-hover: #167a5b;
+  --color-on-primary: #ffffff;
+  --color-accent: var(--miithii-lime-400);
+  --color-on-accent: #1f2e0c;
+  --color-danger: #c84d3f;
+  --color-on-danger: #ffffff;
+  --color-focus: #167a5b;
+  --color-stage: var(--miithii-teal-950);
+  --color-stage-surface: var(--miithii-teal-900);
+  --color-stage-text: var(--miithii-cream-50);
+  --color-stage-muted: #9fc2b7;
+  --color-stage-border: #1d4239;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+}
+
+/* fonts.css defines the raw, self-hosted family variables. These semantic
+   aliases keep components independent from the underlying font files. */
+body {
+  --font-display: var(--font-space-grotesk), sans-serif;
+  --font-body: var(--font-manrope), sans-serif;
+  --font-mono: var(--font-space-mono), monospace;
+  --font-assamese: var(--font-noto-bengali), "Nirmala UI", sans-serif;
+  --font-bodo: var(--font-noto-devanagari), "Nirmala UI", sans-serif;
+}
+
+[data-theme="dark"] {
+  --color-bg: var(--miithii-teal-950);
+  --color-surface: var(--miithii-teal-900);
+  --color-text-primary: var(--miithii-cream-50);
+  --color-text-secondary: #9fc2b7;
+  --color-text-muted: #6d8f85;
+  --color-border: #1d4239;
+  --color-border-strong: #2c554b;
+  --color-primary: var(--miithii-jade-400);
+  --color-primary-hover: var(--miithii-jade-500);
+  --color-on-primary: #06211b;
+  --color-accent: var(--miithii-lime-400);
+  --color-on-accent: #1f2e0c;
+  --color-focus: var(--miithii-jade-400);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: var(--miithii-teal-950);
+    --color-surface: var(--miithii-teal-900);
+    --color-text-primary: var(--miithii-cream-50);
+    --color-text-secondary: #9fc2b7;
+    --color-text-muted: #6d8f85;
+    --color-border: #1d4239;
+    --color-border-strong: #2c554b;
+    --color-primary: var(--miithii-jade-400);
+    --color-primary-hover: var(--miithii-jade-500);
+    --color-on-primary: #06211b;
+    --color-accent: var(--miithii-lime-400);
+    --color-on-accent: #1f2e0c;
+    --color-focus: var(--miithii-jade-400);
+  }
+}

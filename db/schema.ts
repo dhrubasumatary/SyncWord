@@ -126,6 +126,63 @@ export const projectRevisions = sqliteTable(
   ],
 );
 
+export const processingJobs = sqliteTable(
+  "processing_jobs",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    sourceAssetId: text("source_asset_id")
+      .notNull()
+      .references(() => assets.id, { onDelete: "restrict" }),
+    revisionId: text("revision_id").references(() => projectRevisions.id, {
+      onDelete: "restrict",
+    }),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    callbackCapabilityHash: text("callback_capability_hash").notNull(),
+    language: text("language").notNull(),
+    mode: text("mode").notNull(),
+    processorRevision: text("processor_revision").notNull(),
+    status: text("status").notNull().default("queued"),
+    progress: integer("progress").notNull().default(0),
+    message: text("message").notNull().default("Queued for captioning"),
+    failureCode: text("failure_code"),
+    dispatchAttempts: integer("dispatch_attempts").notNull().default(0),
+    dispatchedAt: text("dispatched_at"),
+    dispatchError: text("dispatch_error"),
+    dispatchLeaseExpiresAt: text("dispatch_lease_expires_at"),
+    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+    startedAt: text("started_at"),
+    completedAt: text("completed_at"),
+    updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [
+    check(
+      "processing_jobs_status_check",
+      sql`${table.status} in ('queued', 'extracting', 'transcribing', 'aligning', 'recovering', 'ready', 'review_required', 'failed', 'cancelled')`,
+    ),
+    check(
+      "processing_jobs_progress_check",
+      sql`${table.progress} >= 0 and ${table.progress} <= 100`,
+    ),
+    check(
+      "processing_jobs_dispatch_attempts_check",
+      sql`${table.dispatchAttempts} >= 0`,
+    ),
+    uniqueIndex("processing_jobs_project_idempotency_unique").on(
+      table.projectId,
+      table.idempotencyKey,
+    ),
+    index("processing_jobs_project_created_at_idx").on(
+      table.projectId,
+      table.createdAt,
+    ),
+    index("processing_jobs_source_asset_idx").on(table.sourceAssetId),
+  ],
+);
+
 export const renderJobs = sqliteTable(
   "render_jobs",
   {
@@ -145,6 +202,10 @@ export const renderJobs = sqliteTable(
     progress: integer("progress").notNull().default(0),
     message: text("message").notNull().default("Queued for rendering"),
     failureCode: text("failure_code"),
+    dispatchAttempts: integer("dispatch_attempts").notNull().default(0),
+    dispatchedAt: text("dispatched_at"),
+    dispatchError: text("dispatch_error"),
+    dispatchLeaseExpiresAt: text("dispatch_lease_expires_at"),
     createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
     startedAt: text("started_at"),
     completedAt: text("completed_at"),
@@ -158,6 +219,10 @@ export const renderJobs = sqliteTable(
     check(
       "render_jobs_progress_check",
       sql`${table.progress} >= 0 and ${table.progress} <= 100`,
+    ),
+    check(
+      "render_jobs_dispatch_attempts_check",
+      sql`${table.dispatchAttempts} >= 0`,
     ),
     uniqueIndex("render_jobs_project_idempotency_unique").on(
       table.projectId,

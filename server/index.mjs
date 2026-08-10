@@ -35,15 +35,37 @@ import {
   chooseBetterAlignment,
 } from "../shared/caption-quality.mjs";
 import {
-  canRenderCaptionTrack,
+  CAPTION_QUALITY_REVISION,
+  defaultCaptionCoveragePolicy,
   evaluateCaptionCoverage,
   speechIntervalsFromSilences,
 } from "../shared/caption-coverage.mjs";
+import { isSupportedLanguageCode } from "../shared/project-contract.mjs";
+import { miithiiColors } from "../shared/miithii-tokens.mjs";
 import { runTargetedCoverageRecovery } from "./coverage-recovery.mjs";
 import {
+  acceptedRenderCaptionState,
+  validateRenderCaptionSubmission,
+} from "./render-coverage.mjs";
+import {
   buildExportMediaPolicy,
+  exportFrameRateMatchesSource,
   exportVideoArgs,
 } from "./export-policy.mjs";
+import {
+  projectDocumentFromProcessingJob,
+  projectProcessingCallbackStatus,
+} from "./project-processing-contract.mjs";
+import { executeProjectProcessing } from "./project-processing-executor.mjs";
+import {
+  createProjectProcessingRouter,
+  projectJobCapabilityMatches,
+} from "./project-processing-routes.mjs";
+import { executeProjectRender } from "./project-render-executor.mjs";
+import {
+  parseProjectRenderRequest,
+  putProjectRenderState,
+} from "./project-render-protocol.mjs";
 import {
   combineSegmentTranscripts,
   parseSilenceIntervals,
@@ -52,18 +74,27 @@ import {
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
-const captionQualityRevision = "perceptual-and-coverage-gate-v2";
+const captionQualityRevision = CAPTION_QUALITY_REVISION;
+// These identify the running code contract. Generic process environment
+// variables can collide with hosting/tooling internals, so revisions advance
+// with the binary rather than being silently overridden at runtime.
+const processorRevision = "syncword-caption-v3";
+const rendererRevision = "syncword-render-v2";
 const runtimeRoot = path.resolve(
   process.env.RUNTIME_DIR ?? path.join(process.cwd(), ".runtime"),
 );
 const uploadRoot = path.join(runtimeRoot, "incoming");
 const jobsRoot = path.join(runtimeRoot, "jobs");
+const projectProcessingRoot = path.join(runtimeRoot, "project-processing");
+const projectRendersRoot = path.join(runtimeRoot, "project-renders");
 const sarvamBaseUrl =
   process.env.SARVAM_BASE_URL ?? "https://api.sarvam.ai";
 const sarvamModel = process.env.SARVAM_MODEL ?? "saaras:v3";
 const defaultModalAlignerUrl =
   "https://dhrubasumatary--syncword-aligner-alignment-api.modal.run";
 const jobs = new Map();
+const projectProcessingJobs = new Map();
+const projectRenderJobs = new Map();
 const taskQueue = [];
 const persistenceQueue = new Map();
 const remoteSyncQueue = new Map();
@@ -86,6 +117,8 @@ let queueRunning = false;
 await Promise.all([
   mkdir(uploadRoot, { recursive: true }),
   mkdir(jobsRoot, { recursive: true }),
+  mkdir(projectProcessingRoot, { recursive: true }),
+  mkdir(projectRendersRoot, { recursive: true }),
 ]);
 
 const configuredOrigins = (process.env.ALLOWED_ORIGINS ?? "*")
@@ -179,6 +212,13 @@ function updateJob(job, status, progress, message) {
   });
   void persistJob(job);
   void syncRemoteJob(job);
+  if (typeof job.projectProcessingStateCallback === "function") {
+    void Promise.resolve(
+      job.projectProcessingStateCallback({ status, progress, message }),
+    ).catch((error) => {
+      console.error(`Could not sync project processing job ${job.id}:`, error);
+    });
+  }
 }
 
 function remoteAuthorization(job) {
@@ -683,7 +723,7 @@ async function waitForSarvamJob(
   throw new Error("Sarvam Batch did not finish within 30 minutes.");
 }
 
-function transcriptToCaptions(transcript, requestedLanguage = "unknown") {
+function transcriptToCaptions(transcript, requestedLanguage) {
   const captionLanguage = languageTag(
     resolveTranscriptLanguage(
       transcript.language_code,
@@ -1252,10 +1292,12 @@ async function runSarvamTranscript(job, mode, progressFloor = 24) {
 function captionCoveragePolicy() {
   return {
     minimumCoverageRatio: Number(
-      process.env.MIN_SPEECH_CAPTION_COVERAGE ?? 0.92,
+      process.env.MIN_SPEECH_CAPTION_COVERAGE ??
+        defaultCaptionCoveragePolicy.minimumCoverageRatio,
     ),
     maximumUncoveredGapSeconds: Number(
-      process.env.MAX_UNCOVERED_SPEECH_GAP_SECONDS ?? 1.5,
+      process.env.MAX_UNCOVERED_SPEECH_GAP_SECONDS ??
+        defaultCaptionCoveragePolicy.maximumUncoveredGapSeconds,
     ),
   };
 }
@@ -1269,6 +1311,36 @@ function captionCoverageReport(job, captions) {
       policy: captionCoveragePolicy(),
     },
   );
+}
+
+function renderCaptionSubmissionDecision(job, captions) {
+  return validateRenderCaptionSubmission({
+    status: job.status,
+    persistedCoverage: job.alignment?.coverage,
+    captions,
+    durationSeconds: Number(job.video?.duration),
+    policy: captionCoveragePolicy(),
+  });
+}
+
+function rejectRenderCaptionSubmission(response, decision) {
+  response.status(409).json({
+    error: decision.error,
+    code: decision.code,
+    coverage: decision.coverage,
+    uncoveredIntervals: decision.uncoveredIntervals,
+  });
+}
+
+function acceptRenderCaptionSubmission(job, captions, decision) {
+  const state = acceptedRenderCaptionState({
+    status: job.status,
+    alignment: job.alignment,
+    captions,
+    decision,
+  });
+  job.captions = state.captions;
+  job.alignment = state.alignment;
 }
 
 async function ensurePcmAudio(job) {
@@ -1846,7 +1918,7 @@ function animationTag(animation, position, playResX, playResY) {
   return "{\\fscx84\\fscy84\\t(0,190,\\fscx100\\fscy100)\\fad(60,100)}";
 }
 
-function createAss(captions, rawStyle, languageCode, video = {}) {
+export function createAss(captions, rawStyle, languageCode, video = {}) {
   const supportedFonts = new Set([
     "Noto Sans Bengali",
     "Noto Sans Devanagari",
@@ -1860,11 +1932,11 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
       ? rawStyle.fontFamily
       : fallbackFont,
     fontSize: clamp(rawStyle?.fontSize, 24, 84, 72),
-    textColor: safeHex(rawStyle?.textColor, "#fff9ee"),
-    backgroundColor: safeHex(rawStyle?.backgroundColor, "#171a27"),
+    textColor: safeHex(rawStyle?.textColor, miithiiColors.cream50),
+    backgroundColor: safeHex(rawStyle?.backgroundColor, miithiiColors.teal950),
     backgroundOpacity: clamp(rawStyle?.backgroundOpacity, 0, 100, 78),
-    highlightColor: safeHex(rawStyle?.highlightColor, "#ffde59"),
-    outlineColor: safeHex(rawStyle?.outlineColor, "#171a27"),
+    highlightColor: safeHex(rawStyle?.highlightColor, miithiiColors.lime400),
+    outlineColor: safeHex(rawStyle?.outlineColor, miithiiColors.teal950),
     outlineWidth: clamp(rawStyle?.outlineWidth, 0, 8, 2),
     position: clamp(rawStyle?.position, 52, 92, 74),
     animation: ["pop", "fade", "slide"].includes(rawStyle?.animation)
@@ -1890,6 +1962,12 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
     style.backgroundColor,
     style.backgroundOpacity,
   );
+  const baseWordFontSize = Math.round(style.fontSize);
+  const largeWordFontSize = Math.round(style.fontSize * 1.46);
+  const wordFontSize = (word) =>
+    word?.displaySize === "large"
+      ? largeWordFontSize
+      : baseWordFontSize;
 
   const events = captions
     .filter(
@@ -1917,9 +1995,17 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
           !canHighlightGroup(words)
         ) {
           const phraseText = words
-            .map((word) => String(word.text ?? "").trim())
-            .filter(Boolean)
-            .join(" ");
+            .map((word, index) => {
+              const wordText = escapeAssText(
+                String(word.text ?? "").trim(),
+                style.uppercaseEnglish,
+              );
+              if (!wordText) return "";
+              return `{\\fs${wordFontSize(word)}}${wordText}${
+                index === words.length - 1 ? "" : " "
+              }`;
+            })
+            .join("");
           return `Dialogue: 0,${assTime(words[0].start)},${assTime(
             words.at(-1).end,
           )},Default,,0,0,0,,${animationTag(
@@ -1927,7 +2013,7 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
             style.position,
             playResX,
             playResY,
-          )}${escapeAssText(phraseText, style.uppercaseEnglish)}`;
+          )}${phraseText}`;
         }
 
         return words.map((activeWord, activeIndex) => {
@@ -1943,7 +2029,7 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
               const scale = index === activeIndex
                 ? "\\fscx116\\fscy116\\t(0,120,\\fscx106\\fscy106)"
                 : "\\fscx100\\fscy100";
-              return `{\\1c${color}&${scale}}${wordText}${
+              return `{\\1c${color}&\\fs${wordFontSize(word)}${scale}}${wordText}${
                 index === words.length - 1 ? "" : " "
               }`;
             })
@@ -1966,7 +2052,7 @@ function createAss(captions, rawStyle, languageCode, video = {}) {
     .join("\n");
 
   return `[Script Info]
-Title: SyncWord captions
+Title: subtitles by miithii
 ScriptType: v4.00+
 PlayResX: ${playResX}
 PlayResY: ${playResY}
@@ -1984,95 +2070,123 @@ ${events}
 `;
 }
 
+async function encodeCaptionVideo(
+  job,
+  captions,
+  style,
+  { onProgress = async () => {} } = {},
+) {
+  ensureJobRuntime(job);
+  throwIfCancelled(job);
+  await onProgress(82, "Preparing your caption style");
+  job.captions = captions;
+  job.style = style;
+  job.assPath = path.join(job.directory, "captions.ass");
+  await writeFile(
+    job.assPath,
+    createAss(captions, style, job.languageCode, job.video),
+    "utf8",
+  );
+
+  const fontsDir = process.env.CAPTION_FONTS_DIR;
+  const fontOption = fontsDir
+    ? `:fontsdir=${fontsDir
+        .replaceAll("\\", "/")
+        .replaceAll(":", "\\:")
+        .replaceAll("'", "\\'")}`
+    : "";
+  job.outputPath = path.join(job.directory, "captioned.mp4");
+  const exportPolicy = buildExportMediaPolicy(job.video, {
+    gopSeconds: Number(process.env.FFMPEG_GOP_SECONDS ?? 2),
+  });
+  const videoFilters = [
+    ...(exportPolicy.tailPadSeconds > 0
+      ? [
+          `tpad=stop_mode=clone:stop_duration=${exportPolicy.tailPadSeconds}`,
+        ]
+      : []),
+    `ass=captions.ass${fontOption}`,
+    "format=yuv420p",
+  ];
+  job.exportMedia = {
+    audioMode: exportPolicy.audioMode,
+    gopSeconds: exportPolicy.gopSeconds,
+    keyframeIntervalFrames: exportPolicy.keyframeIntervalFrames,
+    tailPadSeconds: exportPolicy.tailPadSeconds,
+  };
+
+  await onProgress(88, "Adding captions to your video");
+  await run(
+    process.env.FFMPEG_PATH ?? "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-y",
+      "-i",
+      path.basename(job.inputPath),
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a:0?",
+      "-vf",
+      videoFilters.join(","),
+      "-c:v",
+      "libx264",
+      "-preset",
+      process.env.FFMPEG_PRESET ?? "medium",
+      "-crf",
+      process.env.FFMPEG_CRF ?? "18",
+      "-pix_fmt",
+      "yuv420p",
+      ...exportVideoArgs(exportPolicy),
+      ...exportPolicy.audioFilterArgs,
+      ...exportPolicy.audioArgs,
+      ...(exportPolicy.useShortest ? ["-shortest"] : []),
+      "-movflags",
+      "+faststart",
+      path.basename(job.outputPath),
+    ],
+    { cwd: job.directory, job },
+  );
+  throwIfCancelled(job);
+
+  return {
+    captionsAssPath: job.assPath,
+    videoPath: job.outputPath,
+    codecManifest: {
+      container: "mp4",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      width: Number(job.video?.width) || null,
+      height: Number(job.video?.height) || null,
+      frameRate: job.video?.frameRate ?? null,
+      pixelFormat: "yuv420p",
+      ...job.exportMedia,
+    },
+  };
+}
+
 async function renderVideo(job, captions, style) {
   try {
-    ensureJobRuntime(job);
-    throwIfCancelled(job);
-    updateJob(job, "rendering", 82, "Preparing your caption style");
-    job.captions = captions;
-    job.style = style;
-    job.assPath = path.join(job.directory, "captions.ass");
-    await writeFile(
-      job.assPath,
-      createAss(captions, style, job.languageCode, job.video),
-      "utf8",
-    );
-
-    const fontsDir = process.env.CAPTION_FONTS_DIR;
-    const fontOption = fontsDir
-      ? `:fontsdir=${fontsDir
-          .replaceAll("\\", "/")
-          .replaceAll(":", "\\:")
-          .replaceAll("'", "\\'")}`
-      : "";
-    job.outputPath = path.join(job.directory, "captioned.mp4");
-    const exportPolicy = buildExportMediaPolicy(job.video, {
-      gopSeconds: Number(process.env.FFMPEG_GOP_SECONDS ?? 2),
+    const output = await encodeCaptionVideo(job, captions, style, {
+      onProgress(progress, message) {
+        updateJob(job, "rendering", progress, message);
+      },
     });
-    const videoFilters = [
-      ...(exportPolicy.tailPadSeconds > 0
-        ? [
-            `tpad=stop_mode=clone:stop_duration=${exportPolicy.tailPadSeconds}`,
-          ]
-        : []),
-      `ass=captions.ass${fontOption}`,
-      "format=yuv420p",
-    ];
-    job.exportMedia = {
-      audioMode: exportPolicy.audioMode,
-      gopSeconds: exportPolicy.gopSeconds,
-      keyframeIntervalFrames: exportPolicy.keyframeIntervalFrames,
-      tailPadSeconds: exportPolicy.tailPadSeconds,
-    };
-
-    updateJob(job, "rendering", 88, "Adding captions to your video");
-    await run(
-      process.env.FFMPEG_PATH ?? "ffmpeg",
-      [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        path.basename(job.inputPath),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-vf",
-        videoFilters.join(","),
-        "-c:v",
-        "libx264",
-        "-preset",
-        process.env.FFMPEG_PRESET ?? "medium",
-        "-crf",
-        process.env.FFMPEG_CRF ?? "18",
-        "-pix_fmt",
-        "yuv420p",
-        ...exportVideoArgs(exportPolicy),
-        ...exportPolicy.audioFilterArgs,
-        ...exportPolicy.audioArgs,
-        ...(exportPolicy.useShortest ? ["-shortest"] : []),
-        "-movflags",
-        "+faststart",
-        path.basename(job.outputPath),
-      ],
-      { cwd: job.directory, job },
-    );
-    throwIfCancelled(job);
 
     if (job.remote) {
       updateJob(job, "rendering", 97, "Saving your export");
       await uploadRemoteArtifact(
         job,
         "captions.ass",
-        job.assPath,
+        output.captionsAssPath,
         "text/x-ssa; charset=utf-8",
       );
       await uploadRemoteArtifact(
         job,
         "result",
-        job.outputPath,
+        output.videoPath,
         "video/mp4",
       );
     }
@@ -2139,11 +2253,146 @@ function objectFromField(value) {
   }
 }
 
+function projectRenderAllowedOrigins() {
+  return (
+    process.env.MEDIA_CALLBACK_ORIGINS ??
+    "https://syncword-caption-studio.dhrub404.chatgpt.site"
+  )
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+function hasCapability(request, job) {
+  return projectJobCapabilityMatches(request, job?.capabilityToken);
+}
+
+function publicProjectRenderJob(job) {
+  return {
+    id: job.id,
+    projectId: job.projectId,
+    revisionId: job.revisionId,
+    requestFingerprint: job.requestFingerprint,
+    rendererRevision: job.rendererRevision,
+    status: job.status,
+    progress: job.progress,
+    message: job.message,
+    captionQualityRevision,
+  };
+}
+
+function assertImmutableSourceFacts(job, renderInput, exportSpec) {
+  const expected = renderInput.video;
+  if (
+    Number(job.video?.width) !== Number(expected.width) ||
+    Number(job.video?.height) !== Number(expected.height)
+  ) {
+    const error = new Error(
+      "The immutable revision canvas does not match the source video.",
+    );
+    error.code = "project_source_canvas_mismatch";
+    throw error;
+  }
+  const actualDuration = Number(job.video?.duration);
+  const expectedDuration = Number(expected.duration);
+  if (
+    !Number.isFinite(actualDuration) ||
+    !Number.isFinite(expectedDuration) ||
+    Math.abs(actualDuration - expectedDuration) > 0.35
+  ) {
+    const error = new Error(
+      "The immutable revision duration does not match the source video.",
+    );
+    error.code = "project_source_duration_mismatch";
+    throw error;
+  }
+  if (
+    exportSpec.width !== Number(expected.width) ||
+    exportSpec.height !== Number(expected.height)
+  ) {
+    const error = new Error(
+      "This caption renderer currently requires export dimensions to match the immutable canvas.",
+    );
+    error.code = "project_export_canvas_unsupported";
+    throw error;
+  }
+  if (!exportFrameRateMatchesSource(job.video?.frameRate, exportSpec.fps)) {
+    const error = new Error(
+      "This caption renderer currently requires export FPS to match the source timeline.",
+    );
+    error.code = "project_export_fps_unsupported";
+    throw error;
+  }
+}
+
+async function runImmutableProjectProcessing({ job, plan, directory }) {
+  return executeProjectProcessing({
+    plan,
+    directory,
+    isCancelled: () => isCancelled(job),
+    signal: ensureJobRuntime(job).abortController.signal,
+    process: async ({ inputPath, onState }) => {
+      job.inputPath = inputPath;
+      Object.defineProperty(job, "projectProcessingStateCallback", {
+        value({ status, progress, message }) {
+          const callbackStatus = projectProcessingCallbackStatus(
+            status,
+            message,
+          );
+          if (!callbackStatus) return Promise.resolve();
+          return onState({
+            status: callbackStatus,
+            progress,
+            message,
+          });
+        },
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+      try {
+        await transcribe(job);
+      } finally {
+        delete job.projectProcessingStateCallback;
+      }
+      if (isCancelled(job)) throw cancelledError();
+      if (job.status === "failed") {
+        const error = new Error(job.message || "Caption processing failed.");
+        error.code = "caption_processing_failed";
+        throw error;
+      }
+      return {
+        document: projectDocumentFromProcessingJob(plan, job),
+        changeSummary: "Automatic captions with speech-coverage validation",
+      };
+    },
+  });
+}
+
+app.use(
+  "/v3/processing-jobs",
+  createProjectProcessingRouter({
+    root: projectProcessingRoot,
+    jobs: projectProcessingJobs,
+    maxQueuedJobs,
+    jobLifetimeMs,
+    allowedOrigins: projectRenderAllowedOrigins,
+    captionQualityRevision,
+    supportedProcessorRevision: processorRevision,
+    enqueue,
+    ensureRuntime: ensureJobRuntime,
+    cancelRuntime: cancelJob,
+    runJob: runImmutableProjectProcessing,
+  }),
+);
+
 app.get("/health", (_request, response) => {
   response.json({
     ok: true,
-    service: "syncword-render",
+    service: "miithii-subtitles-render",
     captionQualityRevision,
+    processorRevision,
+    rendererRevision,
     sarvamConfigured: Boolean(process.env.SARVAM_API_KEY),
     modalAlignerConfigured: Boolean(modalAlignerEndpoint()),
     ffmpeg: process.env.FFMPEG_PATH ?? "ffmpeg",
@@ -2179,6 +2428,15 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
     return;
   }
 
+  const language = String(request.body.language ?? "").trim();
+  if (!isSupportedLanguageCode(language)) {
+    await unlink(request.file.path).catch(() => {});
+    response.status(400).json({
+      error: "Choose Assamese or Bodo before captioning.",
+    });
+    return;
+  }
+
   const activeJobs = [...jobs.values()].filter((job) =>
     ["queued", "extracting", "transcribing", "rendering"].includes(
       job.status,
@@ -2206,11 +2464,6 @@ app.post("/v1/jobs", upload.single("video"), async (request, response) => {
     await copyFile(request.file.path, inputPath);
   }
 
-  const language = ["as-IN", "brx-IN", "unknown"].includes(
-    request.body.language,
-  )
-    ? request.body.language
-    : "unknown";
   const mode = ["codemix", "verbatim", "transcribe"].includes(
     request.body.mode,
   )
@@ -2269,8 +2522,22 @@ app.post("/v2/jobs", async (request, response) => {
     response.status(400).json({ error: "Invalid durable job capability." });
     return;
   }
+  const language = String(rawLanguage ?? "").trim();
+  if (!isSupportedLanguageCode(language)) {
+    response.status(400).json({
+      error: "Choose Assamese or Bodo before captioning.",
+    });
+    return;
+  }
   if (jobs.has(id)) {
-    response.status(202).json(publicJob(jobs.get(id)));
+    const existing = jobs.get(id);
+    if (existing.language !== language) {
+      response.status(409).json({
+        error: "Durable job language does not match the original request.",
+      });
+      return;
+    }
+    response.status(202).json(publicJob(existing));
     return;
   }
 
@@ -2322,9 +2589,6 @@ app.post("/v2/jobs", async (request, response) => {
     path.extname(safeOriginalName).replace(/[^a-zA-Z0-9.]/g, "") ||
     ".mp4";
   const inputPath = path.join(directory, `source${extension}`);
-  const language = ["as-IN", "brx-IN", "unknown"].includes(rawLanguage)
-    ? rawLanguage
-    : "unknown";
   const mode = ["codemix", "verbatim", "transcribe"].includes(rawMode)
     ? rawMode
     : "codemix";
@@ -2378,6 +2642,172 @@ app.post("/v2/jobs", async (request, response) => {
   enqueue(job, () => downloadRemoteSource(job));
 });
 
+app.post("/v3/render-jobs", async (request, response) => {
+  let plan;
+  try {
+    plan = parseProjectRenderRequest(request.body, {
+      allowedOrigins: projectRenderAllowedOrigins(),
+    });
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : "Invalid project render request.",
+      code: error?.code ?? "invalid_project_render_request",
+    });
+    return;
+  }
+  if (plan.rendererRevision !== rendererRevision) {
+    response.status(409).json({
+      error: `This compute service supports renderer revision ${rendererRevision}.`,
+      code: "project_renderer_revision_unsupported",
+    });
+    return;
+  }
+  const idempotencyKey = request.headers["idempotency-key"];
+  if (idempotencyKey && idempotencyKey !== plan.id) {
+    response.status(409).json({
+      error: "Idempotency-Key must equal the immutable render job id.",
+      code: "project_render_idempotency_mismatch",
+    });
+    return;
+  }
+  const existing = projectRenderJobs.get(plan.id);
+  if (existing) {
+    if (existing.requestFingerprint !== plan.requestFingerprint) {
+      response.status(409).json({
+        error: "This render job id already names different immutable input.",
+        code: "project_render_fingerprint_conflict",
+      });
+      return;
+    }
+    if (!["failed", "cancelled"].includes(existing.status)) {
+      response.status(existing.status === "succeeded" ? 200 : 202).json(
+        publicProjectRenderJob(existing),
+      );
+      return;
+    }
+  }
+  const activeProjectRenders = [...projectRenderJobs.values()].filter((job) =>
+    ["queued", "running"].includes(job.status),
+  ).length;
+  if (activeProjectRenders >= maxQueuedJobs) {
+    response.status(429).json({
+      error: "The render queue is full. Try again in a few minutes.",
+      code: "project_render_queue_full",
+    });
+    return;
+  }
+
+  const directory = path.join(projectRendersRoot, plan.id);
+  await rm(directory, { recursive: true, force: true });
+  await mkdir(directory, { recursive: true });
+  const projectJob = {
+    id: plan.id,
+    projectId: plan.projectId,
+    revisionId: plan.revision.id,
+    requestFingerprint: plan.requestFingerprint,
+    rendererRevision: plan.rendererRevision,
+    directory,
+    inputPath: path.join(directory, "source.mp4"),
+    status: "queued",
+    progress: 0,
+    message: "Queued for immutable rendering",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + jobLifetimeMs).toISOString(),
+  };
+  Object.defineProperties(projectJob, {
+    plan: { value: plan, enumerable: false },
+    capabilityToken: {
+      value: plan.authorization.renderCapabilityToken,
+      enumerable: false,
+    },
+  });
+  ensureJobRuntime(projectJob);
+  projectRenderJobs.set(plan.id, projectJob);
+  response.status(202).json(publicProjectRenderJob(projectJob));
+
+  enqueue(projectJob, async () => {
+    projectJob.status = "running";
+    projectJob.progress = 1;
+    projectJob.message = "Starting immutable render";
+    try {
+      await executeProjectRender({
+        plan,
+        directory,
+        isCancelled: () => isCancelled(projectJob),
+        render: async ({ renderInput, inputPath, onProgress }) => {
+          projectJob.inputPath = inputPath;
+          projectJob.languageCode = renderInput.languageCode;
+          projectJob.alignment = renderInput.alignment;
+          await probeVideo(projectJob);
+          assertImmutableSourceFacts(projectJob, renderInput, plan.exportSpec);
+          return encodeCaptionVideo(
+            projectJob,
+            renderInput.captions,
+            renderInput.style,
+            {
+              async onProgress(progress, message) {
+                projectJob.progress = progress;
+                projectJob.message = message;
+                projectJob.updatedAt = new Date().toISOString();
+                await onProgress(progress, message);
+              },
+            },
+          );
+        },
+      });
+      projectJob.status = "succeeded";
+      projectJob.progress = 100;
+      projectJob.message = "Captioned video ready";
+    } catch (error) {
+      if (isCancelled(projectJob)) {
+        projectJob.status = "cancelled";
+        projectJob.message = "Rendering cancelled";
+      } else {
+        projectJob.status = "failed";
+        projectJob.message =
+          error instanceof Error ? error.message : "Project render failed";
+        console.error(
+          JSON.stringify({
+            event: "project_render_failed",
+            renderJobId: projectJob.id,
+            projectId: projectJob.projectId,
+            message: projectJob.message,
+          }),
+        );
+      }
+    } finally {
+      projectJob.updatedAt = new Date().toISOString();
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+      const retentionTimer = setTimeout(
+        () => projectRenderJobs.delete(projectJob.id),
+        jobLifetimeMs,
+      );
+      retentionTimer.unref();
+    }
+  });
+});
+
+app.delete("/v3/render-jobs/:id", async (request, response) => {
+  const job = projectRenderJobs.get(request.params.id);
+  if (!job) {
+    response.status(404).json({ error: "Project render job not found." });
+    return;
+  }
+  if (!hasCapability(request, job)) {
+    response.status(401).json({ error: "Render cancellation capability is invalid." });
+    return;
+  }
+  if (!["succeeded", "failed", "cancelled"].includes(job.status)) {
+    cancelJob(job);
+    await putProjectRenderState(
+      job.plan,
+      { status: "cancelled", progress: job.progress, message: "Rendering cancelled" },
+    ).catch(() => undefined);
+  }
+  response.status(202).json(publicProjectRenderJob(job));
+});
+
 app.get("/v1/jobs/:id", (request, response) => {
   const job = jobs.get(request.params.id);
   if (!job) {
@@ -2423,24 +2853,21 @@ app.post("/v1/jobs/:id/render", (request, response) => {
     response.status(404).json({ error: "Job not found." });
     return;
   }
-  if (!canRenderCaptionTrack(job.status, job.alignment?.coverage)) {
-    response.status(409).json({
-      error:
-        job.alignment?.coverage?.complete === false
-          ? "Caption coverage is incomplete. Review the uncovered speech before rendering."
-          : `Job is not ready for a render. Current status: ${job.status}.`,
-    });
-    return;
-  }
-  const captions = Array.isArray(request.body.captions)
+  const captions = Array.isArray(request.body?.captions)
     ? request.body.captions
     : job.captions;
   if (!captions.length) {
     response.status(400).json({ error: "At least one caption is required." });
     return;
   }
+  const coverageDecision = renderCaptionSubmissionDecision(job, captions);
+  if (!coverageDecision.allowed) {
+    rejectRenderCaptionSubmission(response, coverageDecision);
+    return;
+  }
 
-  job.style = objectFromField(request.body.style);
+  job.style = objectFromField(request.body?.style);
+  acceptRenderCaptionSubmission(job, captions, coverageDecision);
   updateJob(job, "rendering", 82, "Re-render queued");
   enqueue(job, () => renderVideo(job, captions, job.style));
   response.status(202).json(publicJob(job));
@@ -2452,23 +2879,20 @@ app.post("/v2/jobs/:id/render", (request, response) => {
     response.status(404).json({ error: "Job not found." });
     return;
   }
-  if (!canRenderCaptionTrack(job.status, job.alignment?.coverage)) {
-    response.status(409).json({
-      error:
-        job.alignment?.coverage?.complete === false
-          ? "Caption coverage is incomplete. Review the uncovered speech before rendering."
-          : `Job is not ready for a render. Current status: ${job.status}.`,
-    });
-    return;
-  }
-  const captions = Array.isArray(request.body.captions)
+  const captions = Array.isArray(request.body?.captions)
     ? request.body.captions
     : job.captions;
   if (!captionsHaveWordTimings(captions)) {
     response.status(400).json({ error: "Complete word timings are required." });
     return;
   }
-  job.style = objectFromField(request.body.style);
+  const coverageDecision = renderCaptionSubmissionDecision(job, captions);
+  if (!coverageDecision.allowed) {
+    rejectRenderCaptionSubmission(response, coverageDecision);
+    return;
+  }
+  job.style = objectFromField(request.body?.style);
+  acceptRenderCaptionSubmission(job, captions, coverageDecision);
   updateJob(job, "rendering", 82, "Re-render queued");
   enqueue(job, () => renderVideo(job, captions, job.style));
   response.status(202).json(publicJob(job));
@@ -2527,6 +2951,6 @@ const cleanupTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 cleanupTimer.unref();
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`SyncWord render API listening on http://localhost:${port}`);
+export const renderServer = app.listen(port, "0.0.0.0", () => {
+  console.log(`subtitles by miithii render API listening on http://localhost:${port}`);
 });

@@ -24,7 +24,11 @@ const revisionId = "33333333-3333-4333-8333-333333333333";
 const renderJobId = "44444444-4444-4444-8444-444444444444";
 const artifactId = "55555555-5555-4555-8555-555555555555";
 
-function projectDocument({ status = "ready", coverageComplete = true } = {}) {
+function projectDocument({
+  status = "ready",
+  coverageComplete = true,
+  languageCode = "as-IN",
+} = {}) {
   return {
     schemaVersion: 1,
     sourceAssetId: assetId,
@@ -32,7 +36,7 @@ function projectDocument({ status = "ready", coverageComplete = true } = {}) {
     canvas: { width: 720, height: 1280 },
     captionTrack: {
       id: "captions-main",
-      languageCode: "as-IN",
+      languageCode,
       status,
       style: { preset: "karaoke", activeColor: "#ffe66d" },
       coverage: {
@@ -69,7 +73,41 @@ test("normalizes a caption-first revision document", () => {
   assert.equal(parsed.sourceAssetId, assetId);
   assert.equal(parsed.captionTrack.status, "ready");
   assert.equal(parsed.captionTrack.coverage.complete, true);
+  assert.equal(
+    parsed.captionTrack.cues[0].words[0].displaySize,
+    "small",
+  );
   assert.equal(renderBlockReason(parsed), null);
+});
+
+test("validates optional per-word display sizes without breaking legacy revisions", () => {
+  const large = projectDocument();
+  large.captionTrack.cues[0].words[0].displaySize = "large";
+  assert.equal(
+    parseProjectDocument(large).captionTrack.cues[0].words[0].displaySize,
+    "large",
+  );
+
+  const invalid = projectDocument();
+  invalid.captionTrack.cues[0].words[0].displaySize = "medium";
+  assert.throws(
+    () => parseProjectDocument(invalid),
+    /displaySize: must be small or large/,
+  );
+});
+
+test("accepts only Assamese and Bodo project language codes", () => {
+  assert.equal(
+    parseProjectDocument(projectDocument({ languageCode: "brx-IN" }))
+      .captionTrack.languageCode,
+    "brx-IN",
+  );
+  for (const languageCode of ["auto", "unknown", "mix", "as"]) {
+    assert.throws(
+      () => parseProjectDocument(projectDocument({ languageCode })),
+      /must be as-IN or brx-IN/,
+    );
+  }
 });
 
 test("blocks review-required and incomplete-coverage revisions from render", () => {
@@ -78,10 +116,23 @@ test("blocks review-required and incomplete-coverage revisions from render", () 
   );
   assert.equal(renderBlockReason(review), "caption_review_required");
 
-  const incomplete = parseProjectDocument(
-    projectDocument({ status: "ready", coverageComplete: false }),
+  const incomplete = projectDocument({
+    status: "ready",
+    coverageComplete: false,
+  });
+  assert.throws(
+    () => parseProjectDocument(incomplete),
+    /must be verified true when caption status is ready or complete/,
   );
   assert.equal(renderBlockReason(incomplete), "speech_coverage_incomplete");
+
+  const unverified = projectDocument({ status: "ready" });
+  delete unverified.captionTrack.coverage;
+  assert.throws(
+    () => parseProjectDocument(unverified),
+    /must be verified true when caption status is ready or complete/,
+  );
+  assert.equal(renderBlockReason(unverified), "speech_coverage_unverified");
 
   const processing = parseProjectDocument(
     projectDocument({ status: "recovering", coverageComplete: true }),
@@ -157,7 +208,31 @@ test("canonical export fingerprints ignore object property order", async () => {
       "syncword-render-v2",
     ),
   );
+  assert.equal(
+    await renderRequestFingerprint(projectId, revisionId, specA),
+    await renderRequestFingerprint(
+      projectId,
+      revisionId,
+      specA,
+      "syncword-render-v2",
+    ),
+  );
   assert.equal(canonicalJson({ z: 1, a: { y: 2, x: 3 } }), '{"a":{"x":3,"y":2},"z":1}');
+});
+
+test("export specs preserve source frame rate and accept fractional timelines", () => {
+  const source = parseExportSpec({ width: 720, height: 1280 });
+  const ntsc = parseExportSpec({
+    width: 720,
+    height: 1280,
+    fps: 30000 / 1001,
+  });
+  assert.equal(source.fps, "source");
+  assert.equal(ntsc.fps, 30000 / 1001);
+  assert.throws(
+    () => parseExportSpec({ width: 720, height: 1280, fps: 0 }),
+    /exportSpec\.fps/,
+  );
 });
 
 test("idempotency distinguishes replay from key reuse with new input", () => {

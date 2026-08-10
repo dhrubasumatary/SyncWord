@@ -8,8 +8,10 @@ interface Env {
   ASSETS: Fetcher;
   DB?: D1Database;
   MEDIA?: R2Bucket;
+  RENDER_API?: Fetcher;
   RENDER_API_URL?: string;
   RENDERER_REVISION?: string;
+  PROCESSOR_REVISION?: string;
   SITES_BYPASS_BEARER_TOKEN?: string;
   IMAGES: {
     input(stream: ReadableStream): {

@@ -3,6 +3,10 @@ const UUID_PATTERN =
 
 export const PROJECT_DOCUMENT_SCHEMA_VERSION = 1;
 
+export const SUPPORTED_LANGUAGE_CODES = Object.freeze(["as-IN", "brx-IN"]);
+
+export const WORD_DISPLAY_SIZES = Object.freeze(["small", "large"]);
+
 export const CAPTION_PROCESSING_STATUSES = Object.freeze([
   "queued",
   "extracting",
@@ -33,6 +37,18 @@ export const EXPORT_ARTIFACT_KINDS = Object.freeze([
 const CAPTION_PROCESSING_STATUS_SET = new Set(CAPTION_PROCESSING_STATUSES);
 const RENDER_JOB_STATUS_SET = new Set(RENDER_JOB_STATUSES);
 const EXPORT_ARTIFACT_KIND_SET = new Set(EXPORT_ARTIFACT_KINDS);
+const SUPPORTED_LANGUAGE_CODE_SET = new Set(SUPPORTED_LANGUAGE_CODES);
+const WORD_DISPLAY_SIZE_SET = new Set(WORD_DISPLAY_SIZES);
+
+/**
+ * @param {unknown} value
+ * @returns {value is "as-IN" | "brx-IN"}
+ */
+export function isSupportedLanguageCode(value) {
+  return (
+    typeof value === "string" && SUPPORTED_LANGUAGE_CODE_SET.has(value)
+  );
+}
 
 function contractError(path, message) {
   throw new TypeError(`${path}: ${message}`);
@@ -122,7 +138,19 @@ function parseWord(value, cuePath, index) {
     text: stringAt(word.text, `${path}.text`, 500),
     startMs,
     endMs,
+    displaySize: "small",
   };
+  if (word.displaySize !== undefined) {
+    const displaySize = stringAt(
+      word.displaySize,
+      `${path}.displaySize`,
+      16,
+    );
+    if (!WORD_DISPLAY_SIZE_SET.has(displaySize)) {
+      contractError(`${path}.displaySize`, "must be small or large");
+    }
+    parsed.displaySize = displaySize;
+  }
   if (word.confidence !== undefined) {
     parsed.confidence = finiteNumberAt(
       word.confidence,
@@ -238,13 +266,21 @@ export function parseProjectDocument(input) {
     }
   }
 
+  const languageCode = stringAt(
+    captionTrack.languageCode,
+    "document.captionTrack.languageCode",
+    32,
+  );
+  if (!isSupportedLanguageCode(languageCode)) {
+    contractError(
+      "document.captionTrack.languageCode",
+      "must be as-IN or brx-IN",
+    );
+  }
+
   const parsedTrack = {
     id: stringAt(captionTrack.id, "document.captionTrack.id", 128),
-    languageCode: stringAt(
-      captionTrack.languageCode,
-      "document.captionTrack.languageCode",
-      32,
-    ),
+    languageCode,
     status,
     cues,
     style:
@@ -253,6 +289,15 @@ export function parseProjectDocument(input) {
         : jsonValueAt(captionTrack.style, "document.captionTrack.style"),
   };
   const coverage = parseCoverage(captionTrack.coverage);
+  if (
+    (status === "ready" || status === "complete") &&
+    coverage?.complete !== true
+  ) {
+    contractError(
+      "document.captionTrack.coverage.complete",
+      "must be verified true when caption status is ready or complete",
+    );
+  }
   if (coverage !== undefined) parsedTrack.coverage = coverage;
 
   return {
@@ -281,11 +326,14 @@ export function parseProjectDocument(input) {
 export function renderBlockReason(document) {
   const status = document?.captionTrack?.status;
   if (status === "review_required") return "caption_review_required";
+  if (status !== "ready" && status !== "complete") {
+    return "caption_processing_incomplete";
+  }
   if (document?.captionTrack?.coverage?.complete === false) {
     return "speech_coverage_incomplete";
   }
-  if (status !== "ready" && status !== "complete") {
-    return "caption_processing_incomplete";
+  if (document?.captionTrack?.coverage?.complete !== true) {
+    return "speech_coverage_unverified";
   }
   return null;
 }
@@ -310,9 +358,12 @@ export function parseExportSpec(input) {
   if (!["draft", "balanced", "high"].includes(quality)) {
     contractError("exportSpec.quality", "must be draft, balanced, or high");
   }
-  const fps = spec.fps ?? 30;
-  if (![24, 25, 30, 50, 60].includes(fps)) {
-    contractError("exportSpec.fps", "must be 24, 25, 30, 50, or 60");
+  let fps = spec.fps ?? "source";
+  if (fps !== "source") {
+    fps = finiteNumberAt(fps, "exportSpec.fps", {
+      minimum: 1,
+      maximum: 240,
+    });
   }
   return {
     container,
@@ -404,7 +455,7 @@ export async function renderRequestFingerprint(
   projectId,
   revisionId,
   spec,
-  rendererRevision = "syncword-render-v1",
+  rendererRevision = "syncword-render-v2",
 ) {
   return sha256Hex(
     canonicalJson({

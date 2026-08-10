@@ -120,3 +120,29 @@ test("a no-op retry remains on the primary alignment and never realigns", async 
   assert.equal(result.coverage.complete, false);
   assert.equal(result.alignment, primary);
 });
+
+test("a placeholder retry cannot manufacture a complete recovery", async () => {
+  const primary = primaryAlignment();
+  let alignmentCalls = 0;
+
+  const result = await runTargetedCoverageRecovery({
+    alignment: primary,
+    speechIntervals: [{ start: 0, end: 12 }],
+    durationSeconds: 12,
+    policy: strictPolicy,
+    transcribeWindows: async () => ({
+      captions: [{ id: "retry", text: "Type-here", start: 4, end: 8 }],
+    }),
+    alignCaptions: async () => {
+      alignmentCalls += 1;
+      throw new Error("placeholder recovery must not be aligned");
+    },
+  });
+
+  assert.equal(alignmentCalls, 0);
+  assert.equal(result.recovery.attempted, true);
+  assert.equal(result.recovery.addedCaptionCount, 0);
+  assert.equal(result.recovery.selected, false);
+  assert.equal(result.coverage.complete, false);
+  assert.equal(result.alignment, primary);
+});

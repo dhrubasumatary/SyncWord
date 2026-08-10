@@ -55,8 +55,7 @@ function mergeCaptions(left, right) {
     text: `${String(left.text ?? "").trim()} ${String(
       right.text ?? "",
     ).trim()}`.trim(),
-    language:
-      left.language === right.language ? left.language : "mix",
+    language: left.language,
     words,
   };
 }

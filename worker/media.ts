@@ -1,3 +1,6 @@
+import { canRenderCaptionTrack } from "../shared/caption-coverage.mjs";
+import { isSupportedLanguageCode } from "../shared/project-contract.mjs";
+
 const DEFAULT_RENDER_API = "https://syncword-render-dhrub404.onrender.com";
 const MAX_VIDEO_BYTES = 90 * 1024 * 1024;
 const JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -10,18 +13,19 @@ type MediaEnv = {
 
 type StoredJob = {
   id: string;
+  captionQualityRevision?: string;
   status: string;
   progress: number;
   message: string;
   originalName: string;
   contentType: string;
   size: number;
-  language: string;
+  language: "as-IN" | "brx-IN";
   mode: string;
   style: Record<string, unknown>;
   captions: unknown[];
   alignment?: Record<string, unknown>;
-  languageCode?: string;
+  languageCode?: "as-IN" | "brx-IN";
   createdAt: string;
   updatedAt: string;
   expiresAt: string;
@@ -47,6 +51,7 @@ function jobKey(id: string) {
 function publicJob(job: StoredJob) {
   return {
     id: job.id,
+    captionQualityRevision: job.captionQualityRevision,
     status: job.status,
     progress: job.progress,
     message: job.message,
@@ -73,7 +78,10 @@ async function readJob(bucket: R2Bucket, id: string) {
   const object = await bucket.get(jobKey(id));
   if (!object) return null;
   try {
-    return (await object.json()) as StoredJob;
+    const job = (await object.json()) as StoredJob;
+    if (!isSupportedLanguageCode(job.language)) return null;
+    job.languageCode = job.language;
+    return job;
   } catch {
     return null;
   }
@@ -211,6 +219,11 @@ async function createJob(request: Request, bucket: R2Bucket) {
     );
   }
 
+  const language = String(input.language ?? "").trim();
+  if (!isSupportedLanguageCode(language)) {
+    return json({ error: "Choose Assamese or Bodo before captioning." }, 400);
+  }
+
   const id = crypto.randomUUID();
   const extension =
     originalName.match(/\.(mp4|mov|webm|mkv|m4v)$/i)?.[0].toLowerCase() ??
@@ -224,9 +237,7 @@ async function createJob(request: Request, bucket: R2Bucket) {
     originalName,
     contentType,
     size,
-    language: ["as-IN", "brx-IN", "unknown"].includes(String(input.language))
-      ? String(input.language)
-      : "unknown",
+    language,
     mode: ["codemix", "verbatim", "transcribe"].includes(String(input.mode))
       ? String(input.mode)
       : "codemix",
@@ -235,6 +246,7 @@ async function createJob(request: Request, bucket: R2Bucket) {
         ? (input.style as Record<string, unknown>)
         : {},
     captions: [],
+    languageCode: language,
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + JOB_RETENTION_MS).toISOString(),
@@ -309,9 +321,14 @@ async function startProcessing(
   const source = await bucket.head(job.sourceKey);
   if (!source) return json({ error: "Upload the source video first." }, 409);
   if (
-    ["extracting", "transcribing", "rendering", "complete"].includes(
-      job.status,
-    )
+    [
+      "extracting",
+      "transcribing",
+      "ready",
+      "review_required",
+      "rendering",
+      "complete",
+    ].includes(job.status)
   ) {
     return json(publicJob(job), 202);
   }
@@ -344,6 +361,7 @@ async function startProcessing(
   });
   const result = (await response.json().catch(() => ({}))) as {
     error?: string;
+    captionQualityRevision?: string;
   };
   if (!response.ok) {
     job.status = "failed";
@@ -352,6 +370,10 @@ async function startProcessing(
       `Render engine rejected the job (${response.status}).`;
     await writeJob(bucket, job);
     return json({ error: job.message }, response.status);
+  }
+  if (typeof result.captionQualityRevision === "string") {
+    job.captionQualityRevision = result.captionQualityRevision;
+    await writeJob(bucket, job);
   }
   return json(publicJob(job), 202);
 }
@@ -392,13 +414,23 @@ async function updateState(
   if (typeof input.message === "string") {
     job.message = input.message.slice(0, 500);
   }
+  if (typeof input.captionQualityRevision === "string") {
+    job.captionQualityRevision = input.captionQualityRevision.slice(0, 120);
+  }
   if (Array.isArray(input.captions)) job.captions = input.captions;
   if (input.alignment && typeof input.alignment === "object") {
     job.alignment = input.alignment as Record<string, unknown>;
   }
-  if (typeof input.languageCode === "string") {
-    job.languageCode = input.languageCode;
+  if (
+    input.languageCode !== undefined &&
+    input.languageCode !== job.language
+  ) {
+    return json(
+      { error: "Callback language must match the selected language." },
+      400,
+    );
   }
+  job.languageCode = job.language;
   if (input.style && typeof input.style === "object") {
     job.style = input.style as Record<string, unknown>;
   }
@@ -473,23 +505,57 @@ async function rerenderJob(
   if (!hasCapability(request, job)) {
     return json({ error: "Render capability is invalid." }, 401);
   }
-  if (!["ready", "complete"].includes(job.status)) {
+  if (!["ready", "complete", "review_required"].includes(job.status)) {
     return json(
-      { error: `Job is not ready for rendering (${job.status}).` },
+      {
+        error: `Job is not ready for rendering (${job.status}).`,
+        code: "caption_status_not_renderable",
+        coverage: null,
+        uncoveredIntervals: [],
+      },
       409,
     );
   }
   const coverage = job.alignment?.coverage;
   if (
-    coverage &&
-    typeof coverage === "object" &&
-    "complete" in coverage &&
-    coverage.complete === false
+    !coverage ||
+    typeof coverage !== "object" ||
+    !("complete" in coverage) ||
+    typeof coverage.complete !== "boolean" ||
+    !("speechIntervals" in coverage) ||
+    !Array.isArray(coverage.speechIntervals) ||
+    coverage.speechIntervals.length === 0 ||
+    !("speechDurationSeconds" in coverage) ||
+    !Number.isFinite(Number(coverage.speechDurationSeconds)) ||
+    Number(coverage.speechDurationSeconds) <= 0
   ) {
     return json(
       {
         error:
+          "Caption coverage has not been verified for this job. Reprocess it before rendering.",
+        code: "caption_coverage_unverified",
+        coverage: null,
+        uncoveredIntervals: [],
+      },
+      409,
+    );
+  }
+  if (
+    job.status !== "review_required" &&
+    !canRenderCaptionTrack(job.status, coverage)
+  ) {
+    const uncoveredIntervals =
+      "uncoveredIntervals" in coverage &&
+      Array.isArray(coverage.uncoveredIntervals)
+        ? coverage.uncoveredIntervals
+        : [];
+    return json(
+      {
+        error:
           "Caption coverage is incomplete. Review or recover the missed speech before rendering.",
+        code: "caption_coverage_incomplete",
+        coverage,
+        uncoveredIntervals,
       },
       409,
     );
@@ -504,16 +570,35 @@ async function rerenderJob(
     headers: { "content-type": "application/json" },
     body,
   });
-  const payload = await response.text();
+  const payloadText = await response.text();
   if (!response.ok) {
-    return new Response(payload, {
+    return new Response(payloadText, {
       status: response.status,
       headers: { "content-type": "application/json" },
     });
   }
-  job.status = "rendering";
-  job.progress = 82;
-  job.message = "Re-render queued";
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(payloadText) as Record<string, unknown>;
+  } catch {
+    return json({ error: "Render engine returned an invalid job state." }, 502);
+  }
+  job.status =
+    typeof payload.status === "string" ? payload.status : "rendering";
+  job.progress = Number.isFinite(Number(payload.progress))
+    ? Math.max(0, Math.min(100, Number(payload.progress)))
+    : 82;
+  job.message =
+    typeof payload.message === "string"
+      ? payload.message.slice(0, 500)
+      : "Re-render queued";
+  if (Array.isArray(payload.captions)) job.captions = payload.captions;
+  if (payload.alignment && typeof payload.alignment === "object") {
+    job.alignment = payload.alignment as Record<string, unknown>;
+  }
+  if (typeof payload.captionQualityRevision === "string") {
+    job.captionQualityRevision = payload.captionQualityRevision.slice(0, 120);
+  }
   await writeJob(bucket, job);
   return json(publicJob(job), 202);
 }
@@ -581,7 +666,7 @@ export async function handleMediaRequest(
       .replace(/\.[^.]+$/, "")
       .replace(/[^\p{L}\p{N}_-]+/gu, "-");
     return serveObject(request, bucket, job.resultKey, {
-      attachmentName: `${baseName || "syncword"}-captioned.mp4`,
+      attachmentName: `${baseName || "subtitles-by-miithii"}-captioned.mp4`,
     });
   }
   if (action === "captions.ass" && request.method === "GET" && job.assKey) {

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildExportMediaPolicy,
+  exportFrameRateMatchesSource,
   exportVideoArgs,
   parseFrameRate,
 } from "../server/export-policy.mjs";
@@ -11,6 +12,16 @@ test("parses rational frame rates without assuming 30 fps", () => {
   assert.equal(parseFrameRate("30000/1001"), 30000 / 1001);
   assert.equal(parseFrameRate("25/1"), 25);
   assert.equal(parseFrameRate("broken"), 30);
+});
+
+test("preserves fractional source frame rates unless resampling is explicit", () => {
+  assert.equal(exportFrameRateMatchesSource("24000/1001", "source"), true);
+  assert.equal(
+    exportFrameRateMatchesSource("30000/1001", 30000 / 1001),
+    true,
+  );
+  assert.equal(exportFrameRateMatchesSource("30000/1001", 30), false);
+  assert.equal(exportFrameRateMatchesSource("25/1", 25), true);
 });
 
 test("converts HE-AAC once and pads both timelines to the advertised audio tail", () => {

@@ -11,17 +11,17 @@ export default function ErrorScreen({
   reset: () => void;
 }) {
   useEffect(() => {
-    console.error("SyncWord UI recovered from an error:", error);
+    console.error("subtitles by miithii recovered from an error:", error);
   }, [error]);
 
   return (
     <main className="fatal-shell">
       <div className="fatal-card">
-        <span>SYNCWORD RECOVERY</span>
-        <h1>The render is still safe.</h1>
+        <span>MIITHII RECOVERY</span>
+        <h1>Your project is still safe.</h1>
         <p>
           The editor hit a temporary display error. Retry the screen first—your
-          server-side caption job may still be processing.
+          caption job may still be processing.
         </p>
         <button onClick={reset}>Restore editor</button>
         <Link href="/">Start over</Link>

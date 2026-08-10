@@ -1,28 +1,17 @@
-const languageAliases = new Map([
-  ["as", "as-IN"],
-  ["asm", "as-IN"],
-  ["as-in", "as-IN"],
-  ["brx", "brx-IN"],
-  ["brx-in", "brx-IN"],
-]);
-
-function canonicalLanguageCode(value) {
-  return languageAliases.get(String(value ?? "").trim().toLowerCase()) ?? null;
-}
+import { isSupportedLanguageCode } from "../shared/project-contract.mjs";
 
 export function resolveTranscriptLanguage(
-  transcriptLanguage,
+  _transcriptLanguage,
   requestedLanguage,
 ) {
-  return (
-    canonicalLanguageCode(transcriptLanguage) ??
-    canonicalLanguageCode(requestedLanguage) ??
-    "unknown"
-  );
+  if (!isSupportedLanguageCode(requestedLanguage)) {
+    throw new TypeError("requestedLanguage must be as-IN or brx-IN.");
+  }
+  return requestedLanguage;
 }
 
 export function languageTag(languageCode) {
   if (languageCode === "as-IN") return "as";
   if (languageCode === "brx-IN") return "brx";
-  return "mix";
+  throw new TypeError("languageCode must be as-IN or brx-IN.");
 }

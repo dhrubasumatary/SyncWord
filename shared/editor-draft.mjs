@@ -197,6 +197,24 @@ export function replaceRevisionBase(history, snapshot) {
   return createRevisionHistory(snapshot, { limit: history.limit });
 }
 
+/**
+ * Reconcile an authoritative remote base without discarding autosaved local
+ * work. A clean draft adopts the remote snapshot; a dirty draft keeps its
+ * current snapshot as one unsaved revision on top of that remote base.
+ *
+ * @param {RevisionHistory} history
+ * @param {unknown} remoteSnapshot
+ * @returns {RevisionHistory}
+ */
+export function rebaseRevisionHistory(history, remoteSnapshot) {
+  const localSnapshot = history.present.snapshot;
+  const preserveLocalChanges = revisionHistoryDirty(history);
+  const remoteBase = replaceRevisionBase(history, remoteSnapshot);
+  return preserveLocalChanges
+    ? commitRevision(remoteBase, localSnapshot)
+    : remoteBase;
+}
+
 /** @param {RevisionHistory} history @returns {RevisionHistory} */
 export function markRevisionBase(history) {
   if (history.baseRevision === history.present.revisionId) return history;
@@ -301,6 +319,48 @@ function normalizedMedia(value) {
       Number.isFinite(record.videoRatio) && Number(record.videoRatio) > 0
         ? Number(record.videoRatio)
         : 9 / 16,
+    videoWidth:
+      Number.isInteger(record.videoWidth) && Number(record.videoWidth) > 0
+        ? Number(record.videoWidth)
+        : 0,
+    videoHeight:
+      Number.isInteger(record.videoHeight) && Number(record.videoHeight) > 0
+        ? Number(record.videoHeight)
+        : 0,
+  };
+}
+
+/** @param {unknown} value */
+function normalizedProjectSession(value) {
+  const record = plainRecord(value);
+  if (
+    !record ||
+    typeof record.projectId !== "string" ||
+    !record.projectId ||
+    typeof record.sourceAssetId !== "string" ||
+    !record.sourceAssetId
+  ) {
+    return null;
+  }
+  /** @param {unknown} item */
+  const optionalId = (item) =>
+    typeof item === "string" && item ? item : null;
+  return {
+    projectId: record.projectId,
+    sourceAssetId: record.sourceAssetId,
+    activeProcessingJobId: optionalId(record.activeProcessingJobId),
+    headRevisionId: optionalId(record.headRevisionId),
+    headEditorRevisionId: optionalId(record.headEditorRevisionId),
+    activeRenderJobId: optionalId(record.activeRenderJobId),
+    activeRenderIdempotencyKey: optionalId(
+      record.activeRenderIdempotencyKey,
+    ),
+    activeRenderRequestScope: optionalId(record.activeRenderRequestScope),
+    activeRenderAttemptDiscriminator: optionalId(
+      record.activeRenderAttemptDiscriminator,
+    ),
+    lastCompletedRenderJobId: optionalId(record.lastCompletedRenderJobId),
+    lastExportArtifactId: optionalId(record.lastExportArtifactId),
   };
 }
 
@@ -325,6 +385,14 @@ function normalizedView(value) {
       Number.isFinite(record.currentTime) && Number(record.currentTime) >= 0
         ? Number(record.currentTime)
         : 0,
+    pendingRenderRevision:
+      typeof record.pendingRenderRevision === "string"
+        ? record.pendingRenderRevision
+        : "",
+    lastRenderedRevision:
+      typeof record.lastRenderedRevision === "string"
+        ? record.lastRenderedRevision
+        : "",
     captionDrafts: Object.fromEntries(
       Object.entries(captionDrafts).filter(
         ([key, item]) => key.length > 0 && typeof item === "string",
@@ -342,6 +410,7 @@ function normalizedView(value) {
  *   projectId?: string,
  *   savedAt: string,
  *   media?: unknown,
+ *   projectSession?: unknown,
  *   job?: unknown,
  *   history: unknown,
  *   view?: unknown,
@@ -358,6 +427,7 @@ export function createEditorDraft(input) {
         : "active",
     savedAt: input.savedAt,
     media: normalizedMedia(input.media),
+    projectSession: normalizedProjectSession(input.projectSession),
     job: normalizedJob(input.job),
     history,
     view: normalizedView(input.view),
@@ -380,6 +450,7 @@ function normalizedDraft(value) {
         : "active",
     savedAt: record.savedAt,
     media: normalizedMedia(record.media),
+    projectSession: normalizedProjectSession(record.projectSession),
     job: normalizedJob(record.job),
     history,
     view: normalizedView(record.view),
@@ -532,7 +603,7 @@ export function createResilientDraftStore({ primary = null, fallback = null }) {
       ]);
       const primaryValue = results[0].status === "fulfilled" ? results[0].value : null;
       const fallbackValue = results[1].status === "fulfilled" ? results[1].value : null;
-      return savedAt(fallbackValue) > savedAt(primaryValue)
+      return savedAt(fallbackValue) >= savedAt(primaryValue)
         ? fallbackValue
         : primaryValue ?? fallbackValue;
     },
@@ -541,9 +612,15 @@ export function createResilientDraftStore({ primary = null, fallback = null }) {
         try {
           await primary.setItem(key, value);
           try {
-            await fallback?.removeItem(key);
+            const fallbackValue = await fallback?.getItem(key);
+            if (
+              fallbackValue === value ||
+              savedAt(fallbackValue ?? null) < savedAt(value)
+            ) {
+              await fallback?.removeItem(key);
+            }
           } catch {
-            // A stale fallback is harmless because load selects the newest copy.
+            // A fallback is harmless because load selects the newest copy.
           }
           return "primary";
         } catch {

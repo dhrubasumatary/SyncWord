@@ -52,7 +52,7 @@ test("combines relative captions into one absolute timeline", () => {
       },
       {
         segment: { id: "speech-2", start: 9, end: 18, duration: 9 },
-        languageCode: "as-IN",
+        languageCode: "brx-IN",
         captions: [{ start: 0.7, end: 3.2, text: "this is SyncWord" }],
       },
     ],
@@ -63,4 +63,11 @@ test("combines relative captions into one absolute timeline", () => {
   assert.deepEqual(transcript.timestamps.start_time_seconds, [0.4, 9.7]);
   assert.deepEqual(transcript.timestamps.end_time_seconds, [2, 12.2]);
   assert.equal(transcript.syncword_segmentation.segment_count, 2);
+});
+
+test("requires an explicit supported language for segmented transcripts", () => {
+  assert.throws(
+    () => combineSegmentTranscripts([], "unknown"),
+    /as-IN or brx-IN/,
+  );
 });

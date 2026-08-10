@@ -10,12 +10,15 @@ test("keeps requested Assamese when Saaras omits language detection", () => {
   assert.equal(languageTag("as-IN"), "as");
 });
 
-test("normalizes ISO aliases returned by speech providers", () => {
-  assert.equal(resolveTranscriptLanguage("asm", "unknown"), "as-IN");
-  assert.equal(resolveTranscriptLanguage("brx", "unknown"), "brx-IN");
+test("keeps requested Bodo when Saaras reports another language", () => {
+  assert.equal(resolveTranscriptLanguage("asm", "brx-IN"), "brx-IN");
+  assert.equal(languageTag("brx-IN"), "brx");
 });
 
-test("prefers detected language over the requested fallback", () => {
-  assert.equal(resolveTranscriptLanguage("brx-IN", "as-IN"), "brx-IN");
-  assert.equal(languageTag("brx-IN"), "brx");
+test("rejects unsupported requested and caption languages", () => {
+  assert.throws(
+    () => resolveTranscriptLanguage("as-IN", "unknown"),
+    /as-IN or brx-IN/,
+  );
+  assert.throws(() => languageTag("mix"), /as-IN or brx-IN/);
 });

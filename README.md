@@ -1,85 +1,144 @@
-# SyncWord
+# subtitles — by miithii
 
-SyncWord is a web-first caption studio for Indian-language video. The browser
-handles upload, phrase editing, and instant style preview; a companion Node
-service handles ffmpeg, Saaras v3 Batch STT in `codemix` mode, ASS generation,
-and the final burn-in.
+`subtitles` is a caption-first video studio for Assamese and Bodo. It turns a
+source video into an editable, revisioned subtitle project and lets creators
+shape the rhythm of a line with small and large words before rendering a new
+MP4. The original upload is never overwritten.
 
-## Product flow
+## Language contract
 
-1. Add a video and choose Assamese, Bodo, or automatic language detection.
-2. The render service extracts 16 kHz mono WAV audio with ffmpeg. Sarvam
-   auto-detects the WAV container; `input_audio_codec` is intentionally omitted
-   because that parameter is required only for raw PCM uploads.
-3. Saaras v3 Batch STT returns phrase-level timestamps.
-4. SyncWord sends each timestamped phrase and its audio window to a Modal T4
-   worker running Meta's dedicated `MMS_FA` forced-alignment model. Uroman
-   normalizes Assamese, Bodo, English, and code-mixed display words onto the
-   model's shared acoustic alphabet. MMS star spans absorb transcript/audio
-   mismatches instead of stretching a neighboring word across a long gap.
-5. The first upload automatically generates ASS `\kf` karaoke events and burns
-   a social-ready H.264/AAC MP4 with ffmpeg.
-6. The player switches to that real rendered file. Optional transcript,
-   boundary, or style changes preview instantly in the browser and create a new
-   final MP4 only when the user taps **Update final video**.
+The creator explicitly chooses **Assamese** (`as-IN`) or **Bodo** (`brx-IN`) before
+processing. There is no automatic language-detection choice.
 
-The browser stores source videos, job state, ASS files, and rendered MP4s in
-Cloudflare R2. Render remains a stateless Saaras/ffmpeg worker for the MVP, and
-the API stays client-agnostic so a future Expo app can remain a pure
-upload/status/download client.
+`codemix` is a transcription/writing mode inside the selected language. It
+allows regional-script speech and embedded English to be written faithfully;
+it does not guess which language the video contains.
+
+## Primary project flow
+
+The hosted application uses the durable project API:
+
+1. The browser creates a `Project`.
+2. It reserves a source `Asset` and streams the original video once to the
+   project-scoped R2 object.
+3. It creates a `ProcessingJob` for that asset, selected language, and writing
+   mode. The Worker dispatches the immutable request to the compute service's
+   `/v3/processing-jobs` surface.
+4. Compute downloads the source through a scoped capability, runs speech
+   transcription, word alignment, and coverage checks, then returns a
+   normalized editor document.
+5. The Worker validates that document, stores the first immutable
+   `ProjectRevision`, and advances the project head. A valid
+   `review_required` result remains editable but cannot render until its speech
+   gaps are repaired.
+6. Text, timing, and small/large word-style changes remain local while editing.
+   Saving creates another immutable revision from an explicit
+   `baseRevisionId`; it never mutates an earlier revision.
+7. Export creates a `RenderJob` containing only a saved `revisionId`, an export
+   specification, a renderer revision, and an idempotency key. The renderer
+   never reads an unsaved browser draft or the mutable project head.
+8. Compute hash-verifies the revision, verifies the source facts available to
+   it, generates the video and caption files, and uploads each artifact through
+   job-scoped callback URLs.
+9. The Worker records durable `ExportArtifact` rows only after the corresponding
+   R2 objects exist. The browser polls the render independently and downloads
+   the exact artifact produced for that revision.
+
+The Worker is the authorization and state-transition boundary. D1 stores
+project, revision, job, and artifact metadata; R2 stores source media, immutable
+revision documents, and exported files. Speech models and FFmpeg stay in the
+separate compute service.
 
 ## Local setup
 
-Copy `.env.example` to `.env`, set `SARVAM_API_KEY` and
-`MODAL_ALIGNER_URL`, then run:
+Requirements:
 
-```bash
+- Node.js 22.13 or newer
+- npm
+- FFmpeg available on `PATH` (or set `FFMPEG_PATH`)
+- a Sarvam API key for transcription
+- a deployed Modal alignment endpoint
+
+Install dependencies and create the local environment file:
+
+```powershell
 npm install
-npm run dev
-npm run render-server
+Copy-Item .env.example .env
 ```
 
-The web editor runs at `http://localhost:3000`; the render API runs at
-`http://localhost:8787`.
+Set at least these values in `.env`:
 
-## Container render service
+```dotenv
+SARVAM_API_KEY=...
+MODAL_ALIGNER_URL=...
+NEXT_PUBLIC_RENDER_API_URL=http://localhost:8787
+```
 
-`server/Dockerfile` installs ffmpeg plus Noto script fonts and starts the render
-API. Set `SARVAM_API_KEY` and `ALLOWED_ORIGINS` in production.
+Start the web editor and local compute service together:
 
-`render.yaml` defines one serialized hobby render worker in Singapore. The
-production web app accepts reels up to 90 MB and three minutes, stores uploads
-and results in R2, and retains them for 24 hours. A Render restart can interrupt
-the current compute attempt, but it no longer deletes the uploaded source or a
-completed export.
+```powershell
+npm run dev
+```
 
-## API
+For isolated debugging, `npm run dev:web` and `npm run dev:engine` run the two
+processes separately.
 
-- `POST /v1/jobs` — multipart video upload; runs the complete caption + render
-  pipeline automatically
-- `GET /v1/jobs/:id` — processing state and phrase captions
-- `POST /v1/jobs/:id/render` — re-render edited captions or style
-- `GET /v1/jobs/:id/result` — inline final MP4 used by the real final preview
-- `GET /v1/jobs/:id/download` — final MP4
-- `GET /v1/jobs/:id/captions.ass` — generated ASS file
-- `GET /health` — service readiness
+The editor is served at `http://localhost:3000`; the render service defaults to
+`http://localhost:8787`. The interface can load locally, but caption generation
+is not network-offline: it requires the configured transcription and alignment
+services. The editor now reports a missing local API key directly instead of
+silently waiting on the engine.
 
-Production web clients use the durable `/api/media/jobs` surface. It creates
-an R2-backed job, accepts the source upload, starts the Render worker, persists
-progress, serves range-enabled video previews, and supports re-rendering edited
-captions. The legacy `/v1/jobs` routes remain useful for local development.
+Useful checks:
 
-## WordSync timing model
+```powershell
+npm run lint
+npm test
+```
 
-Sarvam Batch STT supplies chunk-level sentence or phrase timestamps, not
-word-level timings. SyncWord treats those timestamps as search windows rather
-than inventing uniform word durations. Meta's CTC model scores the actual
-speech frames against the known Sarvam transcript, and Viterbi decoding finds
-the highest-probability monotonic character path. Word boundaries come from
-that path. Each word carries a confidence score; unsupported or impossible
-phrases fall back explicitly to the older grapheme prior and are surfaced for
-review.
+`npm test` builds the vinext/Cloudflare application before running the Node test
+suite.
 
-This is honest forced alignment rather than native Sarvam word timestamps.
-Transcript errors, heavy music, crosstalk, and fully overlapping speech can
-still require a manual nudge.
+## API surfaces
+
+The primary hosted contract is `/api/projects` and its nested resources:
+
+- assets and source upload/content
+- processing jobs and their immutable first revision
+- revisions created with optimistic concurrency
+- render jobs and artifact callbacks
+- project export history and artifact content
+
+The compute plane receives `/v3/processing-jobs` and `/v3/render-jobs` requests
+from that project API.
+
+Two compatibility surfaces remain intentionally reachable:
+
+- `/v1/jobs` supports the direct local/configured render-server workflow.
+- `/api/media/jobs`, backed by compute `/v2/jobs`, restores older hosted drafts
+  that predate durable projects.
+
+New hosted uploads must use the project flow. Do not add new product behavior to
+the compatibility routes; remove them only after local development has a
+project-mode replacement and old hosted drafts have passed their recovery
+window.
+
+## Current limits
+
+- Dispatch is direct. A bounded lease and owner-poll redrive can repair a stale
+  attempt, but there is no autonomous durable queue or workflow yet.
+- Source upload is one streamed PUT, not resumable multipart upload.
+- The editor range-serves the authenticated source; thumbnail strips, proxy
+  media, and HLS previews are not implemented.
+- Ownership is an HttpOnly project capability, not account identity. Losing the
+  cookie cannot be repaired from browser storage.
+- Upload finalization records size and ETag. SHA-256, duration, dimensions, and
+  codec facts are verified only when the relevant stage has actually produced
+  them.
+- Caption coverage is a quality gate, not a claim of mathematically perfect
+  speech detection. Uncertain or uncovered speech can require manual repair.
+- The renderer is caption-first. A general scene/layer composition graph is out
+  of scope.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the control-plane
+boundaries and enforced invariants.

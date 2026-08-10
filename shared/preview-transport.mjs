@@ -10,7 +10,9 @@
 export function createLatestSeekController(media, options = {}) {
   const timeoutMs = options.timeoutMs ?? 1400;
   const epsilon = options.epsilon ?? 0.006;
+  /** @type {number | null} */
   let pendingPreview = null;
+  /** @type {(() => void) | null} */
   let activeCleanup = null;
   let disposed = false;
 
@@ -55,14 +57,14 @@ export function createLatestSeekController(media, options = {}) {
 
   return {
     /** Queue a scrub-preview position, replacing any older queued position. */
-    preview(seconds) {
+    preview(/** @type {number} */ seconds) {
       if (disposed || !Number.isFinite(seconds)) return;
       pendingPreview = Math.max(0, seconds);
       runPendingPreview();
     },
 
     /** Move immediately for an explicit transport action. */
-    jump(seconds) {
+    jump(/** @type {number} */ seconds) {
       if (disposed || !Number.isFinite(seconds)) return;
       pendingPreview = null;
       finishActiveSeek();

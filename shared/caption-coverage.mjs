@@ -1,10 +1,21 @@
-const coverageRevision = "speech-active-v1";
+export const CAPTION_QUALITY_REVISION =
+  "perceptual-and-coverage-gate-v3";
 
+const coverageRevision = "speech-active-v2";
+
+export const CAPTION_PLACEHOLDER_FIELD = "_coveragePlaceholderText";
+
+/**
+ * Completeness tolerates timestamp jitter, not missing speech: at least 99.5%
+ * of speech must be covered and no residual gap may exceed 250 ms. The small
+ * edge padding and merge allowance absorb word-boundary quantization and short
+ * articulation gaps before those two limits are applied.
+ */
 export const defaultCaptionCoveragePolicy = Object.freeze({
-  minimumCoverageRatio: 0.92,
-  maximumUncoveredGapSeconds: 1.5,
-  captionBoundaryPaddingSeconds: 0.12,
-  captionMergeGapSeconds: 0.24,
+  minimumCoverageRatio: 0.995,
+  maximumUncoveredGapSeconds: 0.25,
+  captionBoundaryPaddingSeconds: 0.08,
+  captionMergeGapSeconds: 0.12,
   minimumSpeechIntervalSeconds: 0.12,
 });
 
@@ -104,17 +115,53 @@ export function speechIntervalsFromSilences(
   });
 }
 
+function normalizedCaptionText(text) {
+  return String(text ?? "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+const placeholderCaptionTexts = new Set([
+  "add caption",
+  "add caption here",
+  "caption text",
+  "enter caption",
+  "enter caption here",
+  "replace me",
+  "replace this text",
+  "type caption here",
+  "type here",
+]);
+
+export function isCaptionPlaceholderText(text) {
+  return placeholderCaptionTexts.has(normalizedCaptionText(text));
+}
+
+function captionIsPlaceholder(caption) {
+  const text = String(caption?.text ?? "");
+  if (isCaptionPlaceholderText(text)) return true;
+  const generatedPlaceholder = caption?.[CAPTION_PLACEHOLDER_FIELD];
+  return (
+    typeof generatedPlaceholder === "string" &&
+    normalizedCaptionText(generatedPlaceholder) === normalizedCaptionText(text)
+  );
+}
+
 function validWordIntervals(words) {
   return (words ?? [])
     .map((word) => ({
       start: finiteNumber(word?.start, Number.NaN),
       end: finiteNumber(word?.end, Number.NaN),
+      placeholder: isCaptionPlaceholderText(word?.text),
     }))
     .filter(
       (word) =>
         Number.isFinite(word.start) &&
         Number.isFinite(word.end) &&
-        word.end > word.start,
+        word.end > word.start &&
+        !word.placeholder,
     );
 }
 
@@ -132,14 +179,18 @@ export function captionIntervalsFromCaptions(
     : Number.POSITIVE_INFINITY;
   const padding = Math.max(0, finiteNumber(boundaryPaddingSeconds));
   const intervals = (captions ?? []).flatMap((caption) => {
-    if (!String(caption?.text ?? "").trim()) return [];
+    if (!String(caption?.text ?? "").trim() || captionIsPlaceholder(caption)) {
+      return [];
+    }
     const words = validWordIntervals(caption?.words);
-    const start = words.length
-      ? Math.min(...words.map((word) => word.start))
-      : finiteNumber(caption?.start, Number.NaN);
-    const end = words.length
-      ? Math.max(...words.map((word) => word.end))
-      : finiteNumber(caption?.end, Number.NaN);
+    if (Array.isArray(caption?.words) && caption.words.length > 0) {
+      return words.map((word) => ({
+        start: word.start - padding,
+        end: word.end + padding,
+      }));
+    }
+    const start = finiteNumber(caption?.start, Number.NaN);
+    const end = finiteNumber(caption?.end, Number.NaN);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
       return [];
     }
@@ -296,6 +347,9 @@ export function evaluateCaptionCoverage(
     captionIntervals,
     coveredIntervals,
     uncoveredIntervals,
+    ignoredPlaceholderCaptionCount: (captions ?? []).filter(
+      captionIsPlaceholder,
+    ).length,
     reasons,
     policy: {
       minimumCoverageRatio: resolved.minimumCoverageRatio,
@@ -326,7 +380,7 @@ export function planCoverageRecoveryWindows(
   {
     paddingSeconds = 0.45,
     mergeGapSeconds = 0.35,
-    minimumGapSeconds = 0.18,
+    minimumGapSeconds = 0.08,
     maximumWindowSeconds = 28,
     overlapSeconds = 0.45,
     maximumWindows = 8,
@@ -335,7 +389,7 @@ export function planCoverageRecoveryWindows(
   const duration = Math.max(0, finiteNumber(durationSeconds));
   if (!duration) return [];
   const padding = Math.max(0, Math.min(2, finiteNumber(paddingSeconds)));
-  const minimumGap = Math.max(0, finiteNumber(minimumGapSeconds, 0.18));
+  const minimumGap = Math.max(0, finiteNumber(minimumGapSeconds, 0.08));
   const recoveryMergeGap = Math.max(
     0,
     Math.min(2, finiteNumber(mergeGapSeconds, 0.35)),
@@ -378,14 +432,6 @@ export function planCoverageRecoveryWindows(
     }));
 }
 
-function normalizedCaptionText(text) {
-  return String(text ?? "")
-    .normalize("NFKC")
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
 function captionInterval(caption) {
   const words = validWordIntervals(caption?.words);
   const start = words.length
@@ -402,8 +448,9 @@ export function mergeRecoveredCaptions(
   recoveredCaptions,
   uncoveredIntervals,
 ) {
-  const primary = (primaryCaptions ?? []).filter((caption) =>
-    String(caption?.text ?? "").trim(),
+  const primary = (primaryCaptions ?? []).filter(
+    (caption) =>
+      String(caption?.text ?? "").trim() && !captionIsPlaceholder(caption),
   );
   const gaps = normalizeTimeIntervals(uncoveredIntervals);
   const additions = [];
@@ -413,6 +460,7 @@ export function mergeRecoveredCaptions(
     const interval = captionInterval(caption);
     if (
       !text ||
+      captionIsPlaceholder(caption) ||
       !Number.isFinite(interval.start) ||
       !Number.isFinite(interval.end) ||
       interval.end <= interval.start
@@ -477,12 +525,15 @@ export function coverageMateriallyImproves(primary, candidate) {
   const gapReduction =
     finiteNumber(primary.largestUncoveredGapSeconds) -
     finiteNumber(candidate.largestUncoveredGapSeconds);
-  return ratioGain >= 0.01 && gapReduction >= -0.05;
+  return (
+    (ratioGain >= 0.001 && gapReduction >= -0.02) ||
+    (gapReduction >= 0.08 && ratioGain >= -0.0005)
+  );
 }
 
 export function canRenderCaptionTrack(status, coverage) {
   return (
     ["ready", "complete"].includes(String(status ?? "")) &&
-    coverage?.complete !== false
+    coverage?.complete === true
   );
 }
