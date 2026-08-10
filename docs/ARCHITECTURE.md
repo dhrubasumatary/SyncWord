@@ -46,8 +46,11 @@ capabilities are never returned to the browser.
 1. The browser creates a project, reserves an asset, and streams the source to
    R2.
 2. The Worker creates a processing job and dispatches `/v3/processing-jobs`.
-3. Compute transcribes, aligns, runs bounded coverage recovery, and returns an
-   editor document through scoped callbacks.
+3. Compute transcribes, aligns, runs bounded coverage recovery, and projects
+   generated words onto one strictly ordered millisecond timeline before it
+   returns an editor document through scoped callbacks. Small acoustic jitter is
+   normalized silently; substantial repairs remain editable and are marked for
+   timing review instead of failing the processing job.
 4. The Worker validates the document and trusted speech intervals, stores the
    first revision, and advances the project head.
 5. The browser edits locally. A save supplies the exact base revision; a stale
@@ -69,7 +72,8 @@ capabilities are never returned to the browser.
 4. Processing and rendering are idempotent. Reusing an identity with different
    immutable input is a conflict.
 5. `review_required` is an honest terminal processing result. It remains
-   editable but is not renderable until a new revision passes coverage checks.
+   editable but is not renderable until a new revision passes coverage checks
+   and every automatically repaired timing marker has been manually reviewed.
 6. Current coverage policy requires at least 99.5% speech coverage, no residual
    uncovered interval over 250 ms, credible word spans, and excludes placeholder
    captions. Passing this policy does not claim every audio sample is speech.

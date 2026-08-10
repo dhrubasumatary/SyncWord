@@ -279,7 +279,7 @@ type ProjectRenderJob = {
 };
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
-const appRevision = "subtitles-web-2026-08-10-v27";
+const appRevision = "subtitles-web-2026-08-10-v28";
 const expectedCaptionQualityRevision = CAPTION_QUALITY_REVISION;
 const expectedProcessorRevision = "syncword-caption-v3";
 const expectedRendererRevision = "syncword-render-v2";
@@ -930,6 +930,12 @@ export default function Home() {
       word,
     })),
   );
+  const timingReviewWordCount = flatWords.filter(
+    ({ word }) => word.source === "speech-window-review",
+  ).length;
+  const selectedTimingReviewWordCount = selectedWords.filter(
+    (word) => word.source === "speech-window-review",
+  ).length;
   const selectedItem = flatWords.find(
     (item) =>
       item.captionId === selectedCaption?.id &&
@@ -1801,19 +1807,38 @@ export default function Home() {
               coverage?.uncoveredIntervals,
               projectDocument.durationMs / 1_000,
             ) as CoverageInterval[];
+            const timingReviewCount = nextCaptions.reduce(
+              (count, caption) =>
+                count +
+                caption.words.filter(
+                  (word) => word.source === "speech-window-review",
+                ).length,
+              0,
+            );
+            const reviewMessage =
+              timingReviewCount > 0 && intervals.length > 0
+                ? `${timingReviewCount} repaired timing ${
+                    timingReviewCount === 1 ? "word" : "words"
+                  } and ${intervals.length} speech ${
+                    intervals.length === 1 ? "gap need" : "gaps need"
+                  } review before export.`
+                : timingReviewCount > 0
+                  ? `${timingReviewCount} automatically repaired ${
+                      timingReviewCount === 1 ? "word needs" : "words need"
+                    } a quick check. Play the outlined words and nudge each once to approve.`
+                  : processing.message ??
+                    "Some speech still needs a caption before export.";
             setRenderPreflight({
-              code: "caption_coverage_incomplete",
-              message:
-                processing.message ??
-                "Some speech still needs a caption before export.",
+              code:
+                timingReviewCount > 0 && intervals.length === 0
+                  ? "caption_timing_review_required"
+                  : "caption_coverage_incomplete",
+              message: reviewMessage,
               coverage: coverage ?? null,
               uncoveredIntervals: intervals,
             });
             setTab("review");
-            setToast(
-              processing.message ??
-                "Captions need review in the highlighted speech gaps.",
-            );
+            setToast(reviewMessage);
           } else {
             setRenderPreflight(null);
             setTab("review");
@@ -4069,7 +4094,21 @@ export default function Home() {
                     </label>
 
                     <div className="composer-save-row">
-                      <span>Select a word to edit its timing and size.</span>
+                      <span>
+                        {selectedTimingReviewWordCount > 0
+                          ? `${selectedTimingReviewWordCount} outlined ${
+                              selectedTimingReviewWordCount === 1
+                                ? "word needs"
+                                : "words need"
+                            } a timing check. Play and nudge each one to approve.`
+                          : timingReviewWordCount > 0
+                            ? `${timingReviewWordCount} outlined ${
+                                timingReviewWordCount === 1
+                                  ? "word remains"
+                                  : "words remain"
+                              } in another caption.`
+                            : "Select a word to edit its timing and size."}
+                      </span>
                       <button onClick={commitCaptionDraft}>Save text</button>
                     </div>
 
@@ -4083,9 +4122,17 @@ export default function Home() {
                             word.displaySize === "large"
                               ? "word-is-large"
                               : "word-is-small"
+                          } ${
+                            word.source === "speech-window-review"
+                              ? "word-needs-timing-review"
+                              : ""
                           }`}
                           aria-label={`${word.text}, ${
                             word.displaySize === "large" ? "large" : "small"
+                          }${
+                            word.source === "speech-window-review"
+                              ? ", timing review needed"
+                              : ""
                           }`}
                           aria-pressed={index === selectedWordIndex}
                           onClick={() =>

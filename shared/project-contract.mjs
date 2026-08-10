@@ -329,6 +329,15 @@ export function renderBlockReason(document) {
   if (status !== "ready" && status !== "complete") {
     return "caption_processing_incomplete";
   }
+  if (
+    document?.captionTrack?.cues?.some((cue) =>
+      cue?.words?.some(
+        (word) => String(word?.source ?? "") === "speech-window-review",
+      ),
+    )
+  ) {
+    return "caption_timing_review_required";
+  }
   if (document?.captionTrack?.coverage?.complete === false) {
     return "speech_coverage_incomplete";
   }

@@ -135,11 +135,23 @@ export function projectDocumentFromEditor({
         durationSeconds: duration,
       })
     : missingSpeechCoverage();
-  const status = coverage.complete
-    ? requestedStatus === "complete"
-      ? "complete"
-      : "ready"
-    : "review_required";
+  const timingReviewRequired = orderedCaptions.some((caption) =>
+    Array.isArray(caption?.words)
+      ? caption.words.some(
+          (word) =>
+            String(word?.source ?? word?.timingSource ?? "") ===
+            "speech-window-review",
+        )
+      : false,
+  );
+  const status =
+    !coverage.complete ||
+    timingReviewRequired ||
+    requestedStatus === "review_required"
+      ? "review_required"
+      : requestedStatus === "complete"
+        ? "complete"
+        : "ready";
 
   return parseProjectDocument({
     schemaVersion: PROJECT_DOCUMENT_SCHEMA_VERSION,

@@ -7,6 +7,7 @@ import { stitchShortCaptionPhrases } from "../server/caption-groups.mjs";
 import {
   GeneratedCaptionTimelineError,
   finalizeGeneratedCaptionTimeline,
+  finalizeGeneratedCaptionTimelineWithDiagnostics,
 } from "../server/generated-caption-timeline.mjs";
 
 function caption(id, text, start, end, wordBounds) {
@@ -27,7 +28,24 @@ function caption(id, text, start, end, wordBounds) {
   };
 }
 
-test("repairs the small third-caption collision produced at an alignment boundary", () => {
+function assertValidTimeline(captions, durationSeconds) {
+  let previousCaptionEnd = 0;
+  for (const item of captions) {
+    assert.ok(item.start >= previousCaptionEnd, `${item.id} follows its neighbor`);
+    assert.ok(item.end > item.start, `${item.id} has a positive duration`);
+    assert.ok(item.end <= durationSeconds, `${item.id} stays within the video`);
+    let previousWordEnd = item.start;
+    for (const word of item.words) {
+      assert.ok(word.start >= previousWordEnd, `${word.id} follows its neighbor`);
+      assert.ok(word.end > word.start, `${word.id} has a positive duration`);
+      assert.ok(word.end <= item.end, `${word.id} stays within its caption`);
+      previousWordEnd = word.end;
+    }
+    previousCaptionEnd = item.end;
+  }
+}
+
+test("silently repairs a small alignment collision without downgrading its source", () => {
   const input = [
     caption("first", "one two", 0, 1, [
       [0, 0.5],
@@ -43,9 +61,10 @@ test("repairs the small third-caption collision produced at an alignment boundar
     ]),
   ];
 
-  const result = finalizeGeneratedCaptionTimeline(input, {
-    durationSeconds: 3,
-  });
+  const { captions: result, diagnostics } =
+    finalizeGeneratedCaptionTimelineWithDiagnostics(input, {
+      durationSeconds: 3,
+    });
 
   assert.equal(result[1].end, 2.02);
   assert.equal(result[2].start, 2.02);
@@ -58,10 +77,12 @@ test("repairs the small third-caption collision produced at an alignment boundar
       word.confidence,
     ]),
     [
-      ["speech-window-review", "speech-window-review", 0],
-      ["speech-window-review", "speech-window-review", 0],
+      ["mms-fa", undefined, 0.82],
+      ["mms-fa", undefined, 0.82],
     ],
   );
+  assert.equal(diagnostics.maximumOverlapMilliseconds, 40);
+  assert.equal(diagnostics.reviewRequired, false);
   assert.equal(result[2].text, "five six");
   assert.equal(input[1].end, 2.04, "the processor result is not mutated");
 
@@ -157,7 +178,7 @@ test("keeps recovery-window context while resolving its padded overlap", () => {
   assert.ok(result.every((item, index) => !index || item.start >= result[index - 1].end));
 });
 
-test("repairs adjacent word overlap after orphan captions are stitched", () => {
+test("silently repairs a small word overlap after orphan captions are stitched", () => {
   const stitched = stitchShortCaptionPhrases([
     caption("orphan", "one", 0, 1.04, [[0, 1.04]]),
     caption("phrase", "two three", 1, 2, [
@@ -178,13 +199,13 @@ test("repairs adjacent word overlap after orphan captions are stitched", () => {
       .slice(0, 2)
       .map((word) => [word.source, word.timingSource, word.confidence]),
     [
-      ["speech-window-review", "speech-window-review", 0],
-      ["speech-window-review", "speech-window-review", 0],
+      ["mms-fa", undefined, 0.82],
+      ["mms-fa", undefined, 0.82],
     ],
   );
 });
 
-test("fails closed for large or infeasible adjacent word collisions", () => {
+test("repairs large and short adjacent-word collisions without changing word order", () => {
   const cases = [
     caption("large", "one two", 0, 2, [
       [0, 1.2],
@@ -197,17 +218,26 @@ test("fails closed for large or infeasible adjacent word collisions", () => {
   ];
 
   for (const input of cases) {
-    assert.throws(
-      () => finalizeGeneratedCaptionTimeline([input], { durationSeconds: 2 }),
-      (error) =>
-        error instanceof GeneratedCaptionTimelineError &&
-        error.code === "caption_timeline_overlap",
-      input.id,
+    const { captions: [result], diagnostics } =
+      finalizeGeneratedCaptionTimelineWithDiagnostics([input], {
+        durationSeconds: 2,
+      });
+    const requiresReview = input.id === "large";
+    assertValidTimeline([result], 2);
+    assert.deepEqual(result.words.map((word) => word.text), ["one", "two"]);
+    assert.equal(diagnostics.reviewRequired, requiresReview);
+    assert.ok(
+      result.words.every(
+        (word) =>
+          word.source ===
+            (requiresReview ? "speech-window-review" : "mms-fa") &&
+          word.confidence === (requiresReview ? 0 : 0.82),
+      ),
     );
   }
 });
 
-test("fails closed when a collision exceeds the acoustic repair allowance", () => {
+test("repairs overlap above 80 ms and reports a substantial forced review", () => {
   const input = [
     caption("first", "one two", 0, 2.2, [
       [0, 1],
@@ -219,33 +249,104 @@ test("fails closed when a collision exceeds the acoustic repair allowance", () =
     ]),
   ];
 
-  assert.throws(
-    () => finalizeGeneratedCaptionTimeline(input, { durationSeconds: 3 }),
-    (error) =>
-      error instanceof GeneratedCaptionTimelineError &&
-      error.code === "caption_timeline_overlap" &&
-      error.details.overlapMilliseconds === 200,
+  const { captions: result, diagnostics } =
+    finalizeGeneratedCaptionTimelineWithDiagnostics(input, {
+      durationSeconds: 3,
+    });
+
+  assertValidTimeline(result, 3);
+  assert.equal(result[0].end, 2.1);
+  assert.equal(result[1].start, 2.1);
+  assert.equal(diagnostics.repairedBoundaryCount, 1);
+  assert.equal(diagnostics.crossCaptionBoundaryCount, 1);
+  assert.equal(diagnostics.substantialOverlapBoundaryCount, 1);
+  assert.equal(diagnostics.maximumOverlapMilliseconds, 200);
+  assert.equal(diagnostics.reviewRequired, true);
+  assert.deepEqual(
+    result.flatMap((item) => item.words).map((word) => word.text),
+    ["one", "two", "three", "four"],
+  );
+  assert.doesNotThrow(() =>
+    projectDocumentFromEditor({
+      sourceAssetId: "11111111-1111-4111-8111-111111111111",
+      durationSeconds: 3,
+      canvas: { width: 720, height: 1280 },
+      languageCode: "as-IN",
+      captions: result,
+      speechIntervals: [{ start: 0, end: 3 }],
+    }),
   );
 });
 
-test("fails closed when edge words cannot retain a safe duration", () => {
+test("repairs a contained duplicate-like caption while preserving semantic order", () => {
   const input = [
-    caption("first", "one two", 0, 2.01, [
-      [0, 1.98],
-      [1.98, 2.01],
+    caption("first", "one two", 0, 2, [
+      [0, 1],
+      [1, 2],
     ]),
-    caption("second", "three four", 2, 3, [
-      [2, 2.03],
-      [2.03, 3],
+    caption("contained", "three four", 0.25, 1.75, [
+      [0.25, 1],
+      [1, 1.75],
+    ]),
+  ];
+
+  const { captions: result, diagnostics } =
+    finalizeGeneratedCaptionTimelineWithDiagnostics(input, {
+      durationSeconds: 2,
+    });
+
+  assertValidTimeline(result, 2);
+  assert.deepEqual(result.map((item) => item.id), ["first", "contained"]);
+  assert.deepEqual(result.map((item) => item.text), ["one two", "three four"]);
+  assert.equal(diagnostics.maximumOverlapMilliseconds, 1_750);
+  assert.equal(diagnostics.reviewRequired, true);
+  assert.deepEqual(
+    finalizeGeneratedCaptionTimeline(result, { durationSeconds: 2 }),
+    result,
+    "contained repairs remain idempotent",
+  );
+});
+
+test("falls back from the preferred 40 ms edge duration for a dense timeline", () => {
+  const input = [
+    caption("dense", "one two three four", 0, 0.1, [
+      [0, 0.06],
+      [0.01, 0.07],
+      [0.02, 0.08],
+      [0.03, 0.1],
+    ]),
+  ];
+
+  const { captions: result, diagnostics } =
+    finalizeGeneratedCaptionTimelineWithDiagnostics(input, {
+      durationSeconds: 0.1,
+    });
+
+  assertValidTimeline(result, 0.1);
+  assert.equal(diagnostics.minimumDurationFallbackUsed, true);
+  assert.equal(diagnostics.reviewRequired, true);
+  assert.deepEqual(result[0].words.map((word) => word.text), [
+    "one",
+    "two",
+    "three",
+    "four",
+  ]);
+});
+
+test("fails only when the video cannot contain one positive millisecond per word", () => {
+  const input = [
+    caption("impossible", "one two three", 0, 0.001, [
+      [0, 0.001],
+      [0, 0.001],
+      [0, 0.001],
     ]),
   ];
 
   assert.throws(
-    () => finalizeGeneratedCaptionTimeline(input, { durationSeconds: 3 }),
+    () => finalizeGeneratedCaptionTimeline(input, { durationSeconds: 0.002 }),
     (error) =>
       error instanceof GeneratedCaptionTimelineError &&
-      error.code === "caption_timeline_overlap" &&
-      /could not safely separate/.test(error.message),
+      error.code === "caption_timeline_capacity",
   );
 });
 

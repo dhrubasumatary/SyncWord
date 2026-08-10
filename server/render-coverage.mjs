@@ -32,6 +32,28 @@ export function validateRenderCaptionSubmission({
       `Job is not ready for rendering (${normalizedStatus || "unknown"}).`,
     );
   }
+  const timingReviewWordCount = Array.isArray(captions)
+    ? captions.reduce(
+        (count, caption) =>
+          count +
+          (Array.isArray(caption?.words)
+            ? caption.words.filter(
+                (word) =>
+                  String(word?.source ?? word?.timingSource ?? "") ===
+                  "speech-window-review",
+              ).length
+            : 0),
+        0,
+      )
+    : 0;
+  if (timingReviewWordCount > 0) {
+    return rejection(
+      "caption_timing_review_required",
+      `${timingReviewWordCount} automatically repaired ${
+        timingReviewWordCount === 1 ? "word needs" : "words need"
+      } a quick timing edit before rendering.`,
+    );
+  }
   if (
     !persistedCoverage ||
     typeof persistedCoverage !== "object" ||

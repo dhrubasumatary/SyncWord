@@ -67,6 +67,19 @@ test("accepts a ready track only after checking its submitted captions", () => {
   assert.equal(decision.coverage.coverageRatio, 1);
 });
 
+test("blocks an automatically repaired boundary until the creator edits it", () => {
+  const timingReviewCaptions = structuredClone(completeCaptions);
+  timingReviewCaptions[0].words[0].source = "speech-window-review";
+
+  const blocked = validate({ captions: timingReviewCaptions });
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.code, "caption_timing_review_required");
+  assert.match(blocked.error, /timing edit before rendering/);
+
+  timingReviewCaptions[0].words[0].source = "manual";
+  assert.equal(validate({ captions: timingReviewCaptions }).allowed, true);
+});
+
 test("blocks a deleted caption despite stale complete job coverage", () => {
   const decision = validate({ captions: [completeCaptions[0]] });
   assert.equal(decision.allowed, false);

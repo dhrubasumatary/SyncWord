@@ -64,6 +64,21 @@ test("normalizes processing output into one immutable ready ProjectDocument", ()
   });
 });
 
+test("opens a complete-coverage timing repair as an immutable review revision", () => {
+  const job = processingJob();
+  job.captions[0].words[0].timingSource = "speech-window-review";
+  job.captions[0].words[0].source = "speech-window-review";
+  job.captions[0].words[0].confidence = 0;
+  const document = projectDocumentFromProcessingJob(plan, job);
+
+  assert.equal(document.captionTrack.coverage.complete, true);
+  assert.equal(document.captionTrack.status, "review_required");
+  assert.equal(
+    document.captionTrack.cues[0].words[0].source,
+    "speech-window-review",
+  );
+});
+
 test("keeps the selected language authoritative over provider detection", () => {
   const document = projectDocumentFromProcessingJob(
     plan,

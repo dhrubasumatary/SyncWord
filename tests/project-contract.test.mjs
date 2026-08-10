@@ -140,6 +140,16 @@ test("blocks review-required and incomplete-coverage revisions from render", () 
   assert.equal(renderBlockReason(processing), "caption_processing_incomplete");
 });
 
+test("keeps repaired automatic timing editable but blocks it from render", () => {
+  const timingReview = parseProjectDocument(projectDocument());
+  timingReview.captionTrack.cues[0].words[0].source =
+    "speech-window-review";
+  assert.equal(
+    renderBlockReason(timingReview),
+    "caption_timing_review_required",
+  );
+});
+
 test("rejects invalid cue timing instead of persisting a corrupt snapshot", () => {
   const document = projectDocument();
   document.captionTrack.cues[0].words[0].endMs = 2_000;

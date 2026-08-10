@@ -88,6 +88,8 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(page, /CaptionTimeline/);
   assert.match(page, /Caption text/);
   assert.match(page, /Fine timing/);
+  assert.match(page, /word-needs-timing-review/);
+  assert.match(page, /Play the outlined words and nudge each once to approve/);
   assert.match(page, /Start −30 ms/);
   assert.match(page, /Done with this line/);
   assert.match(page, /onChange=\{updateCaptionTiming\}/);
@@ -179,6 +181,8 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.doesNotMatch(page, /perceptual-gate-v1/);
   assert.match(renderServer, /speech_coverage_recovery_started/);
   assert.match(renderServer, /caption_job_review_required/);
+  assert.match(renderServer, /caption_timing_review_required/);
+  assert.match(renderServer, /timingReview: timelineFinalization\.diagnostics/);
   assert.match(renderServer, /validateRenderCaptionSubmission/);
   assert.match(renderServer, /acceptRenderCaptionSubmission/);
   assert.match(renderServer, /uncoveredIntervals/);

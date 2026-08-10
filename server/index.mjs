@@ -23,7 +23,7 @@ import {
   groupWordsForReels,
   stitchShortCaptionPhrases,
 } from "./caption-groups.mjs";
-import { finalizeGeneratedCaptionTimeline } from "./generated-caption-timeline.mjs";
+import { finalizeGeneratedCaptionTimelineWithDiagnostics } from "./generated-caption-timeline.mjs";
 import {
   languageTag,
   resolveTranscriptLanguage,
@@ -1753,9 +1753,11 @@ async function transcribe(job) {
     aligned = coverageRecoveryResult.aligned;
     job.captions = annotateTimingSafety(aligned.captions);
     job.captions = stitchShortCaptionPhrases(job.captions);
-    job.captions = finalizeGeneratedCaptionTimeline(job.captions, {
-      durationSeconds: Number(job.video?.duration),
-    });
+    const timelineFinalization =
+      finalizeGeneratedCaptionTimelineWithDiagnostics(job.captions, {
+        durationSeconds: Number(job.video?.duration),
+      });
+    job.captions = timelineFinalization.captions;
     const timingQuality = alignmentQualityReport({
       ...aligned,
       captions: job.captions,
@@ -1772,6 +1774,7 @@ async function transcribe(job) {
       transcriptRecoveryAttempted,
       transcriptRecoverySelected,
       coverage: finalCoverage,
+      timingReview: timelineFinalization.diagnostics,
     };
     if (
       timingQuality.totalWords >= 4 &&
@@ -1785,23 +1788,40 @@ async function transcribe(job) {
         "Automatic timing could not lock onto this voice. No inaccurate caption track was created; try a cleaner clip or a different language choice.",
       );
     }
-    if (!finalCoverage.complete) {
+    if (
+      !finalCoverage.complete ||
+      timelineFinalization.diagnostics.reviewRequired
+    ) {
+      const needsCoverageReview = !finalCoverage.complete;
+      const needsTimingReview =
+        timelineFinalization.diagnostics.reviewRequired;
+      const reviewMessage =
+        needsCoverageReview && needsTimingReview
+          ? "Some spoken audio and automatically repaired timing need review before rendering."
+          : needsTimingReview
+            ? "Automatic timing was repaired. Play the outlined words and nudge each once before rendering."
+            : "Some spoken audio still needs captions. Review the uncovered sections before rendering.";
       console.warn(
         JSON.stringify({
           event: "caption_job_review_required",
           jobId: job.id,
+          reasonCodes: [
+            ...(needsCoverageReview ? ["caption_coverage_incomplete"] : []),
+            ...(needsTimingReview ? ["caption_timing_review_required"] : []),
+          ],
           coverageRatio: finalCoverage.coverageRatio,
           largestUncoveredGapSeconds:
             finalCoverage.largestUncoveredGapSeconds,
           uncoveredIntervals: finalCoverage.uncoveredIntervals,
           recovery: finalCoverage.recovery,
+          timingReview: timelineFinalization.diagnostics,
         }),
       );
       updateJob(
         job,
         "review_required",
         82,
-        "Some spoken audio still needs captions. Review the uncovered sections before rendering.",
+        reviewMessage,
       );
       return;
     }

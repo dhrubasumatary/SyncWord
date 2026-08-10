@@ -105,6 +105,35 @@ test("missing speech activity fails closed instead of blessing a ready revision"
   ]);
 });
 
+test("keeps automatically repaired timing in review until its words are edited", () => {
+  const repairedCaption = structuredClone(baseCaption);
+  repairedCaption.words[0].source = "speech-window-review";
+
+  const reviewDocument = projectDocumentFromEditor({
+    sourceAssetId,
+    durationSeconds: 2,
+    canvas: { width: 720, height: 1280 },
+    languageCode: "as-IN",
+    captions: [repairedCaption],
+    speechIntervals: [{ start: 0.15, end: 1.15 }],
+    requestedStatus: "ready",
+  });
+  assert.equal(reviewDocument.captionTrack.coverage.complete, true);
+  assert.equal(reviewDocument.captionTrack.status, "review_required");
+
+  repairedCaption.words[0].source = "manual";
+  const approvedDocument = projectDocumentFromEditor({
+    sourceAssetId,
+    durationSeconds: 2,
+    canvas: { width: 720, height: 1280 },
+    languageCode: "as-IN",
+    captions: [repairedCaption],
+    speechIntervals: [{ start: 0.15, end: 1.15 }],
+    requestedStatus: "ready",
+  });
+  assert.equal(approvedDocument.captionTrack.status, "ready");
+});
+
 test("an edited gap is re-evaluated and remains review-required", () => {
   const document = projectDocumentFromEditor({
     sourceAssetId,
