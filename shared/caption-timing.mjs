@@ -16,15 +16,20 @@ export function retimeCaption(
   const resolvedFollowingStart = Number.isFinite(followingStart)
     ? followingStart
     : Math.max(requestedEnd, caption.end);
+  const availableDuration = resolvedFollowingStart - previousEnd;
+  if (availableDuration <= 0) {
+    throw new Error("A timed caption needs a positive gap between its neighbors.");
+  }
+  const minimumDuration = Math.min(0.18, availableDuration);
   const safeStart = clamp(
     requestedStart,
     previousEnd,
-    Math.max(previousEnd, resolvedFollowingStart - 0.18),
+    resolvedFollowingStart - minimumDuration,
   );
   const safeEnd = clamp(
     requestedEnd,
-    safeStart + 0.18,
-    Math.max(safeStart + 0.18, resolvedFollowingStart),
+    safeStart + minimumDuration,
+    resolvedFollowingStart,
   );
   const originalDuration = Math.max(0.18, caption.end - caption.start);
   const scale = (safeEnd - safeStart) / originalDuration;

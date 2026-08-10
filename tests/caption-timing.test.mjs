@@ -45,3 +45,26 @@ test("never overlaps the captions on either side", () => {
   assert.ok(result.words[0].start >= 1.5);
   assert.ok(result.words.at(-1).end <= 4.5);
 });
+
+test("uses the available positive gap when neighboring captions are closer than 180ms", () => {
+  const result = retimeCaption(caption, 0, 10, 1.5, 1.6);
+
+  assert.equal(result.start, 1.5);
+  assert.equal(result.end, 1.6);
+  assert.deepEqual(
+    result.words.map((word) => [word.start, word.end]),
+    [
+      [1.5, 1.55],
+      [1.55, 1.6],
+    ],
+  );
+});
+
+test("fails only when neighboring captions leave no positive interval", () => {
+  for (const followingStart of [1.5, 1.4]) {
+    assert.throws(
+      () => retimeCaption(caption, 0, 10, 1.5, followingStart),
+      /positive gap between its neighbors/,
+    );
+  }
+});

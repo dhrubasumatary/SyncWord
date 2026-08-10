@@ -23,6 +23,7 @@ import {
   groupWordsForReels,
   stitchShortCaptionPhrases,
 } from "./caption-groups.mjs";
+import { finalizeGeneratedCaptionTimeline } from "./generated-caption-timeline.mjs";
 import {
   languageTag,
   resolveTranscriptLanguage,
@@ -1752,6 +1753,9 @@ async function transcribe(job) {
     aligned = coverageRecoveryResult.aligned;
     job.captions = annotateTimingSafety(aligned.captions);
     job.captions = stitchShortCaptionPhrases(job.captions);
+    job.captions = finalizeGeneratedCaptionTimeline(job.captions, {
+      durationSeconds: Number(job.video?.duration),
+    });
     const timingQuality = alignmentQualityReport({
       ...aligned,
       captions: job.captions,
