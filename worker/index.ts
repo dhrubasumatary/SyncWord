@@ -2,12 +2,14 @@
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 import { handleMediaRequest } from "./media";
+import { handleProjectRequest } from "./projects";
 
 interface Env {
   ASSETS: Fetcher;
-  DB: D1Database;
+  DB?: D1Database;
   MEDIA?: R2Bucket;
   RENDER_API_URL?: string;
+  RENDERER_REVISION?: string;
   SITES_BYPASS_BEARER_TOKEN?: string;
   IMAGES: {
     input(stream: ReadableStream): {
@@ -35,6 +37,9 @@ const worker = {
 
     const mediaResponse = await handleMediaRequest(request, env);
     if (mediaResponse) return mediaResponse;
+
+    const projectResponse = await handleProjectRequest(request, env);
+    if (projectResponse) return projectResponse;
 
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];

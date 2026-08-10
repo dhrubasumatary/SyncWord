@@ -378,6 +378,7 @@ async function updateState(
     "ready",
     "rendering",
     "complete",
+    "review_required",
     "failed",
     "cancelled",
   ]);
@@ -475,6 +476,21 @@ async function rerenderJob(
   if (!["ready", "complete"].includes(job.status)) {
     return json(
       { error: `Job is not ready for rendering (${job.status}).` },
+      409,
+    );
+  }
+  const coverage = job.alignment?.coverage;
+  if (
+    coverage &&
+    typeof coverage === "object" &&
+    "complete" in coverage &&
+    coverage.complete === false
+  ) {
+    return json(
+      {
+        error:
+          "Caption coverage is incomplete. Review or recover the missed speech before rendering.",
+      },
       409,
     );
   }

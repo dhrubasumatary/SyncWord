@@ -187,6 +187,33 @@ button:disabled {
   gap: 10px;
 }
 
+.history-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.history-actions button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  place-items: center;
+  color: #f7f8f2;
+  font-size: 18px;
+  line-height: 1;
+  background: #20221f;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.history-actions button:disabled {
+  color: #62665f;
+  cursor: default;
+  opacity: 0.68;
+}
+
 .header-export {
   min-height: 38px;
   padding: 0 17px;
@@ -520,6 +547,11 @@ button:disabled {
 .final-label {
   color: #fff;
   background: #426fe0;
+}
+
+.review-label {
+  color: #2b110d;
+  background: var(--coral);
 }
 
 .reel-frame {
@@ -887,6 +919,27 @@ button:disabled {
 .tool-body {
   min-height: 320px;
   padding: 6px 14px 24px;
+}
+
+.coverage-warning {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 12px;
+  padding: 11px 12px;
+  color: #f8ddd8;
+  background: rgba(255, 109, 93, 0.11);
+  border: 1px solid rgba(255, 109, 93, 0.34);
+  border-radius: 12px;
+}
+
+.coverage-warning strong {
+  font-size: 12px;
+}
+
+.coverage-warning span {
+  color: #cfaaa4;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .waiting-panel {

@@ -35,6 +35,16 @@ import {
   chooseBetterAlignment,
 } from "../shared/caption-quality.mjs";
 import {
+  canRenderCaptionTrack,
+  evaluateCaptionCoverage,
+  speechIntervalsFromSilences,
+} from "../shared/caption-coverage.mjs";
+import { runTargetedCoverageRecovery } from "./coverage-recovery.mjs";
+import {
+  buildExportMediaPolicy,
+  exportVideoArgs,
+} from "./export-policy.mjs";
+import {
   combineSegmentTranscripts,
   parseSilenceIntervals,
   planSpeechSegments,
@@ -42,7 +52,7 @@ import {
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
-const captionQualityRevision = "perceptual-gate-v1";
+const captionQualityRevision = "perceptual-and-coverage-gate-v2";
 const runtimeRoot = path.resolve(
   process.env.RUNTIME_DIR ?? path.join(process.cwd(), ".runtime"),
 );
@@ -324,6 +334,7 @@ async function restoreJobs() {
       for (const pathKey of [
         "inputPath",
         "transcriptPath",
+        "coverageRecoveryPath",
         "assPath",
         "outputPath",
       ]) {
@@ -492,10 +503,8 @@ async function probeVideo(job) {
     [
       "-v",
       "error",
-      "-select_streams",
-      "v:0",
       "-show_entries",
-      "stream=width,height,r_frame_rate:format=duration",
+      "stream=codec_type,codec_name,profile,width,height,r_frame_rate,duration,sample_rate,channels:format=duration,format_name",
       "-of",
       "json",
       path.basename(job.inputPath),
@@ -503,7 +512,12 @@ async function probeVideo(job) {
     { cwd: job.directory, job },
   );
   const probe = JSON.parse(output);
-  const stream = probe.streams?.[0];
+  const stream = probe.streams?.find(
+    (candidate) => candidate.codec_type === "video",
+  );
+  const audioStream = probe.streams?.find(
+    (candidate) => candidate.codec_type === "audio",
+  );
   if (!stream?.width || !stream?.height) {
     throw new Error("The upload does not contain a readable video stream.");
   }
@@ -525,6 +539,27 @@ async function probeVideo(job) {
     height: Number(stream.height),
     frameRate: String(stream.r_frame_rate ?? ""),
     duration: Number.isFinite(duration) ? duration : undefined,
+    streamDuration: Number.isFinite(Number(stream.duration))
+      ? Number(stream.duration)
+      : undefined,
+    formatName: String(probe.format?.format_name ?? ""),
+    ...(audioStream
+      ? {
+          audio: {
+            codecName: String(audioStream.codec_name ?? ""),
+            profile: String(audioStream.profile ?? ""),
+            sampleRate: Number.isFinite(Number(audioStream.sample_rate))
+              ? Number(audioStream.sample_rate)
+              : undefined,
+            channels: Number.isFinite(Number(audioStream.channels))
+              ? Number(audioStream.channels)
+              : undefined,
+            duration: Number.isFinite(Number(audioStream.duration))
+              ? Number(audioStream.duration)
+              : undefined,
+          },
+        }
+      : {}),
   };
   void persistJob(job);
 }
@@ -733,11 +768,13 @@ function transcriptToCaptions(transcript, requestedLanguage = "unknown") {
   );
 }
 
-async function prepareSpeechSegments(job) {
-  if (Array.isArray(job.speechSegments) && job.speechSegments.length) {
-    return job.speechSegments;
+async function prepareSpeechAnalysis(job) {
+  if (
+    Array.isArray(job.speechAnalysis?.speechIntervals) &&
+    Array.isArray(job.speechAnalysis?.silenceIntervals)
+  ) {
+    return job.speechAnalysis;
   }
-
   const duration = Number(job.video?.duration);
   if (!Number.isFinite(duration) || duration <= 0) {
     throw new Error("The video duration is unavailable for speech timing.");
@@ -758,7 +795,28 @@ async function prepareSpeechSegments(job) {
     { cwd: job.directory, job },
   );
   const silences = parseSilenceIntervals(detected.stderr, duration);
-  const plan = planSpeechSegments(duration, silences);
+  const speechIntervals = speechIntervalsFromSilences(duration, silences);
+  job.speechAnalysis = {
+    revision: "ffmpeg-silencedetect-v1",
+    durationSeconds: duration,
+    silenceIntervals: silences,
+    speechIntervals,
+  };
+  void persistJob(job);
+  return job.speechAnalysis;
+}
+
+async function prepareSpeechSegments(job) {
+  const speechAnalysis = await prepareSpeechAnalysis(job);
+  if (Array.isArray(job.speechSegments) && job.speechSegments.length) {
+    return job.speechSegments;
+  }
+
+  const duration = Number(speechAnalysis.durationSeconds);
+  const plan = planSpeechSegments(
+    duration,
+    speechAnalysis.silenceIntervals,
+  );
 
   for (const [index, segment] of plan.entries()) {
     const fileName = `speech-segment-${index + 1}.wav`;
@@ -795,7 +853,8 @@ async function prepareSpeechSegments(job) {
       event: "speech_segments_ready",
       jobId: job.id,
       durationSeconds: duration,
-      silenceCount: silences.length,
+      silenceCount: speechAnalysis.silenceIntervals.length,
+      speechIntervalCount: speechAnalysis.speechIntervals.length,
       segmentCount: plan.length,
       segments: plan.map(({ start, end, duration: segmentDuration }) => ({
         start,
@@ -870,6 +929,39 @@ async function sarvamRestTranscript(job, segment, mode) {
   throw lastError ?? new Error("Sarvam REST transcription failed.");
 }
 
+function segmentTranscriptResult(job, segment, response) {
+  let captions = [];
+  if (String(response?.transcript ?? "").trim()) {
+    try {
+      captions = transcriptToCaptions(response, job.language);
+    } catch {
+      captions = [
+        {
+          id: `${segment.id}-phrase`,
+          start: 0,
+          end: segment.duration,
+          text: String(response.transcript).trim(),
+          language: languageTag(
+            resolveTranscriptLanguage(
+              response.language_code,
+              job.language,
+            ),
+          ),
+        },
+      ];
+    }
+  }
+  return {
+    segment,
+    languageCode: resolveTranscriptLanguage(
+      response?.language_code,
+      job.language,
+    ),
+    captions,
+    response,
+  };
+}
+
 async function runSegmentedSarvamTranscript(
   job,
   mode,
@@ -898,36 +990,7 @@ async function runSegmentedSarvamTranscript(
       nextIndex += 1;
       const segment = segments[index];
       const response = await sarvamRestTranscript(job, segment, mode);
-      let captions = [];
-      if (String(response?.transcript ?? "").trim()) {
-        try {
-          captions = transcriptToCaptions(response, job.language);
-        } catch {
-          captions = [
-            {
-              id: `${segment.id}-phrase`,
-              start: 0,
-              end: segment.duration,
-              text: String(response.transcript).trim(),
-              language: languageTag(
-                resolveTranscriptLanguage(
-                  response.language_code,
-                  job.language,
-                ),
-              ),
-            },
-          ];
-        }
-      }
-      results[index] = {
-        segment,
-        languageCode: resolveTranscriptLanguage(
-          response.language_code,
-          job.language,
-        ),
-        captions,
-        response,
-      };
+      results[index] = segmentTranscriptResult(job, segment, response);
       completed += 1;
       updateJob(
         job,
@@ -1056,6 +1119,7 @@ async function alignTranscriptWithModal(
   {
     captions: rawCaptions = job.captions,
     displayCaptions = null,
+    progress = 76,
   } = {},
 ) {
   const endpoint = modalAlignerEndpoint();
@@ -1088,7 +1152,7 @@ async function alignTranscriptWithModal(
   updateJob(
     job,
     "transcribing",
-    76,
+    progress,
     "Syncing captions to the voice",
   );
   const response = await fetch(endpoint, {
@@ -1183,6 +1247,269 @@ async function runSarvamTranscript(job, mode, progressFloor = 24) {
     Math.max(31, progressFloor),
   );
   return downloadTranscript(job, init.job_id, status);
+}
+
+function captionCoveragePolicy() {
+  return {
+    minimumCoverageRatio: Number(
+      process.env.MIN_SPEECH_CAPTION_COVERAGE ?? 0.92,
+    ),
+    maximumUncoveredGapSeconds: Number(
+      process.env.MAX_UNCOVERED_SPEECH_GAP_SECONDS ?? 1.5,
+    ),
+  };
+}
+
+function captionCoverageReport(job, captions) {
+  return evaluateCaptionCoverage(
+    job.speechAnalysis?.speechIntervals ?? [],
+    captions,
+    {
+      durationSeconds: Number(job.video?.duration),
+      policy: captionCoveragePolicy(),
+    },
+  );
+}
+
+async function ensurePcmAudio(job) {
+  const audioPath = path.join(job.directory, "audio.pcm");
+  try {
+    await readFile(audioPath);
+    return audioPath;
+  } catch {
+    await run(
+      process.env.FFMPEG_PATH ?? "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "audio.wav",
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "audio.pcm",
+      ],
+      { cwd: job.directory, job },
+    );
+    return audioPath;
+  }
+}
+
+async function alignCoverageRecoveryCandidate(
+  job,
+  captions,
+  displayCaptions,
+) {
+  try {
+    const modalAlignment = await alignTranscriptWithModal(job, {
+      captions,
+      displayCaptions,
+      progress: 80,
+    });
+    if (modalAlignment) return modalAlignment;
+  } catch (error) {
+    const requiresGpu =
+      String(process.env.MODAL_ALIGNMENT_REQUIRED ?? "true").toLowerCase() !==
+      "false";
+    if (requiresGpu) throw error;
+    console.error(
+      "Coverage recovery GPU alignment failed; using local fallback.",
+      error,
+    );
+  }
+
+  await ensurePcmAudio(job);
+  throwIfCancelled(job);
+  return alignTranscriptWords(
+    captions,
+    await readFile(path.join(job.directory, "audio.pcm")),
+    { sampleRate: 16_000, frameMs: 20 },
+  );
+}
+
+async function transcribeCoverageWindows(job, windows) {
+  const segments = [];
+  for (const window of windows) {
+    const segment = {
+      ...window,
+      fileName: `${window.id}.wav`,
+    };
+    await run(
+      process.env.FFMPEG_PATH ?? "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        String(segment.start),
+        "-t",
+        String(segment.duration),
+        "-i",
+        "audio.wav",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        segment.fileName,
+      ],
+      { cwd: job.directory, job },
+    );
+    segments.push(segment);
+  }
+
+  const results = new Array(segments.length);
+  const configuredConcurrency = Number(
+    process.env.SARVAM_COVERAGE_RECOVERY_CONCURRENCY ?? 2,
+  );
+  const concurrency = Number.isFinite(configuredConcurrency)
+    ? Math.max(1, Math.min(2, Math.floor(configuredConcurrency)))
+    : 2;
+  const mode = job.mode === "codemix" ? "verbatim" : job.mode;
+  let nextIndex = 0;
+  let completed = 0;
+
+  async function worker() {
+    while (nextIndex < segments.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const segment = segments[index];
+      const response = await sarvamRestTranscript(job, segment, mode);
+      results[index] = segmentTranscriptResult(job, segment, response);
+      completed += 1;
+      updateJob(
+        job,
+        "transcribing",
+        Math.min(80, 77 + Math.floor((completed / segments.length) * 3)),
+        "Recovering missed speech",
+      );
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, segments.length) },
+      () => worker(),
+    ),
+  );
+  return combineSegmentTranscripts(results, job.language);
+}
+
+async function recoverSpeechCoverage(job, aligned) {
+  await prepareSpeechAnalysis(job);
+  const primaryCoverage = captionCoverageReport(job, aligned.captions);
+  let attemptedWindows = [];
+  try {
+    const result = await runTargetedCoverageRecovery({
+      alignment: aligned,
+      speechIntervals: job.speechAnalysis.speechIntervals,
+      durationSeconds: Number(job.video?.duration),
+      policy: captionCoveragePolicy(),
+      recoveryWindowOptions: {
+        paddingSeconds: Number(
+          process.env.SPEECH_COVERAGE_RETRY_PADDING_SECONDS ?? 0.45,
+        ),
+        maximumWindows: Number(
+          process.env.MAX_SPEECH_COVERAGE_RETRY_WINDOWS ?? 8,
+        ),
+      },
+      transcribeWindows: async (windows) => {
+        attemptedWindows = windows;
+        updateJob(job, "transcribing", 77, "Recovering missed speech");
+        console.info(
+          JSON.stringify({
+            event: "speech_coverage_recovery_started",
+            jobId: job.id,
+            coverageRatio: primaryCoverage.coverageRatio,
+            largestUncoveredGapSeconds:
+              primaryCoverage.largestUncoveredGapSeconds,
+            windows: windows.map(({ start, end, duration }) => ({
+              start,
+              end,
+              duration,
+            })),
+          }),
+        );
+        const transcript = await transcribeCoverageWindows(job, windows);
+        return {
+          transcript,
+          captions: transcriptToCaptions(transcript, job.language),
+        };
+      },
+      alignCaptions: (captions) =>
+        alignCoverageRecoveryCandidate(job, captions, captions),
+    });
+
+    if (result.recovery.attempted) {
+      const artifact = {
+        revision: "targeted-speech-coverage-recovery-v1",
+        windows: result.windows,
+        transcript: result.transcriptResult?.transcript,
+        addedCaptionCount: result.recovery.addedCaptionCount,
+        selected: result.recovery.selected,
+        primaryCoverage: result.primaryCoverage,
+        candidateCoverage: result.candidateCoverage,
+      };
+      job.coverageRecoveryPath = path.join(
+        job.directory,
+        "coverage-recovery.json",
+      );
+      await writeFile(
+        job.coverageRecoveryPath,
+        JSON.stringify(artifact, null, 2),
+        "utf8",
+      );
+      console.info(
+        JSON.stringify({
+          event: "speech_coverage_recovery_finished",
+          jobId: job.id,
+          selected: result.recovery.selected,
+          addedCaptionCount: result.recovery.addedCaptionCount,
+          primaryCoverageRatio: result.primaryCoverage.coverageRatio,
+          candidateCoverageRatio:
+            result.candidateCoverage?.coverageRatio ??
+            result.primaryCoverage.coverageRatio,
+          primaryLargestGapSeconds:
+            result.primaryCoverage.largestUncoveredGapSeconds,
+          candidateLargestGapSeconds:
+            result.candidateCoverage?.largestUncoveredGapSeconds ??
+            result.primaryCoverage.largestUncoveredGapSeconds,
+        }),
+      );
+    }
+    return {
+      aligned: result.alignment,
+      coverage: result.coverage,
+      recovery: result.recovery,
+    };
+  } catch (error) {
+    if (isCancelled(job)) throw error;
+    const recovery = {
+      attempted: attemptedWindows.length > 0,
+      selected: false,
+      windowCount: attemptedWindows.length,
+      addedCaptionCount: 0,
+      error: error instanceof Error ? error.message : "Unknown recovery error",
+    };
+    console.error(
+      JSON.stringify({
+        event: "speech_coverage_recovery_failed",
+        jobId: job.id,
+        message: recovery.error,
+      }),
+    );
+    return { aligned, coverage: primaryCoverage, recovery };
+  }
 }
 
 async function transcribe(job) {
@@ -1341,27 +1668,7 @@ async function transcribe(job) {
         76,
         "Finishing caption timing",
       );
-      await run(
-        process.env.FFMPEG_PATH ?? "ffmpeg",
-        [
-          "-hide_banner",
-          "-loglevel",
-          "error",
-          "-y",
-          "-i",
-          "audio.wav",
-          "-f",
-          "s16le",
-          "-acodec",
-          "pcm_s16le",
-          "-ac",
-          "1",
-          "-ar",
-          "16000",
-          "audio.pcm",
-        ],
-        { cwd: job.directory, job },
-      );
+      await ensurePcmAudio(job);
       throwIfCancelled(job);
       aligned = alignTranscriptWords(
         job.captions,
@@ -1369,6 +1676,8 @@ async function transcribe(job) {
         { sampleRate: 16_000, frameMs: 20 },
       );
     }
+    const coverageRecoveryResult = await recoverSpeechCoverage(job, aligned);
+    aligned = coverageRecoveryResult.aligned;
     job.captions = annotateTimingSafety(aligned.captions);
     job.captions = stitchShortCaptionPhrases(job.captions);
     const timingQuality = alignmentQualityReport({
@@ -1376,6 +1685,8 @@ async function transcribe(job) {
       captions: job.captions,
     });
     job.captions = timingQuality.captions;
+    const finalCoverage = captionCoverageReport(job, job.captions);
+    finalCoverage.recovery = coverageRecoveryResult.recovery;
     job.alignment = {
       ...aligned.summary,
       highlightSafeWords: timingQuality.safeWords,
@@ -1384,6 +1695,7 @@ async function transcribe(job) {
       transcriptTransport: job.sarvamTransport,
       transcriptRecoveryAttempted,
       transcriptRecoverySelected,
+      coverage: finalCoverage,
     };
     if (
       timingQuality.totalWords >= 4 &&
@@ -1396,6 +1708,26 @@ async function transcribe(job) {
       throw new Error(
         "Automatic timing could not lock onto this voice. No inaccurate caption track was created; try a cleaner clip or a different language choice.",
       );
+    }
+    if (!finalCoverage.complete) {
+      console.warn(
+        JSON.stringify({
+          event: "caption_job_review_required",
+          jobId: job.id,
+          coverageRatio: finalCoverage.coverageRatio,
+          largestUncoveredGapSeconds:
+            finalCoverage.largestUncoveredGapSeconds,
+          uncoveredIntervals: finalCoverage.uncoveredIntervals,
+          recovery: finalCoverage.recovery,
+        }),
+      );
+      updateJob(
+        job,
+        "review_required",
+        82,
+        "Some spoken audio still needs captions. Review the uncovered sections before rendering.",
+      );
+      return;
     }
     console.info(
       JSON.stringify({
@@ -1415,6 +1747,13 @@ async function transcribe(job) {
         transcriptTransport: job.sarvamTransport,
         transcriptRecoveryAttempted,
         transcriptRecoverySelected,
+        coverageRatio: finalCoverage.coverageRatio,
+        largestUncoveredGapSeconds:
+          finalCoverage.largestUncoveredGapSeconds,
+        coverageRecoveryAttempted:
+          coverageRecoveryResult.recovery.attempted,
+        coverageRecoverySelected:
+          coverageRecoveryResult.recovery.selected,
       }),
     );
     updateJob(
@@ -1667,6 +2006,24 @@ async function renderVideo(job, captions, style) {
           .replaceAll("'", "\\'")}`
       : "";
     job.outputPath = path.join(job.directory, "captioned.mp4");
+    const exportPolicy = buildExportMediaPolicy(job.video, {
+      gopSeconds: Number(process.env.FFMPEG_GOP_SECONDS ?? 2),
+    });
+    const videoFilters = [
+      ...(exportPolicy.tailPadSeconds > 0
+        ? [
+            `tpad=stop_mode=clone:stop_duration=${exportPolicy.tailPadSeconds}`,
+          ]
+        : []),
+      `ass=captions.ass${fontOption}`,
+      "format=yuv420p",
+    ];
+    job.exportMedia = {
+      audioMode: exportPolicy.audioMode,
+      gopSeconds: exportPolicy.gopSeconds,
+      keyframeIntervalFrames: exportPolicy.keyframeIntervalFrames,
+      tailPadSeconds: exportPolicy.tailPadSeconds,
+    };
 
     updateJob(job, "rendering", 88, "Adding captions to your video");
     await run(
@@ -1678,8 +2035,12 @@ async function renderVideo(job, captions, style) {
         "-y",
         "-i",
         path.basename(job.inputPath),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
         "-vf",
-        `ass=captions.ass${fontOption},format=yuv420p`,
+        videoFilters.join(","),
         "-c:v",
         "libx264",
         "-preset",
@@ -1688,10 +2049,10 @@ async function renderVideo(job, captions, style) {
         process.env.FFMPEG_CRF ?? "18",
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        ...exportVideoArgs(exportPolicy),
+        ...exportPolicy.audioFilterArgs,
+        ...exportPolicy.audioArgs,
+        ...(exportPolicy.useShortest ? ["-shortest"] : []),
         "-movflags",
         "+faststart",
         path.basename(job.outputPath),
@@ -2062,9 +2423,12 @@ app.post("/v1/jobs/:id/render", (request, response) => {
     response.status(404).json({ error: "Job not found." });
     return;
   }
-  if (!["ready", "complete"].includes(job.status)) {
+  if (!canRenderCaptionTrack(job.status, job.alignment?.coverage)) {
     response.status(409).json({
-      error: `Job is not ready for a render. Current status: ${job.status}.`,
+      error:
+        job.alignment?.coverage?.complete === false
+          ? "Caption coverage is incomplete. Review the uncovered speech before rendering."
+          : `Job is not ready for a render. Current status: ${job.status}.`,
     });
     return;
   }
@@ -2088,9 +2452,12 @@ app.post("/v2/jobs/:id/render", (request, response) => {
     response.status(404).json({ error: "Job not found." });
     return;
   }
-  if (!["ready", "complete"].includes(job.status)) {
+  if (!canRenderCaptionTrack(job.status, job.alignment?.coverage)) {
     response.status(409).json({
-      error: `Job is not ready for a render. Current status: ${job.status}.`,
+      error:
+        job.alignment?.coverage?.complete === false
+          ? "Caption coverage is incomplete. Review the uncovered speech before rendering."
+          : `Job is not ready for a render. Current status: ${job.status}.`,
     });
     return;
   }

@@ -1,7 +1,9 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -12,6 +14,20 @@ import {
 } from "../shared/caption-quality.mjs";
 import { createLatestSeekController } from "../shared/preview-transport.mjs";
 import { retimeCaption } from "../shared/caption-timing.mjs";
+import {
+  EDITOR_DRAFT_STORAGE_KEY,
+  commitRevision,
+  createBrowserDraftStore,
+  createEditorDraft,
+  createRevisionHistory,
+  markRevisionBase,
+  parseEditorDraft,
+  redoRevision,
+  replaceRevisionBase,
+  revisionHistoryDirty,
+  serializeEditorDraft,
+  undoRevision,
+} from "../shared/editor-draft.mjs";
 import { CaptionTimeline } from "./components/CaptionTimeline";
 
 type WordTiming = {
@@ -78,6 +94,7 @@ type JobStatus =
   | "extracting"
   | "transcribing"
   | "ready"
+  | "review_required"
   | "rendering"
   | "complete"
   | "failed"
@@ -112,6 +129,20 @@ type ReviewItem = {
   word: WordTiming;
 };
 type LoopRange = { start: number; end: number } | null;
+type EditorDocument = {
+  language: string;
+  transcriptMode: TranscriptMode;
+  captionStyle: CaptionStyle;
+  activePresetName: string;
+  captions: Caption[];
+};
+type MediaIdentity = {
+  name: string;
+  type: string;
+  size: number;
+  lastModified: number;
+  durable: boolean;
+};
 
 const hostedRenderApi = "https://syncword-render-dhrub404.onrender.com";
 const appRevision = "syncword-web-2026-08-07-v24";
@@ -362,9 +393,117 @@ function isReviewCandidate(word: WordTiming) {
   return word.highlightReason === "invalid_boundary";
 }
 
+function normalizeRestoredStyle(value: unknown): CaptionStyle {
+  const style = value && typeof value === "object"
+    ? (value as Partial<CaptionStyle>)
+    : {};
+  return {
+    fontFamily:
+      typeof style.fontFamily === "string"
+        ? style.fontFamily
+        : defaultStyle.fontFamily,
+    fontSize: Number.isFinite(style.fontSize)
+      ? clamp(Number(style.fontSize), 28, 160)
+      : defaultStyle.fontSize,
+    textColor:
+      typeof style.textColor === "string"
+        ? style.textColor
+        : defaultStyle.textColor,
+    highlightColor:
+      typeof style.highlightColor === "string"
+        ? style.highlightColor
+        : defaultStyle.highlightColor,
+    backgroundColor:
+      typeof style.backgroundColor === "string"
+        ? style.backgroundColor
+        : defaultStyle.backgroundColor,
+    backgroundOpacity: Number.isFinite(style.backgroundOpacity)
+      ? clamp(Number(style.backgroundOpacity), 0, 100)
+      : defaultStyle.backgroundOpacity,
+    outlineColor:
+      typeof style.outlineColor === "string"
+        ? style.outlineColor
+        : defaultStyle.outlineColor,
+    outlineWidth: Number.isFinite(style.outlineWidth)
+      ? clamp(Number(style.outlineWidth), 0, 12)
+      : defaultStyle.outlineWidth,
+    position: Number.isFinite(style.position)
+      ? clamp(Number(style.position), 8, 94)
+      : defaultStyle.position,
+    weight: ["600", "700", "800"].includes(String(style.weight))
+      ? (String(style.weight) as CaptionStyle["weight"])
+      : defaultStyle.weight,
+    animation: ["pop", "fade", "slide"].includes(String(style.animation))
+      ? (String(style.animation) as CaptionStyle["animation"])
+      : defaultStyle.animation,
+    wordsPerCard: Number.isFinite(style.wordsPerCard)
+      ? clamp(Math.round(Number(style.wordsPerCard)), 2, 7)
+      : defaultStyle.wordsPerCard,
+  };
+}
+
+function normalizeEditorDocument(value: unknown): EditorDocument | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<EditorDocument>;
+  const captions = Array.isArray(record.captions) &&
+    record.captions.every(isAlignedCaption)
+    ? record.captions
+    : [];
+  const transcriptMode = ["codemix", "verbatim", "transcribe"].includes(
+    String(record.transcriptMode),
+  )
+    ? (String(record.transcriptMode) as TranscriptMode)
+    : "codemix";
+  return {
+    language:
+      typeof record.language === "string" ? record.language : "unknown",
+    transcriptMode,
+    captionStyle: normalizeRestoredStyle(record.captionStyle),
+    activePresetName:
+      typeof record.activePresetName === "string"
+        ? record.activePresetName
+        : "Signal",
+    captions,
+  };
+}
+
+function normalizeRestoredJob(
+  value: unknown,
+  captions: Caption[],
+): JobResponse | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<JobResponse>;
+  const statuses: JobStatus[] = [
+    "queued",
+    "extracting",
+    "transcribing",
+    "ready",
+    "review_required",
+    "rendering",
+    "complete",
+    "failed",
+    "cancelled",
+  ];
+  if (
+    typeof record.id !== "string" ||
+    !statuses.includes(record.status as JobStatus)
+  ) {
+    return null;
+  }
+  return {
+    ...record,
+    id: record.id,
+    status: record.status as JobStatus,
+    progress: Number.isFinite(record.progress) ? Number(record.progress) : 0,
+    captions,
+  };
+}
+
 export default function Home() {
   const [tab, setTab] = useState<StudioTab>("review");
   const [file, setFile] = useState<File | null>(null);
+  const [mediaIdentity, setMediaIdentity] =
+    useState<MediaIdentity | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
   const [duration, setDuration] = useState(0);
   const [videoRatio, setVideoRatio] = useState(9 / 16);
@@ -389,6 +528,11 @@ export default function Home() {
   const [captionDrafts, setCaptionDrafts] = useState<
     Record<string, string>
   >({});
+  const [revisionHistoryVersion, setRevisionHistoryVersion] = useState(0);
+  const [historyControls, setHistoryControls] = useState({
+    canUndo: false,
+    canRedo: false,
+  });
   const hydrated = useSyncExternalStore(
     subscribeHydration,
     clientSnapshot,
@@ -400,6 +544,20 @@ export default function Home() {
     typeof createLatestSeekController
   > | null>(null);
   const loopRangeRef = useRef<LoopRange>(null);
+  const revisionHistoryRef = useRef(
+    createRevisionHistory({
+      language: "unknown",
+      transcriptMode: "codemix",
+      captionStyle: defaultStyle,
+      activePresetName: "Signal",
+      captions: [],
+    }),
+  );
+  const draftStoreRef = useRef<ReturnType<
+    typeof createBrowserDraftStore
+  > | null>(null);
+  const draftReadyRef = useRef(false);
+  const suppressHistoryTrackingRef = useRef(false);
 
   const configuredApi =
     process.env.NEXT_PUBLIC_RENDER_API_URL?.replace(/\/$/, "") ?? "";
@@ -419,6 +577,11 @@ export default function Home() {
     usingDurableMedia
       ? `/api/media/jobs/${jobId}`
       : `/v1/jobs/${jobId}`;
+  const hasProject = Boolean(file || mediaIdentity || job);
+  const mediaName = file?.name ?? mediaIdentity?.name ?? "Recovered project";
+  const draftNeedsAuthorization = Boolean(
+    mediaIdentity?.durable && job && !job.capabilityToken,
+  );
   const isProcessing = Boolean(
     uploading || (job && processingStatuses.includes(job.status)),
   );
@@ -485,6 +648,43 @@ export default function Home() {
       ? flatWords[selectedGlobalIndex + 1]?.word ?? null
       : null;
   const isLooping = Boolean(loopRange);
+  const editorDocument = useMemo<EditorDocument>(
+    () => ({
+      language,
+      transcriptMode,
+      captionStyle,
+      activePresetName,
+      captions,
+    }),
+    [
+      activePresetName,
+      captionStyle,
+      captions,
+      language,
+      transcriptMode,
+    ],
+  );
+  const applyEditorDocument = useCallback((document: EditorDocument) => {
+    suppressHistoryTrackingRef.current = true;
+    setLanguage(document.language);
+    setTranscriptMode(document.transcriptMode);
+    setCaptionStyle(document.captionStyle);
+    setActivePresetName(document.activePresetName);
+    setCaptions(document.captions);
+  }, []);
+  const publishRevisionHistory = useCallback(
+    (history: ReturnType<typeof createRevisionHistory>) => {
+      revisionHistoryRef.current = history;
+      setHistoryControls({
+        canUndo: history.past.length > 0,
+        canRedo: history.future.length > 0,
+      });
+      setRevisionHistoryVersion((version) => version + 1);
+    },
+    [],
+  );
+  const canUndo = historyControls.canUndo;
+  const canRedo = historyControls.canRedo;
 
   const previewStyle = {
     "--caption-font-size": `${captionStyle.fontSize}px`,
@@ -503,6 +703,152 @@ export default function Home() {
         ? '"Noto Sans Devanagari", "Nirmala UI", sans-serif'
         : '"Noto Sans Bengali", "Nirmala UI", sans-serif',
   } as CSSProperties;
+
+  useEffect(() => {
+    if (!hydrated) return;
+    let active = true;
+    draftReadyRef.current = false;
+    void (async () => {
+      try {
+        const store = createBrowserDraftStore(window);
+        draftStoreRef.current = store;
+        const serialized = await store.load(EDITOR_DRAFT_STORAGE_KEY);
+        if (!active || !serialized) return;
+        const draft = parseEditorDraft(serialized);
+        const restoredDocument = normalizeEditorDocument(
+          draft?.history.present.snapshot,
+        );
+        if (!draft || !restoredDocument) return;
+
+        const restoredJob = normalizeRestoredJob(
+          draft.job,
+          restoredDocument.captions,
+        );
+        applyEditorDocument(restoredDocument);
+        publishRevisionHistory(draft.history);
+        setHasChanges(revisionHistoryDirty(draft.history));
+        setMediaIdentity(
+          draft.media
+            ? {
+                name: draft.media.name,
+                type: draft.media.type,
+                size: draft.media.size,
+                lastModified: draft.media.lastModified,
+                durable: draft.media.durable,
+              }
+            : null,
+        );
+        setDuration(draft.media?.duration ?? 0);
+        setVideoRatio(draft.media?.videoRatio ?? 9 / 16);
+        setTab(draft.view.tab as StudioTab);
+        setSelectedCaptionId(
+          draft.view.selectedCaptionId ||
+            restoredDocument.captions[0]?.id ||
+            "",
+        );
+        setSelectedWordIndex(draft.view.selectedWordIndex);
+        setCurrentTime(draft.view.currentTime);
+        setCaptionDrafts(
+          draft.view.captionDrafts as Record<string, string>,
+        );
+        setJob(restoredJob);
+        draftReadyRef.current = true;
+
+        if (restoredJob?.status === "review_required") {
+          setTab("review");
+          setToast(
+            restoredJob.message ??
+              "Draft restored. Some speech still needs caption review.",
+          );
+        } else {
+          setToast("Your last caption draft was restored.");
+        }
+
+      } catch {
+        // IndexedDB can be unavailable in hardened browsing modes. The store
+        // already tries localStorage; failure here must not block the editor.
+      } finally {
+        if (active) draftReadyRef.current = true;
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [applyEditorDocument, hydrated, publishRevisionHistory]);
+
+  useEffect(() => {
+    if (!draftReadyRef.current) return;
+    if (suppressHistoryTrackingRef.current) {
+      suppressHistoryTrackingRef.current = false;
+      return;
+    }
+    const current = revisionHistoryRef.current;
+    let next;
+    if (hasChanges) {
+      next = commitRevision(current, editorDocument);
+    } else {
+      const candidate = commitRevision(current, editorDocument);
+      next = candidate === current
+        ? markRevisionBase(current)
+        : replaceRevisionBase(current, editorDocument);
+    }
+    if (next !== current) publishRevisionHistory(next);
+  }, [editorDocument, hasChanges, publishRevisionHistory]);
+
+  useEffect(() => {
+    if (
+      !draftReadyRef.current ||
+      !draftStoreRef.current ||
+      (!mediaIdentity && !job)
+    ) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      try {
+        const draft = createEditorDraft({
+          projectId: job?.id ?? "active",
+          savedAt: new Date().toISOString(),
+          media: mediaIdentity
+            ? { ...mediaIdentity, duration, videoRatio }
+            : null,
+          job,
+          history: revisionHistoryRef.current,
+          view: {
+            tab,
+            selectedCaptionId,
+            selectedWordIndex,
+            currentTime,
+            captionDrafts,
+          },
+        });
+        void draftStoreRef.current?.save(
+          EDITOR_DRAFT_STORAGE_KEY,
+          serializeEditorDraft(draft),
+        );
+      } catch {
+        // Persistence is best-effort and never interrupts active editing.
+      }
+    }, 320);
+    return () => window.clearTimeout(timeout);
+  }, [
+    captionDrafts,
+    currentTime,
+    duration,
+    job,
+    mediaIdentity,
+    revisionHistoryVersion,
+    selectedCaptionId,
+    selectedWordIndex,
+    tab,
+    videoRatio,
+  ]);
+
+  useEffect(
+    () => () => {
+      if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl);
+    },
+    [videoUrl],
+  );
 
   useEffect(() => {
     if (!toast) return;
@@ -673,7 +1019,9 @@ export default function Home() {
     if (
       !job ||
       (!usingDurableMedia && !apiBase) ||
-      ["ready", "complete", "failed", "cancelled"].includes(job.status)
+      ["ready", "review_required", "complete", "failed", "cancelled"].includes(
+        job.status,
+      )
     ) {
       return;
     }
@@ -746,6 +1094,12 @@ export default function Home() {
         if (next.status === "ready") {
           setTab("review");
           setToast("Captions ready. Play through and edit anything.");
+        } else if (next.status === "review_required") {
+          setTab("review");
+          setToast(
+            next.message ??
+              "Some speech is still missing captions and needs review.",
+          );
         } else if (next.status === "complete") {
           setTab("export");
           setToast("Your final video is ready to download.");
@@ -913,9 +1267,20 @@ export default function Home() {
 
   const clearProject = () => {
     if (videoUrl) URL.revokeObjectURL(videoUrl);
+    suppressHistoryTrackingRef.current = true;
+    publishRevisionHistory(
+      createRevisionHistory({
+        ...editorDocument,
+        activePresetName: "Signal",
+        captions: [],
+      }),
+    );
+    void draftStoreRef.current?.remove(EDITOR_DRAFT_STORAGE_KEY);
     setFile(null);
+    setMediaIdentity(null);
     setVideoUrl("");
     setDuration(0);
+    setVideoRatio(9 / 16);
     setCurrentTime(0);
     setCaptions([]);
     setSelectedCaptionId("");
@@ -955,9 +1320,26 @@ export default function Home() {
     await cancelRemoteJob(previousJob);
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     const localUrl = URL.createObjectURL(nextFile);
+    suppressHistoryTrackingRef.current = true;
+    publishRevisionHistory(
+      createRevisionHistory({
+        ...editorDocument,
+        activePresetName: "Signal",
+        captions: [],
+      }),
+    );
+    void draftStoreRef.current?.remove(EDITOR_DRAFT_STORAGE_KEY);
     setFile(nextFile);
+    setMediaIdentity({
+      name: nextFile.name,
+      type: nextFile.type,
+      size: nextFile.size,
+      lastModified: nextFile.lastModified,
+      durable: usingDurableMedia,
+    });
     setVideoUrl(localUrl);
     setDuration(0);
+    setVideoRatio(9 / 16);
     setCurrentTime(0);
     setCaptions([]);
     setSelectedCaptionId("");
@@ -1323,6 +1705,55 @@ export default function Home() {
     setHasChanges(true);
   };
 
+  const moveThroughHistory = useCallback(
+    (direction: "undo" | "redo") => {
+      const current = revisionHistoryRef.current;
+      const next = direction === "undo"
+        ? undoRevision(current)
+        : redoRevision(current);
+      if (next === current) return;
+      const document = normalizeEditorDocument(next.present.snapshot);
+      if (!document) return;
+      applyEditorDocument(document);
+      publishRevisionHistory(next);
+      setHasChanges(revisionHistoryDirty(next));
+      setCaptionDrafts({});
+      setLoopRange(null);
+      setSelectedCaptionId((captionId) =>
+        document.captions.some((caption) => caption.id === captionId)
+          ? captionId
+          : document.captions[0]?.id ?? "",
+      );
+      setSelectedWordIndex((wordIndex) => Math.max(0, wordIndex));
+      setToast(direction === "undo" ? "Edit undone." : "Edit restored.");
+    },
+    [applyEditorDocument, publishRevisionHistory],
+  );
+
+  useEffect(() => {
+    const handleHistoryShortcut = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable ||
+          ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
+      ) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === "z" && !event.shiftKey) {
+        event.preventDefault();
+        moveThroughHistory("undo");
+      } else if (key === "y" || (key === "z" && event.shiftKey)) {
+        event.preventDefault();
+        moveThroughHistory("redo");
+      }
+    };
+    window.addEventListener("keydown", handleHistoryShortcut);
+    return () => window.removeEventListener("keydown", handleHistoryShortcut);
+  }, [moveThroughHistory]);
+
   const seek = (seconds: number) => {
     loopRangeRef.current = null;
     setLoopRange(null);
@@ -1337,12 +1768,20 @@ export default function Home() {
   };
 
   const primaryAction = () => {
-    if (!file) {
+    if (!hasProject) {
       videoInputRef.current?.click();
       return;
     }
     if (!job || ["failed", "cancelled"].includes(job.status)) {
-      void uploadVideo(file);
+      if (file) void uploadVideo(file);
+      else videoInputRef.current?.click();
+      return;
+    }
+    if (job.status === "review_required") {
+      setTab("review");
+      setToast(
+        job.message ?? "Caption every speech gap before exporting this draft.",
+      );
       return;
     }
     if (tab === "review") {
@@ -1351,6 +1790,16 @@ export default function Home() {
     }
     if (tab === "style") {
       setTab("export");
+      return;
+    }
+    if (
+      draftNeedsAuthorization &&
+      (job.status === "ready" ||
+        (job.status === "complete" && hasChanges))
+    ) {
+      setToast(
+        "This recovered draft needs project authorization before it can render again.",
+      );
       return;
     }
     if (job.status === "ready") {
@@ -1364,29 +1813,31 @@ export default function Home() {
 
   const primaryLabel = (() => {
     if (uploading) return "Working…";
-    if (!file) return "Choose video";
+    if (!hasProject) return "Choose video";
     if (!job || ["failed", "cancelled"].includes(job.status)) {
-      return "Try again";
+      return file ? "Try again" : "Choose video";
     }
     if (isProcessing) {
       return `${job.message ?? "Processing"} · ${job.progress}%`;
     }
+    if (job.status === "review_required") return "Review missing speech";
     if (tab === "review") {
       return "Choose a caption look";
     }
     if (tab === "style") return "Continue to export";
+    if (draftNeedsAuthorization && hasChanges) return "Render access required";
     if (job.status === "ready") return "Make my video";
     if (job.status === "complete" && hasChanges) return "Update final video";
     return "Download final MP4";
   })();
 
   return (
-    <main className={`creator-app ${file ? "has-project" : ""}`}>
+    <main className={`creator-app ${hasProject ? "has-project" : ""}`}>
       <header className="app-header">
         <button
           className="brand"
           onClick={() => {
-            if (file) {
+            if (hasProject) {
               const activeJob = job;
               clearProject();
               void cancelRemoteJob(activeJob);
@@ -1402,7 +1853,27 @@ export default function Home() {
           <strong>SyncWord</strong>
         </button>
         <div className="header-actions">
-          {file && (
+          {hasProject && captions.length > 0 && (
+            <div className="history-actions" aria-label="Edit history">
+              <button
+                onClick={() => moveThroughHistory("undo")}
+                disabled={!canUndo}
+                aria-label="Undo last edit"
+                title="Undo (Ctrl+Z)"
+              >
+                ↶
+              </button>
+              <button
+                onClick={() => moveThroughHistory("redo")}
+                disabled={!canRedo}
+                aria-label="Redo last edit"
+                title="Redo (Ctrl+Shift+Z)"
+              >
+                ↷
+              </button>
+            </div>
+          )}
+          {hasProject && (
             <button
               className="header-export"
               onClick={() => setTab("export")}
@@ -1442,7 +1913,7 @@ export default function Home() {
               An older editor can show the wrong word timing with the current
               caption engine. Reload to keep them in sync.
             </p>
-            {file && (
+            {hasProject && (
               <small>
                 This temporary preview will reset. Your original video is
                 untouched.
@@ -1455,7 +1926,7 @@ export default function Home() {
         </section>
       )}
 
-      {!file ? (
+      {!hasProject ? (
         <section className="launch">
           <div className="launch-copy">
             <span className="eyebrow">NEW CAPTION VIDEO</span>
@@ -1583,9 +2054,11 @@ export default function Home() {
               >
                 {isProcessing ? "Cancel & replace" : "Replace video"}
               </button>
-              <span title={file.name}>{file.name}</span>
+              <span title={mediaName}>{mediaName}</span>
               {showingFinal ? (
                 <b className="final-label">FINAL</b>
+              ) : job?.status === "review_required" ? (
+                <b className="review-label">REVIEW</b>
               ) : job?.status === "ready" ? (
                 <b className="preview-label">PREVIEW</b>
               ) : null}
@@ -1756,6 +2229,15 @@ export default function Home() {
             </nav>
 
             <div className="tool-body">
+              {job?.status === "review_required" && (
+                <div className="coverage-warning" role="alert">
+                  <strong>Speech coverage needs review</strong>
+                  <span>
+                    {job.message ??
+                      "Some spoken audio is still missing trusted captions. Export stays locked until coverage is complete."}
+                  </span>
+                </div>
+              )}
               {tab === "review" && !captions.length && (
                 <div className="waiting-panel">
                   <span className="panel-icon">⌁</span>
@@ -2247,7 +2729,7 @@ export default function Home() {
         }}
       />
 
-      {file && (
+      {hasProject && (
         <div className="action-dock">
           {job && (
             <div className="mini-progress">

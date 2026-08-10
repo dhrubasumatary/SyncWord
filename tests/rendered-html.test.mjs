@@ -111,7 +111,10 @@ test("removes the disposable starter and wires product metadata", async () => {
   assert.match(renderServer, /chooseBetterAlignment/);
   assert.match(renderServer, /phraseTimedWords/);
   assert.match(renderServer, /canHighlightGroup/);
-  assert.match(renderServer, /perceptual-gate-v1/);
+  assert.match(renderServer, /perceptual-and-coverage-gate-v2/);
+  assert.match(renderServer, /speech_coverage_recovery_started/);
+  assert.match(renderServer, /caption_job_review_required/);
+  assert.match(renderServer, /canRenderCaptionTrack/);
   assert.match(renderServer, /caption_job_queued/);
   assert.match(renderServer, /caption_job_ready/);
   assert.match(renderServer, /phraseTimedWords: timingQuality\.phraseTimedWords/);
